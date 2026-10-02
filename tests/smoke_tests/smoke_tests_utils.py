@@ -1,0 +1,1938 @@
+import configparser
+import contextlib
+import enum
+import functools
+import inspect
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+from types import MethodType
+from typing import (Any, BinaryIO, Callable, Dict, Generator, List, NamedTuple,
+                    Optional, Sequence, Set, Tuple, Union)
+from unittest.mock import patch
+import urllib.parse
+import uuid
+
+import colorama
+import pytest
+import requests
+from smoke_tests.docker import docker_utils
+
+import sky
+from sky import clouds
+from sky import jobs
+from sky import serve
+from sky import skypilot_config
+from sky.client import sdk
+from sky.clouds import AWS
+from sky.clouds import gcp
+from sky.clouds import GCP
+from sky.jobs import utils as managed_job_utils
+from sky.server import common as server_common
+from sky.server.requests import payloads
+from sky.server.requests import requests as requests_lib
+from sky.skylet import constants
+from sky.utils import common_utils
+from sky.utils import config_utils
+from sky.utils import env_options
+from sky.utils import registry
+from sky.utils import subprocess_utils
+from sky.utils import yaml_utils
+
+# To avoid the second smoke test reusing the cluster launched in the first
+# smoke test. Also required for test_managed_jobs_recovery to make sure the
+# manual termination with aws ec2 does not accidentally terminate other clusters
+# for the different managed jobs launch with the same job name but a
+# different job id.
+# 4 chars: on a long-lived API server the jobs table accumulates every past
+# run of a test, so 2 chars (256 possible names per test) collides with an
+# older same-named job roughly N_history/256 of the time.
+test_id = str(uuid.uuid4())[-4:]
+
+LAMBDA_GPU_TYPE = 'A100'
+LAMBDA_TYPE = f'--infra lambda --gpus {LAMBDA_GPU_TYPE}'
+FLUIDSTACK_TYPE = '--infra fluidstack --gpus RTXA4000'
+
+SCP_TYPE = '--infra scp'
+SCP_GPU_V100 = '--gpus V100-32GB'
+
+STORAGE_SETUP_COMMANDS = [
+    'touch ~/tmpfile', 'mkdir -p ~/tmp-workdir', 'rm -rf ~/empty-workdir',
+    'mkdir -p ~/empty-workdir', r'touch ~/tmp-workdir/tmp\ file',
+    r'touch ~/tmp-workdir/tmp\ file2', 'touch ~/tmp-workdir/foo',
+    '[ ! -e ~/tmp-workdir/circle-link ] && ln -s ~/tmp-workdir/ ~/tmp-workdir/circle-link || true',
+    'touch ~/.ssh/id_rsa.pub'
+]
+
+LOW_RESOURCE_ARG = '--cpus 2+ --memory 4+'
+LOW_RESOURCE_PARAM = {
+    'cpus': '2+',
+    'memory': '4+',
+}
+LOW_CONTROLLER_RESOURCE_ENV = {
+    skypilot_config.ENV_VAR_GLOBAL_CONFIG: 'tests/test_yamls/low_resource_sky_config.yaml',
+}
+LOW_CONTROLLER_RESOURCE_OVERRIDE_CONFIG = {
+    'jobs': {
+        'controller': {
+            'resources': {
+                'cpus': '4+',
+                'memory': '16+'
+            }
+        }
+    },
+    'serve': {
+        'controller': {
+            'resources': {
+                'cpus': '4+',
+                'memory': '8+'
+            }
+        }
+    }
+}
+
+# Get the job queue, and print it once on its own, then print it again to
+# use with grep by the caller.
+GET_JOB_QUEUE = 's=$(sky jobs queue); echo "$s"; echo "$s"'
+# Wait for a job to be not in RUNNING state. Used to check for RECOVERING.
+JOB_WAIT_NOT_RUNNING = (
+    's=$(sky jobs queue);'
+    'until ! echo "$s" | grep "{job_name}" | grep "RUNNING"; do '
+    'sleep 10; s=$(sky jobs queue);'
+    'echo "Waiting for job to stop RUNNING"; echo "$s"; done')
+
+ACTIVATE_SERVICE_ACCOUNT_AND_GSUTIL = (
+    'GOOGLE_APPLICATION_CREDENTIALS='
+    f'{gcp.DEFAULT_GCP_APPLICATION_CREDENTIAL_PATH}; '
+    'gcloud auth activate-service-account '
+    '--key-file=$GOOGLE_APPLICATION_CREDENTIALS '
+    '2> /dev/null || true; '
+    'gsutil')
+
+ENDPOINT = 'http://127.0.0.1:46580/api/health'
+
+# Fix the flakyness of the test, server may not ready when we run the command after restart.
+WAIT_FOR_API = (
+    'for i in $(seq 1 30); do '
+    f'if curl -s {ENDPOINT} > /dev/null; then '
+    'echo "API is up and running"; break; fi; '
+    'echo "Waiting for API to be ready... ($i/30)"; '
+    '[ $i -eq 30 ] && echo "Timed out waiting for API to be ready" && exit 1; '
+    'sleep 1; done')
+
+SKY_API_RESTART = f'sky api stop || true && sky api start && {WAIT_FOR_API}'
+
+AWS_GET_INSTANCE_ID = (
+    '`aws ec2 describe-instances --region {region} --filters '
+    'Name=tag:ray-cluster-name,Values={name_on_cloud} '
+    '--query Reservations[].Instances[].InstanceId '
+    '--output text`')
+
+# Cluster functions
+_ALL_JOB_STATUSES = "|".join([status.value for status in sky.JobStatus])
+_ALL_CLUSTER_STATUSES = "|".join([status.value for status in sky.ClusterStatus])
+_ALL_MANAGED_JOB_STATUSES = "|".join(
+    [status.value for status in sky.ManagedJobStatus])
+
+
+def _statuses_to_str(statuses: Sequence[enum.Enum]):
+    """Convert a list of enums to a string with all the values separated by |."""
+    assert len(statuses) > 0, 'statuses must not be empty'
+    if len(statuses) > 1:
+        return '(' + '|'.join([status.value for status in statuses]) + ')'
+    else:
+        return statuses[0].value
+
+
+_WAIT_UNTIL_CLUSTER_STATUS_CONTAINS = (
+    # A while loop to wait until the cluster status
+    # becomes certain status, with timeout.
+    'start_time=$SECONDS; '
+    'while true; do '
+    'if (( $SECONDS - $start_time > {timeout} )); then '
+    '  echo "Timeout after {timeout} seconds waiting for cluster status \'{cluster_status}\'"; exit 1; '
+    'fi; '
+    'current_status=$(sky status {cluster_name} --refresh | '
+    'awk "/^{cluster_name}/ '
+    r'{{for (i=1; i<=NF; i++) if (\$i ~ /^(' + _ALL_CLUSTER_STATUSES +
+    r')$/) print \$i}}"); '
+    'if [[ "$current_status" =~ {cluster_status} ]]; '
+    'then echo "Target cluster status {cluster_status} reached."; break; fi; '
+    'echo "Waiting for cluster status to become {cluster_status}, current status: $current_status"; '
+    'sleep 10; '
+    'done')
+
+
+def get_cloud_specific_resource_config(generic_cloud: str):
+    # Kubernetes (EKS) requires more resources to avoid flakiness.
+    # Only some EKS tests use this function - specifically those that previously
+    # failed with low resources. Other EKS tests that work fine with low resources
+    # don't need to call this function.
+    if generic_cloud == 'kubernetes':
+        resource_arg = ""
+        env = None
+    else:
+        resource_arg = LOW_RESOURCE_ARG
+        env = LOW_CONTROLLER_RESOURCE_ENV
+    return resource_arg, env
+
+
+def get_cmd_wait_until_cluster_status_contains(
+        cluster_name: str, cluster_status: List[sky.ClusterStatus],
+        timeout: int):
+    return _WAIT_UNTIL_CLUSTER_STATUS_CONTAINS.format(
+        cluster_name=cluster_name,
+        cluster_status=_statuses_to_str(cluster_status),
+        timeout=timeout)
+
+
+def get_cmd_wait_until_cluster_status_contains_wildcard(
+        cluster_name_wildcard: str, cluster_status: List[sky.ClusterStatus],
+        timeout: int):
+    wait_cmd = _WAIT_UNTIL_CLUSTER_STATUS_CONTAINS.replace(
+        'sky status {cluster_name}',
+        'sky status "{cluster_name}"').replace('awk "/^{cluster_name}/',
+                                               'awk "/^{cluster_name_awk}/')
+    return wait_cmd.format(cluster_name=cluster_name_wildcard,
+                           cluster_name_awk=cluster_name_wildcard.replace(
+                               '*', '.*'),
+                           cluster_status=_statuses_to_str(cluster_status),
+                           timeout=timeout)
+
+
+_WAIT_UNTIL_CLUSTER_IS_NOT_FOUND = (
+    # A while loop to wait until the cluster is not found or timeout
+    'start_time=$SECONDS; '
+    'while true; do '
+    'if (( $SECONDS - $start_time > {timeout} )); then '
+    '  echo "Timeout after {timeout} seconds waiting for cluster to be removed"; exit 1; '
+    'fi; '
+    'if sky status -r {cluster_name}; sky status {cluster_name} | grep "\'{cluster_name}\' not found"; then '
+    '  echo "Cluster {cluster_name} successfully removed."; break; '
+    'fi; '
+    'echo "Waiting for cluster {cluster_name} to be removed..."; '
+    'sleep 10; '
+    'done')
+
+
+def get_cmd_wait_until_cluster_is_not_found(cluster_name: str, timeout: int):
+    return _WAIT_UNTIL_CLUSTER_IS_NOT_FOUND.format(cluster_name=cluster_name,
+                                                   timeout=timeout)
+
+
+_WAIT_UNTIL_VOLUME_IS_NOT_FOUND = (
+    # A while loop to wait until a volume no longer appears in
+    # `sky volumes ls`, or timeout. `sky volumes delete` tears down the backing
+    # storage asynchronously, so a single `sky volumes ls` right after the
+    # delete can still list the volume; poll instead of checking once.
+    'start_time=$SECONDS; '
+    'while true; do '
+    'vols=$(sky volumes ls); '
+    # Matched on the whole first field, as the readiness wait is, so that a
+    # longer name containing this one -- another test's, or the same test's in
+    # a concurrent run -- cannot hold the wait open. `{awk_match}` widens that
+    # to a prefix, for a caller waiting on every volume of one cluster.
+    'found=$(echo "$vols" | awk -v n="{volume_name}" '
+    '\'{awk_match} {{print $1; exit}}\'); '
+    'if [ -z "$found" ]; then '
+    '  echo "Volume {volume_name} successfully removed."; break; '
+    'fi; '
+    'if (( $SECONDS - $start_time > {timeout} )); then '
+    '  echo "$vols"; '
+    '  echo "Timeout after {timeout} seconds waiting for volume '
+    '{volume_name} to be removed"; exit 1; '
+    'fi; '
+    'echo "Waiting for volume {volume_name} to be removed..."; '
+    'sleep 5; '
+    'done')
+
+
+def get_cmd_wait_until_volume_is_not_found(volume_name: str,
+                                           timeout: int = 120,
+                                           match_prefix: bool = False):
+    """Blocks until no volume named `volume_name` is listed.
+
+    With `match_prefix`, until no volume whose name *starts with* it is: the
+    volumes a launch creates for a task's inline `volumes:` entries are named
+    after the cluster, one per mount path, so that is how a caller waits for
+    all of them.
+    """
+    awk_match = 'index($1, n) == 1' if match_prefix else '$1 == n'
+    return _WAIT_UNTIL_VOLUME_IS_NOT_FOUND.format(volume_name=volume_name,
+                                                  timeout=timeout,
+                                                  awk_match=awk_match)
+
+
+_WAIT_UNTIL_VOLUME_IS_READY = (
+    # A while loop to wait until a volume is mountable, or timeout.
+    # `sky volumes apply` only *starts* provisioning: on a storage class with
+    # `volumeBindingMode: Immediate` the PersistentVolume is created
+    # asynchronously, so the claim stays Pending -- and the volume NOT_READY --
+    # after the command returns. Mounting it before then is refused with
+    # VolumeNotReadyError, so a test that creates a volume must wait for it,
+    # exactly as a user would.
+    # Deliberately not `--refresh`: that re-probes the backing resource and so
+    # would end the wait the moment the claim binds, but it refreshes the whole
+    # volume table -- a file lock and a database round-trip per volume -- and
+    # would contend with the volume operations of every other test sharing the
+    # API server. Read the row the refresh daemon maintains instead, which
+    # costs the server nothing and bounds the wait by its 60s interval.
+    'start_time=$SECONDS; '
+    'while true; do '
+    'vols=$(sky volumes ls); '
+    # Read the status out of the volume's own row -- matched on the whole first
+    # field, so a longer name containing this one is not mistaken for it -- at
+    # the character offset the header gives for the STATUS column. The table is
+    # space-padded and left-aligned, and columns before STATUS hold spaces of
+    # their own ("alice (SA)", "3 secs"), so splitting the row on whitespace
+    # would not line up. Taking the column rather than searching the row also
+    # keeps NOT_READY, or a stray word in MESSAGE, from passing for READY.
+    'status=$(echo "$vols" | awk -v n="{volume_name}" '
+    '\'$1 == "NAME" {{c = index($0, "STATUS")}} '
+    '$1 == n && c {{split(substr($0, c), f, " "); print f[1]; exit}}\'); '
+    # IN_USE is READY plus a mount; both are mountable.
+    'if [ "$status" = READY ] || [ "$status" = IN_USE ]; then '
+    '  echo "Volume {volume_name} is ready."; break; '
+    'fi; '
+    'if (( $SECONDS - $start_time > {timeout} )); then '
+    '  echo "$vols"; '
+    '  echo "Timeout after {timeout} seconds waiting for volume '
+    '{volume_name} to be ready"; exit 1; '
+    'fi; '
+    'echo "Waiting for volume {volume_name}: ${{status:-not found}}"; '
+    'sleep 5; '
+    'done')
+
+
+def get_cmd_wait_until_volume_is_ready(volume_name: str, timeout: int = 300):
+    """Blocks until a volume is mountable.
+
+    The default timeout leaves room for a cloud storage class to provision its
+    first volume plus the up-to-60s lag of the status refresh daemon this reads
+    from, and is still short enough that a genuinely broken volume fails the
+    step well inside the test timeout.
+    """
+    return _WAIT_UNTIL_VOLUME_IS_READY.format(volume_name=volume_name,
+                                              timeout=timeout)
+
+
+_WAIT_UNTIL_JOB_STATUS_CONTAINS_MATCHING_JOB_ID = (
+    # A while loop to wait until the job status
+    # contains certain status, with timeout.
+    'start_time=$SECONDS; '
+    'while true; do '
+    'if (( $SECONDS - $start_time > {timeout} )); then '
+    '  echo "Timeout after {timeout} seconds waiting for job status \'{job_status}\'"; exit 1; '
+    'fi; '
+    'current_queue=$(sky queue {cluster_name}); '
+    'current_status=$(echo "$current_queue" | '
+    'awk "\\$1 == \\"{job_id}\\" '
+    r'{{for (i=1; i<=NF; i++) if (\$i ~ /^(' + _ALL_JOB_STATUSES +
+    r')$/) print \$i}}"); '
+    'found=0; '  # Initialize found variable outside the loop
+    'while read -r line; do '  # Read line by line
+    '  if [[ "$line" =~ {job_status} ]]; then '  # Check each line
+    '    echo "Target job status {job_status} reached."; '
+    '    found=1; '
+    '    break; '  # Break inner loop
+    '  fi; '
+    'done <<< "$current_status"; '
+    'if [ "$found" -eq 1 ]; then break; fi; '  # Break outer loop if match found
+    'echo "Waiting for job status to contain {job_status}, current status: $current_status"; '
+    'echo "Current queue: $current_queue"; '
+    'sleep 10; '
+    'done')
+
+_WAIT_UNTIL_JOB_STATUS_CONTAINS_WITHOUT_MATCHING_JOB = _WAIT_UNTIL_JOB_STATUS_CONTAINS_MATCHING_JOB_ID.replace(
+    'awk "\\$1 == \\"{job_id}\\"', 'awk "')
+
+_WAIT_UNTIL_JOB_STATUS_CONTAINS_MATCHING_JOB_NAME = _WAIT_UNTIL_JOB_STATUS_CONTAINS_MATCHING_JOB_ID.replace(
+    'awk "\\$1 == \\"{job_id}\\"', 'awk "\\$2 == \\"{job_name}\\"')
+
+
+def get_cmd_wait_until_job_status_contains_matching_job_id(
+        cluster_name: str,
+        job_id: str,
+        job_status: List[sky.JobStatus],
+        timeout: int,
+        all_users: bool = False):
+    cmd = _WAIT_UNTIL_JOB_STATUS_CONTAINS_MATCHING_JOB_ID.format(
+        cluster_name=cluster_name,
+        job_id=job_id,
+        job_status=_statuses_to_str(job_status),
+        timeout=timeout)
+    if all_users:
+        cmd = cmd.replace('sky queue ', 'sky queue -u ')
+    return cmd
+
+
+def get_cmd_wait_until_job_status_contains_without_matching_job(
+        cluster_name: str, job_status: List[sky.JobStatus], timeout: int):
+    return _WAIT_UNTIL_JOB_STATUS_CONTAINS_WITHOUT_MATCHING_JOB.format(
+        cluster_name=cluster_name,
+        job_status=_statuses_to_str(job_status),
+        timeout=timeout)
+
+
+def get_cmd_wait_until_job_status_contains_matching_job_name(
+        cluster_name: str, job_name: str, job_status: List[sky.JobStatus],
+        timeout: int):
+    return _WAIT_UNTIL_JOB_STATUS_CONTAINS_MATCHING_JOB_NAME.format(
+        cluster_name=cluster_name,
+        job_name=job_name,
+        job_status=_statuses_to_str(job_status),
+        timeout=timeout)
+
+
+# Managed job functions
+
+# Unlike `sky queue`, the `sky jobs queue` table has a variable number of
+# leading columns: the TASK column can be empty and a WORKSPACE column is
+# rendered whenever the displayed jobs span more than one workspace (see
+# `format_job_table` in sky/jobs/utils.py). Both shift the position of the
+# NAME column, so we match {job_name} in *any* column via an awk loop rather
+# than a fixed column index. This keeps the wait robust regardless of which
+# columns the server renders (e.g. on a shared server where jobs from
+# multiple workspaces are listed and the WORKSPACE column appears).
+_WAIT_UNTIL_MANAGED_JOB_STATUS_CONTAINS_MATCHING_JOB_NAME = (
+    'start_time=$SECONDS; '
+    'while true; do '
+    'if (( $SECONDS - $start_time > {timeout} )); then '
+    '  echo "Timeout after {timeout} seconds waiting for job status \'{job_status}\'"; exit 1; '
+    'fi; '
+    'current_queue=$(sky jobs queue); '
+    'current_status=$(echo "$current_queue" | '
+    r'awk "{{name_found=0; '
+    r'for (i=1; i<=NF; i++) if (\$i == \"{job_name}\") name_found=1; '
+    r'if (name_found) for (i=1; i<=NF; i++) if (\$i ~ /^(' +
+    _ALL_MANAGED_JOB_STATUSES + r')$/) print \$i}}"); '
+    'found=0; '
+    'while read -r line; do '
+    '  if [[ "$line" =~ {job_status} ]]; then '
+    '    echo "Target job status {job_status} reached."; '
+    '    found=1; '
+    '    break; '
+    '  fi; '
+    'done <<< "$current_status"; '
+    'if [ "$found" -eq 1 ]; then break; fi; '
+    'echo "Waiting for job status to contain {job_status}, current status: $current_status"; '
+    'echo "Current queue: $current_queue"; '
+    'sleep {gap_seconds}; '
+    'done')
+
+
+def get_cmd_wait_until_managed_job_status_contains_matching_job_name(
+        job_name: str,
+        job_status: Sequence[sky.ManagedJobStatus],
+        timeout: int,
+        gap_seconds: int = 10):
+    return _WAIT_UNTIL_MANAGED_JOB_STATUS_CONTAINS_MATCHING_JOB_NAME.format(
+        job_name=job_name,
+        job_status=_statuses_to_str(job_status),
+        timeout=timeout,
+        gap_seconds=gap_seconds)
+
+
+_WAIT_UNTIL_PIPELINE_TASK_STATUS = (
+    # A while loop to wait until a pipeline task (identified by line number)
+    # reaches a certain status, with timeout.
+    'start_time=$SECONDS; '
+    'while true; do '
+    'if (( $SECONDS - $start_time > {timeout} )); then '
+    '  echo "Timeout after {timeout} seconds waiting for task {task_line} to be {expected_status}"; exit 1; '
+    'fi; '
+    's=$(sky jobs queue); echo "$s"; '
+    'task_status=$(echo "$s" | grep -A 4 {job_name} | sed -n {task_line}p); '
+    'if echo "$task_status" | grep -E -q "{expected_status}"; then '
+    '  echo "Task {task_line} reached status {expected_status}."; break; '
+    'fi; '
+    'echo "Waiting for task {task_line} to be {expected_status}, current: $task_status"; '
+    'sleep 5; '
+    'done')
+
+
+def get_cmd_wait_until_pipeline_task_status(job_name: str, task_line: int,
+                                            expected_status: str, timeout: int):
+    """Get a command that waits until a pipeline task reaches a certain status.
+
+    Args:
+        job_name: The name of the job
+        task_line: The line number in the pipeline output (2 = first task, 3 = second, etc.)
+        expected_status: The expected status string (e.g., "CANCELLING|CANCELLED")
+        timeout: Timeout in seconds
+    """
+    return _WAIT_UNTIL_PIPELINE_TASK_STATUS.format(
+        job_name=job_name,
+        task_line=task_line,
+        expected_status=expected_status,
+        timeout=timeout)
+
+
+_WAIT_UNTIL_JOB_STATUS_SUCCEEDED = (
+    'start_time=$SECONDS; '
+    'while true; do '
+    'if (( $SECONDS - $start_time > {timeout} )); then '
+    '  echo "Timeout after {timeout} seconds waiting for job to succeed"; exit 1; '
+    'fi; '
+    'if sky logs {cluster_name} {job_id} --status | grep "SUCCEEDED"; then '
+    '  echo "Job {job_id} succeeded."; break; '
+    'fi; '
+    'echo "Waiting for job {job_id} to succeed..."; '
+    'sleep 10; '
+    'done')
+
+
+def get_cmd_wait_until_job_status_succeeded(cluster_name: str,
+                                            job_id: str,
+                                            timeout: int = 30):
+    return _WAIT_UNTIL_JOB_STATUS_SUCCEEDED.format(cluster_name=cluster_name,
+                                                   job_id=job_id,
+                                                   timeout=timeout)
+
+
+DEFAULT_CMD_TIMEOUT = 15 * 60
+
+# Per-command timeout for tests that configure `logs.store`.
+#
+# Configuring a log store adds a "Setting up logging agent" step to every
+# cluster launch, which installs fluent-bit on each node. That install runs
+# `apt-get update` and `apt-get install` against the distro package mirrors
+# before fetching fluent-bit itself. On a freshly booted VM the package index
+# refresh is the dominant cost -- it has been observed taking anywhere from 4 to
+# 19 minutes when a mirror is serving at ~100 kB/s, while the (much larger)
+# fluent-bit package downloads from its own CDN in seconds. That pushes a single
+# `sky launch` past the default budget, so give these tests enough room to ride
+# out a slow mirror instead of relying on retries.
+LOG_STORE_CMD_TIMEOUT = 30 * 60
+
+# Time for a managed job to go from submitted to RUNNING when a log store is
+# configured: the job's cluster is provisioned from scratch and pays the
+# fluent-bit install described above before the job can start. Kept below
+# LOG_STORE_CMD_TIMEOUT so that this wait, rather than the enclosing per-command
+# timeout, is what reports the failure.
+LOG_STORE_JOB_START_TIMEOUT = 25 * 60
+
+
+class Test(NamedTuple):
+    name: str
+    # Each command is executed serially.  If any failed, the remaining commands
+    # are not run and the test is treated as failed.
+    # Command can either be:
+    # - bash script (str), will be called as a subprocess via Popen.
+    # - a python Callable, will be executed directly. This is useful for testing
+    #   our python SDK in smoke test. The Callable can be generator to yield logs
+    #   that reflects current test status.
+    commands: List[Union[str, Callable[[], None]]]
+    teardown: Optional[str] = None
+    # Timeout for each command in seconds.
+    timeout: int = DEFAULT_CMD_TIMEOUT
+    # Environment variables to set for each command.
+    env: Optional[Dict[str, str]] = None
+    # Config dictionary to override the skypilot config.
+    config_dict: Optional[Dict[str, Any]] = None
+
+    def echo(self, message: str):
+        # pytest's xdist plugin captures stdout; print to stderr so that the
+        # logs are streaming while the tests are running.
+        prefix = f'[{self.name}]'
+        message = f'{prefix} {message}'
+        message = message.replace('\n', f'\n{prefix} ')
+        self.echo_without_prefix(message)
+
+    @classmethod
+    def echo_without_prefix(cls, message: str):
+        print(message, file=sys.stderr, flush=True)
+
+
+def get_timeout(generic_cloud: str,
+                override_timeout: int = DEFAULT_CMD_TIMEOUT):
+    timeouts = {
+        'fluidstack': 60 * 60,  # file_mounts
+        'slurm':
+            40 *
+            60  # Slurm uses NFS which is slower to write to for file_mounts tests
+    }
+    return timeouts.get(generic_cloud, override_timeout)
+
+
+def get_cluster_name() -> str:
+    """Returns a user-unique cluster name for each test_<name>().
+
+    Must be called from each test_<name>().
+    """
+    caller_func_name = inspect.stack()[1][3]
+    test_name = caller_func_name.replace('_', '-').replace('test-', 't-')
+    test_name = test_name.replace('managed-jobs', 'jobs')
+    # Use 20 to avoid cluster name to be truncated twice for managed jobs.
+    test_name = common_utils.make_cluster_name_on_cloud(test_name,
+                                                        20,
+                                                        add_user_hash=False)
+    return f'{test_name}-{test_id}'
+
+
+def is_eks_cluster() -> bool:
+    cmd = 'kubectl config view --minify -o jsonpath='\
+          '{.clusters[0].cluster.server}' \
+          ' | grep -q "eks\.amazonaws\.com"'
+    result = subprocess.run(cmd,
+                            shell=True,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    return result.returncode == 0
+
+
+def kubectl_for_cluster(cluster_name: str) -> str:
+    """``kubectl --context <ctx>`` with <ctx> resolved at *shell* runtime
+    to the kubeconfig context that contains a pod for ``cluster_name``.
+
+    Smoke pipelines fall into two shapes:
+
+    * Single-context (kind-based): only ``kind-skypilot`` exists, so the
+      discovery loop short-circuits on the first iteration.
+    * Multi-context (shared-GKE): the runner has the API server's
+      cluster as current-context and the workload cluster as a second
+      entry; the loop picks the one that actually owns the pod.
+
+    The returned string is meant to be interpolated into an f-string
+    command, e.g. ``f'{kubectl_for_cluster(name)} delete pod foo'``.
+    The context lookup runs at command-execution time (not test-collection
+    time), so it sees the pod created by an earlier ``sky launch`` step.
+    """
+    return (
+        f'kubectl --context "$(for c in $(kubectl config get-contexts -o name); '
+        f'do kubectl --context "$c" get pods -o name 2>/dev/null '
+        f'| grep -q {cluster_name} && echo "$c" && break; done)"')
+
+
+def get_replica_cluster_name_on_gcp(name: str, replica_id: int) -> str:
+    cluster_name = serve.generate_replica_cluster_name(name, replica_id)
+    return common_utils.make_cluster_name_on_cloud(
+        cluster_name, sky.GCP.max_cluster_name_length())
+
+
+def get_managed_job_cluster_name_prefix_on_gcp(job_name: str) -> str:
+    """Prefix of a managed job's GCP cluster name that is safe to filter on.
+
+    The jobs controller names a job's cluster
+    ``<job_name[:JOBS_CLUSTER_NAME_PREFIX_LENGTH]>-<job_id>`` and the GCP
+    provisioner then applies ``make_cluster_name_on_cloud`` with GCP's 35-char
+    limit, which truncates the display name and appends
+    ``-<2-char hash>-<8-char user hash>``. The 24- to 25-char names that
+    ``get_cluster_name`` produces no longer fit, so the job id and the tail of
+    the name are cut off and a ``labels.ray-cluster-name:<full name>`` filter
+    never matches. Only the leading ``35 - 2 - 1 - 9 = 23`` characters are
+    guaranteed to survive, so return those. gcloud's ``:`` operator is a
+    word-prefix match, so the prefix also matches when nothing was truncated.
+    Matching on ~23 chars keeps the first two chars of ``test_id``, the same
+    entropy the filter had before ``test_id`` grew to four chars.
+    """
+    display_name_prefix = common_utils.make_cluster_name_on_cloud(
+        job_name, jobs.JOBS_CLUSTER_NAME_PREFIX_LENGTH, add_user_hash=False)
+    # '-<user hash>' is appended after the cluster name hash.
+    user_hash_length = common_utils.USER_HASH_LENGTH + 1
+    max_length = sky.GCP.max_cluster_name_length()
+    assert max_length is not None
+    keep = (max_length - common_utils.CLUSTER_NAME_HASH_LENGTH - 1 -
+            user_hash_length)
+    # A cut can land on a separator; a trailing '-' would make the gcloud
+    # ':' pattern end in an empty word.
+    return display_name_prefix[:keep].rstrip('-')
+
+
+def terminate_gcp_replica(name: str, zone: str, replica_id: int) -> str:
+    name_on_cloud = get_replica_cluster_name_on_gcp(name, replica_id)
+    query_cmd = (f'gcloud compute instances list --filter='
+                 f'"(labels.ray-cluster-name:{name_on_cloud})" '
+                 f'--zones={zone} --format="value(name)"')
+    return (f'gcloud compute instances delete --zone={zone}'
+            f' --quiet $({query_cmd})')
+
+
+@contextlib.contextmanager
+def override_sky_config(
+    test: Optional[Test] = None,
+    env_dict: Optional[Dict[str, str]] = None,
+    config_dict: Optional[Dict[str, Any]] = None,
+) -> Generator[Optional[tempfile.NamedTemporaryFile], None, None]:
+    echo = Test.echo_without_prefix if test is None else test.echo
+    env_before_override: Optional[Dict[str, Any]] = None
+    config_file_override = pytest_config_file_override()
+    if config_file_override:
+        override_sky_config_dict = (
+            skypilot_config.parse_and_validate_config_file(config_file_override)
+        )
+    else:
+        override_sky_config_dict = (skypilot_config.config_utils.Config())
+
+    if env_dict is None:
+        env_dict = os.environ
+        env_before_override = os.environ.copy()
+
+    if config_dict is not None:
+        override_sky_config_dict.update(config_dict)
+
+    # Collect env overrides that need to be set in real os.environ for SDK
+    # calls. When env_dict is a copy (passed from run_one_test), SDK calls
+    # read from real os.environ, not env_dict. We use patch.dict to properly
+    # manage these overrides with automatic cleanup.
+    env_overrides: Dict[str, str] = {}
+
+    if is_remote_server_test():
+        endpoint = get_api_server_url()
+        override_sky_config_dict.set_nested(('api_server', 'endpoint'),
+                                            endpoint)
+        # For test that use SDK, not subprocess, the python process already
+        # cache the lru_cache of get_server_url and created the sky_config
+        # before we override the environment, so we need to disabled the
+        # lru_cache of get_server_url and set SKY_API_SERVER_URL_ENV_VAR
+        # to make sure the new endpoint is used.
+        env_overrides[constants.SKY_API_SERVER_URL_ENV_VAR] = endpoint
+        echo(
+            f'Overriding API server endpoint: '
+            f'{override_sky_config_dict.get_nested(("api_server", "endpoint"), "UNKNOWN")}'
+        )
+        if services_account_token_configured_in_env_file():
+            config_file = pytest_config_file_override()
+            config = skypilot_config.parse_and_validate_config_file(config_file)
+            service_account_token = config.get_nested(
+                ('api_server', 'service_account_token'), 'UNKNOWN')
+            override_sky_config_dict.set_nested(
+                ('api_server', 'service_account_token'), service_account_token)
+            env_overrides[
+                constants.SERVICE_ACCOUNT_TOKEN_ENV_VAR] = service_account_token
+            echo(
+                f'Overriding service account token {service_account_token[:4]}...'
+            )
+    if pytest_controller_cloud():
+        cloud = pytest_controller_cloud()
+        override_sky_config_dict.set_nested(
+            ('jobs', 'controller', 'resources', 'cloud'), cloud)
+        override_sky_config_dict.set_nested(
+            ('serve', 'controller', 'resources', 'cloud'), cloud)
+        echo(
+            f'Overriding controller cloud: '
+            f'{override_sky_config_dict.get_nested(("jobs", "controller", "resources", "cloud"), "UNKNOWN")}'
+        )
+    if is_grpc_enabled_test():
+        env_overrides[env_options.Options.ENABLE_GRPC.env_key] = '1'
+
+    if not override_sky_config_dict:
+        yield None
+        return
+
+    temp_config_file = tempfile.NamedTemporaryFile(mode='w', suffix='.yaml')
+    if skypilot_config.ENV_VAR_GLOBAL_CONFIG in env_dict:
+        # Read the original config
+        original_config = skypilot_config.parse_and_validate_config_file(
+            env_dict[skypilot_config.ENV_VAR_GLOBAL_CONFIG])
+    else:
+        original_config = skypilot_config.get_user_config()
+    overlay_config = skypilot_config.overlay_skypilot_config(
+        original_config, override_sky_config_dict)
+    temp_config_file.write(yaml_utils.dump_yaml_str(dict(overlay_config)))
+    temp_config_file.flush()
+
+    # Add config file to env overrides
+    env_overrides[skypilot_config.ENV_VAR_GLOBAL_CONFIG] = temp_config_file.name
+
+    # Update env_dict for subprocess calls
+    env_dict.update(env_overrides)
+    if (env_before_override is not None and
+            skypilot_config.ENV_VAR_GLOBAL_CONFIG in env_before_override):
+        env_dict[skypilot_config.ENV_VAR_GLOBAL_CONFIG +
+                 '_ORIGINAL'] = env_before_override[
+                     skypilot_config.ENV_VAR_GLOBAL_CONFIG]
+
+    def _clear_caches():
+        """Clear caches so they pick up new/restored env vars."""
+        server_common.get_server_url.cache_clear()
+        server_common.is_api_server_local.cache_clear()
+        skypilot_config.reload_config()
+
+    # Use patch.dict to properly manage os.environ for SDK calls.
+    # This ensures env vars are set in real os.environ (not just env_dict)
+    # and automatically restored when the context exits.
+    with patch.dict(os.environ, env_overrides):
+        _clear_caches()
+        try:
+            yield temp_config_file
+        finally:
+            pass  # patch.dict handles os.environ restoration
+    # After patch.dict exits, clear caches again to pick up restored env
+    _clear_caches()
+
+    if env_before_override is not None:
+        os.environ.clear()
+        os.environ.update(env_before_override)
+
+
+def _resolve_callable(func):
+    seen = set()
+    while True:
+        if id(func) in seen:
+            break
+        seen.add(id(func))
+        if isinstance(func, functools.partial):
+            func = func.func
+            continue
+        if isinstance(func, MethodType):
+            func = func.__func__
+            continue
+        if (hasattr(func, '__call__') and not inspect.isfunction(func) and
+                not inspect.ismethod(func)):
+            func = func.__call__
+            continue
+        break
+    return func
+
+
+def get_callable_source(func):
+    target = _resolve_callable(func)
+    try:
+        src = inspect.getsource(target)
+    except (OSError, TypeError, IOError):
+        return None, None, None
+    try:
+        file = inspect.getsourcefile(target) or inspect.getfile(target)
+    except Exception:
+        file = None
+    try:
+        _, lineno = inspect.getsourcelines(target)
+    except Exception:
+        lineno = None
+    return file, lineno, src
+
+
+def ensure_iterable_result(func):
+    result = func()
+    if inspect.isgenerator(result):
+        return result
+    elif result is None:
+        return []
+    else:
+        return [result]
+
+
+def run_one_test(test: Test, check_sky_status: bool = True) -> None:
+    # Fail fast if `sky` CLI somehow errors out.
+    if check_sky_status:
+        test.commands.insert(0, 'sky status -u')
+
+    log_to_stdout = os.environ.get('LOG_TO_STDOUT', None)
+    if log_to_stdout:
+        write = test.echo
+        flush = lambda: None
+        subprocess_out = sys.stderr
+        test.echo('Test started. Log to stdout')
+    else:
+        log_file = tempfile.NamedTemporaryFile('a',
+                                               prefix=f'{test.name}-',
+                                               suffix='.log',
+                                               delete=False)
+        write = log_file.write
+        flush = log_file.flush
+        subprocess_out = log_file
+        test.echo(f'Test started. Log: less -r {log_file.name}')
+
+    env_dict = os.environ.copy()
+    if test.env:
+        env_dict.update(test.env)
+
+    # The test's overall exit status. Tracked separately from any single
+    # `proc` because a command may be a callable, which has no process
+    # behind it: a test whose first command is a callable would otherwise
+    # reach the reporting block below with `proc` unbound and die with
+    # `UnboundLocalError`, masking the real failure in the pytest summary.
+    returncode = 0
+    command = None
+
+    with override_sky_config(test, env_dict, config_dict=test.config_dict):
+        for command in test.commands:
+            if callable(command):
+                try:
+                    write(f'+ callable: {command!r}\n')
+                    flush()
+                    for output in ensure_iterable_result(command):
+                        write(str(output) + '\n')
+                        flush()
+                except Exception as e:
+                    file, lineno, src = get_callable_source(command)
+                    error_in_callable = f'Error executing callable command: {e} at {file}:{lineno}\ncode: {src}\ntraceback: {traceback.format_exc()}'
+                    test.echo(error_in_callable)
+                    write(error_in_callable + '\n')
+                    flush()
+                    returncode = 1
+                    break
+                continue
+            write(f'+ {command}\n')
+            flush()
+            proc = subprocess.Popen(
+                command,
+                stdout=subprocess_out,
+                stderr=subprocess.STDOUT,
+                shell=True,
+                executable='/bin/bash',
+                env=env_dict,
+            )
+            try:
+                proc.wait(timeout=test.timeout)
+            except subprocess.TimeoutExpired as e:
+                flush()
+                test.echo(f'Timeout after {test.timeout} seconds.')
+                test.echo(str(e))
+                write(f'Timeout after {test.timeout} seconds.\n')
+                flush()
+                # Kill the current process.
+                proc.terminate()
+                returncode = 1  # proc.returncode is None if we don't set it.
+                break
+
+            returncode = proc.returncode
+            if returncode:
+                break
+
+        style = colorama.Style
+        fore = colorama.Fore
+        outcome = (f'{fore.RED}Failed{style.RESET_ALL} (returned {returncode})'
+                   if returncode else f'{fore.GREEN}Passed{style.RESET_ALL}')
+        reason = f'\nReason: {command}' if returncode else ''
+        msg = (f'{outcome}.'
+               f'{reason}')
+        if log_to_stdout:
+            test.echo(msg)
+        else:
+            msg += f'\nLog: less -r {log_file.name}\n'
+            test.echo(msg)
+            write(msg)
+
+        if returncode:
+            # Fetch controller logs for failed jobs
+            script_path = os.path.join(os.path.dirname(__file__), 'scripts',
+                                       'fetch_failed_job_logs.sh')
+            if os.path.exists(script_path):
+                write('=== Fetching Failed Job Logs ===\n')
+                flush()
+                write(f'+ bash {script_path}\n')
+                flush()
+                script_proc = subprocess.Popen(
+                    f'bash {script_path}',
+                    stdout=subprocess_out,
+                    stderr=subprocess.STDOUT,
+                    shell=True,
+                    executable='/bin/bash',
+                    env=env_dict,
+                )
+                try:
+                    script_proc.wait(timeout=300)  # 5 minutes timeout
+                except subprocess.TimeoutExpired:
+                    write('Timeout after 300 seconds fetching failed job logs.')
+                    script_proc.terminate()
+                write('=== End of Failed Job Logs ===\n')
+                flush()
+            else:
+                error_msg = (f'Script not found: {script_path}, '
+                             f'skipping failed job log fetch')
+                write(error_msg + '\n')
+                flush()
+
+            if not is_remote_server_test():
+                write('=== Sky API Server Log (last 100 lines) ===')
+                # Read the log file directly and echo it
+                log_path = os.path.expanduser('~/.sky/api_server/server.log')
+                if os.path.exists(log_path):
+                    with open(log_path, 'r') as f:
+                        lines = f.readlines()
+                        # Get last 100 lines
+                        last_lines = lines[-100:] if len(lines) > 100 else lines
+                        for line in last_lines:
+                            write(line.rstrip())
+                else:
+                    write(f'Server log file not found: {log_path}')
+                write('=== End of Sky API Server Log ===')
+
+        if (returncode == 0 or
+                pytest.terminate_on_failure) and test.teardown is not None:
+            subprocess_utils.run(
+                test.teardown,
+                stdout=subprocess_out,
+                stderr=subprocess.STDOUT,
+                timeout=20 * 60,  # 20 mins
+                shell=True,
+                env=env_dict,
+            )
+
+        if returncode:
+            if log_to_stdout:
+                raise Exception(f'test failed')
+            else:
+                raise Exception(f'test failed: less -r {log_file.name}')
+
+
+def get_aws_region_for_quota_failover() -> Optional[str]:
+    candidate_regions = AWS.regions_with_offering(instance_type='p4d.24xlarge',
+                                                  accelerators=None,
+                                                  use_spot=True,
+                                                  region=None,
+                                                  zone=None)
+    original_resources = sky.Resources(infra='aws',
+                                       instance_type='p4d.24xlarge',
+                                       use_spot=True)
+
+    # Filter the regions with proxy command in ~/.sky/config.yaml.
+    filtered_regions = original_resources.get_valid_regions_for_launchable()
+    candidate_regions = [
+        region for region in candidate_regions
+        if region.name in filtered_regions
+    ]
+
+    for region in candidate_regions:
+        resources = original_resources.copy(region=region.name)
+        if not AWS.check_quota_available(resources):
+            return region.name
+
+    return None
+
+
+def get_gcp_region_for_quota_failover() -> Optional[str]:
+
+    candidate_regions = GCP.regions_with_offering(instance_type=None,
+                                                  accelerators={'A100-80GB': 1},
+                                                  use_spot=True,
+                                                  region=None,
+                                                  zone=None)
+
+    original_resources = sky.Resources(infra='gcp',
+                                       instance_type='a2-ultragpu-1g',
+                                       accelerators={'A100-80GB': 1},
+                                       use_spot=True)
+
+    # Filter the regions with proxy command in ~/.sky/config.yaml.
+    filtered_regions = original_resources.get_valid_regions_for_launchable()
+    candidate_regions = [
+        region for region in candidate_regions
+        if region.name in filtered_regions
+    ]
+
+    for region in candidate_regions:
+        if not GCP.check_quota_available(
+                original_resources.copy(region=region.name)):
+            return region.name
+
+    return None
+
+
+VALIDATE_LAUNCH_OUTPUT = (
+    # Validate the output of the job submission:
+    # ⚙️ Launching on Kubernetes.
+    #   Pod is up.
+    # ✓ Cluster launched: test. View logs at: ~/sky_logs/sky-2024-10-07-19-44-18-177288/provision.log
+    # ✓ Setup Detached.
+    # ⚙️ Job submitted, ID: 1.
+    # ├── Waiting for task resources on 1 node.
+    # └── Job started. Streaming logs... (Ctrl-C to exit log streaming; job will not be killed)
+    # (setup pid=1277) running setup
+    # (min, pid=1277) Package    Version
+    # (min, pid=1277) ---------- -------
+    # (min, pid=1277) pip        24.0
+    # (min, pid=1277)
+    # (min, pid=1277) task run finish
+    # ✓ Job finished (status: SUCCEEDED).
+    #
+    # Job ID: 1
+    # 📋 Useful Commands
+    # ├── To cancel the job:          sky cancel test 1
+    # ├── To stream job logs:         sky logs test 1
+    # └── To view job queue:          sky queue test
+    #
+    # Cluster name: test
+    # ├── To log into the head VM:    ssh test
+    # ├── To submit a job:            sky exec test yaml_file
+    # ├── To stop the cluster:        sky stop test
+    # └── To teardown the cluster:    sky down test
+    # Reset s to remove any line with FutureWarning
+    's=$(echo "$s" | grep -v "FutureWarning") && '
+    'echo "$s" && echo "==Validating launching==" && '
+    'echo "$s" | grep -A 1 "Launching on" | grep "is up." && '
+    'echo "$s" && echo "==Validating setup output==" && '
+    'echo "$s" | grep -A 5 "Setup detached" | grep "Job submitted" && '
+    'echo "==Validating running output hints==" && echo "$s" | '
+    'grep -A 1 "Job submitted, ID:" | '
+    'grep "Waiting for task resources on " && '
+    'echo "==Validating task setup/run output starting==" && echo "$s" | '
+    'grep -A 1 "Job started. Streaming logs..." | grep "(setup" | '
+    'grep "running setup" && '
+    'echo "$s" | grep -A 1 "(setup" | grep "(min, pid=" && '
+    'echo "==Validating task output ending==" && '
+    'echo "$s" | grep -A 1 "task run finish" | '
+    'grep "Job finished (status: SUCCEEDED)" && '
+    'echo "==Validating task output ending 2==" && '
+    'echo "$s" | grep -A 5 "Job finished (status: SUCCEEDED)" | '
+    'grep "Job ID:" && '
+    'echo "$s" | grep -A 1 "Useful Commands" | grep "Job ID:"')
+
+VALIDATE_LAUNCH_OUTPUT_NO_PG_CONN_CLOSED_ERROR = (
+    VALIDATE_LAUNCH_OUTPUT +
+    ' && echo "==Validating no pg conn closed error==" && '
+    '! echo "$s" | grep -i "psycopg2.InterfaceError: connection already closed"'
+)
+
+# Asserts that the raylet's soft nofile limit was raised. SkyPilot targets
+# 1048576, but a host whose hard limit is lower cannot reach it (raising a hard
+# limit requires CAP_SYS_RESOURCE, which containers usually lack), so the
+# expected value is min(1048576, hard limit).
+_CHECK_RAYLET_NOFILE_LIMIT = (
+    "pid=$(pgrep -f 'raylet/raylet --raylet_socket_name'); "
+    'soft=$(prlimit --nofile --pid=$pid --noheadings --output=SOFT); '
+    'hard=$(prlimit --nofile --pid=$pid --noheadings --output=HARD); '
+    'expected=1048576; '
+    'if [ "$hard" != unlimited ] && [ "$hard" -lt 1048576 ]; then '
+    'expected=$hard; fi; '
+    'echo "raylet $pid nofile: soft=$soft hard=$hard expected=$expected"; '
+    '[ "$soft" = "$expected" ]')
+
+
+def get_check_raylet_nofile_limit_cmd(cluster_name: str) -> str:
+    """Returns a `sky exec` checking the raylet's open files limit."""
+    return f'sky exec {cluster_name} {shlex.quote(_CHECK_RAYLET_NOFILE_LIMIT)}'
+
+
+def get_disk_size_and_validate_launch_output(generic_cloud: str):
+    """Get DISK_SIZE_PARAM and VALIDATE_LAUNCH_OUTPUT for a given cloud.
+
+    For RunPod, returns:
+    - DISK_SIZE_PARAM: '--disk-size 20'
+    - VALIDATE_LAUNCH_OUTPUT: Modified version with increased grep context
+      to handle RunPod's raw_response and banner output
+
+    For other clouds, returns:
+    - DISK_SIZE_PARAM: ''
+    - VALIDATE_LAUNCH_OUTPUT: Standard VALIDATE_LAUNCH_OUTPUT
+
+    Returns:
+        tuple: (DISK_SIZE_PARAM, VALIDATE_LAUNCH_OUTPUT)
+    """
+    if generic_cloud == 'runpod':
+        disk_size_param = '--disk-size 20'
+        # Use -A 10 instead of -A 1 for "Launching on" line to handle RunPod raw_response output
+        # Use -A 100 instead of -A 1 for "Job started. Streaming logs..." to handle RunPod banner output
+        validate_launch_output = (VALIDATE_LAUNCH_OUTPUT.replace(
+            'grep -A 1 "Launching on"', 'grep -A 10 "Launching on"').replace(
+                'grep -A 1 "Job started. Streaming logs..."',
+                'grep -A 100 "Job started. Streaming logs..."'))
+    else:
+        disk_size_param = ''
+        validate_launch_output = VALIDATE_LAUNCH_OUTPUT
+
+    return disk_size_param, validate_launch_output
+
+
+_CLOUD_CMD_CLUSTER_NAME_SUFFIX = '-cloud-cmd'
+
+
+# === Helper functions for executing cloud commands ===
+# When the API server is remote, we should make sure that the tests can run
+# without cloud credentials or cloud dependencies locally. To do this, we run
+# the cloud commands required in tests on a separate remote cluster with the
+# cloud credentials and dependencies setup.
+#
+# Set `skip_remote_server_check=True` to opt-in to using the remote helper
+# cluster regardless of whether the API server is local or remote. This is
+# useful for running cloud commands while the cluster being tested is
+# stopped and you need to run cloud commands.
+#
+# Example usage:
+# Test(
+#     'mytest',
+#     [
+#         launch_cluster_for_cloud_cmd('aws', 'mytest-cluster'),
+#         # ... commands for the test ...
+#         # Run the cloud commands on the remote cluster.
+#         run_cloud_cmd_on_cluster('mytest-cluster', 'aws ec2 describe-instances'),
+#         # ... commands for the test ...
+#     ],
+#     chain_teardown('sky down -y mytest-cluster',
+#                    down_cluster_for_cloud_cmd('mytest-cluster')),
+# )
+def launch_cluster_for_cloud_cmd(cloud: str,
+                                 test_cluster_name: str,
+                                 skip_remote_server_check: bool = False) -> str:
+    """Launch the cluster for cloud commands asynchronously."""
+    cluster_name = test_cluster_name + _CLOUD_CMD_CLUSTER_NAME_SUFFIX
+    if not skip_remote_server_check and sky.server.common.is_api_server_local(
+    ) and not is_remote_server_test():
+        # We need is_remote_server_test() because we override the SKY_API_SERVER_URL_ENV_VAR
+        # in the middle of the test, which is after the test is launched, so the
+        # is_api_server_local() already cached and returned True but we're actually
+        # running the test on the remote server if --remote-server is specified.
+        return 'true'
+    else:
+        return (
+            f'sky launch -y -c {cluster_name} --infra {cloud} {LOW_RESOURCE_ARG} --async'
+        )
+
+
+def k8s_landed_context_file(name: str) -> str:
+    return f'/tmp/sky-smoke-k8s-context-{name}'
+
+
+def resolve_k8s_context_cmd(name: str) -> str:
+    """Resolve, once on the API-connected test driver, the kubeconfig context
+    the cluster landed on, and persist it so the cloud-cmd cluster can be pinned
+    to the same context. For Kubernetes a cluster's ``region`` is its context.
+
+    On a multi-context API server the cluster may land on any context. The
+    cloud-cmd helper is a regular (non-controller) cluster, so by default it
+    uses the Kubernetes SERVICE_ACCOUNT remote_identity: its ``kubectl`` runs
+    with the helper pod's own in-cluster credentials, which only reach the
+    helper's own cluster (the API server's multi-context kubeconfig is uploaded
+    only to controller clusters). Pinning the helper to the target's context
+    puts both on the same cluster, so the helper's ``kubectl`` can see the
+    target's resources.
+    """
+    # Write the context from within Python rather than redirecting stdout:
+    # importing sky may emit logs to stdout (e.g. LOG_TO_STDOUT=1), which would
+    # otherwise contaminate the captured value. A missing cluster or context
+    # raises, failing the step loudly rather than writing an empty context that
+    # would silently leave the cloud-cmd cluster unpinned.
+    resolve = (f"import sky; "
+               f"clusters = sky.get(sky.status(['{name}'])); "
+               f"ctx = clusters[0].region; "
+               f"open('{k8s_landed_context_file(name)}', 'w').write(ctx)")
+    return f'python -c {shlex.quote(resolve)}'
+
+
+def launch_cloud_cmd_on_landed_context(name: str) -> str:
+    """Launch the cloud-cmd cluster pinned to the context the target cluster
+    landed on (see :func:`resolve_k8s_context_cmd`), so its in-cluster kubectl
+    shares the target cluster.
+    """
+    return launch_cluster_for_cloud_cmd(
+        f'kubernetes/$(cat {k8s_landed_context_file(name)})', name)
+
+
+def resolve_cloud_cmd_k8s_context_cmd(test_cluster_name: str) -> str:
+    """Resolve+persist the context the cloud-cmd helper landed on, so a later
+    ``sky launch`` can be pinned to the same context (the inverse of
+    :func:`launch_cloud_cmd_on_landed_context`, which pins the helper to an
+    existing target). Use when a test mutates cluster state *via the helper*
+    (e.g. ``kubectl create`` a pod) and then launches a real cluster that must
+    land on that same context to interact with it.
+
+    No-op when the API server is local: there is no cloud-cmd helper
+    (see :func:`launch_cluster_for_cloud_cmd`) and only one context exists, so
+    the subsequent launch is already co-located.
+    """
+    if server_common.is_api_server_local() and not is_remote_server_test():
+        return 'true'
+    return resolve_k8s_context_cmd(test_cluster_name +
+                                   _CLOUD_CMD_CLUSTER_NAME_SUFFIX)
+
+
+def cloud_cmd_landed_k8s_infra(test_cluster_name: str) -> str:
+    """``--infra`` value that pins a ``sky launch`` to the cloud-cmd helper's
+    landed context on a remote/multi-context server (paired with
+    :func:`resolve_cloud_cmd_k8s_context_cmd`), or plain ``kubernetes`` locally
+    (single context, no helper).
+    """
+    if server_common.is_api_server_local() and not is_remote_server_test():
+        return 'kubernetes'
+    return (
+        'kubernetes/$(cat '
+        f'{k8s_landed_context_file(test_cluster_name + _CLOUD_CMD_CLUSTER_NAME_SUFFIX)})'
+    )
+
+
+def run_cloud_cmd_on_cluster(test_cluster_name: str,
+                             cmd: str,
+                             envs: Set[str] = None,
+                             timeout: int = 180,
+                             skip_remote_server_check: bool = False,
+                             setup_cmd: Optional[str] = None) -> str:
+    """Run the cloud command on the remote cluster for cloud commands.
+
+    Args:
+        setup_cmd: Optional command to prepare the remote cloud-cmd cluster
+            (e.g. installing cloud CLIs into the SkyPilot runtime venv). Only
+            run when `cmd` targets the remote cluster: when the API server is
+            local, `cmd` runs verbatim on the local machine, where the
+            runtime venv does not exist and the local environment is assumed
+            to already have the cloud dependencies.
+    """
+    cluster_name = test_cluster_name + _CLOUD_CMD_CLUSTER_NAME_SUFFIX
+    if not skip_remote_server_check and sky.server.common.is_api_server_local(
+    ) and not is_remote_server_test():
+        return cmd
+    else:
+        if setup_cmd is not None:
+            # Group `cmd` so that a setup failure fails the whole command
+            # instead of falling through to any `||` branches in `cmd`.
+            # Strip trailing semicolons from `cmd` first: `;;` inside the
+            # group is a bash syntax error.
+            cmd = f'{setup_cmd} && {{ {cmd.rstrip().rstrip(";")}; }}'
+        cmd = f'{constants.ACTIVATE_SKY_REMOTE_PYTHON_ENV} && {cmd}'
+        wait_for_cluster_up = get_cmd_wait_until_cluster_status_contains(
+            cluster_name=cluster_name,
+            cluster_status=[sky.ClusterStatus.UP],
+            timeout=timeout,
+        )
+        envs_str = ''
+        if envs is not None:
+            envs_str = ' '.join([f'--env {env}' for env in envs])
+        return (f'{wait_for_cluster_up}; '
+                f'sky exec {envs_str} {cluster_name} {shlex.quote(cmd)} && '
+                f'sky logs {cluster_name} --status')
+
+
+def down_cluster_for_cloud_cmd(test_cluster_name: str,
+                               skip_remote_server_check: bool = False) -> str:
+    """Down the cluster for cloud commands."""
+    cluster_name = test_cluster_name + _CLOUD_CMD_CLUSTER_NAME_SUFFIX
+    if not skip_remote_server_check and sky.server.common.is_api_server_local(
+    ) and not is_remote_server_test():
+        return 'true'
+    else:
+        return f'sky down -y {cluster_name}'
+
+
+def chain_teardown(*cmds: str) -> str:
+    """Chains teardown steps so a failing one does not skip the others.
+
+    Chaining with `&&` stops at the first failure and leaks whatever the later
+    steps would have cleaned up (typically the cloud-cmd helper cluster);
+    chaining with `;` hides failures because only the last exit code survives.
+    Here every step runs and the chain still exits non-zero if any failed.
+    """
+    parts = ['__teardown_rc=0']
+    for cmd in cmds:
+        # Strip trailing semicolons: `{ cmd; ; }` is a bash syntax error.
+        parts.append(f'{{ {cmd.strip().rstrip(";")}; }} || __teardown_rc=1')
+    parts.append('exit $__teardown_rc')
+    # Run in a subshell so the final `exit` cannot terminate an outer shell,
+    # e.g. when a chain is used as a step of another chain.
+    return f'( {"; ".join(parts)} )'
+
+
+def extract_default_aws_credentials():
+    """Extract default AWS credentials from credentials file or environment variables.
+
+    Returns:
+        Tuple of (access_key_id, secret_access_key) or (None, None) if not found.
+    """
+    # Try environment variables first
+    access_key = os.environ.get('AWS_ACCESS_KEY_ID')
+    secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
+    if access_key and secret_key:
+        return access_key, secret_key
+
+    # Try credentials file
+    credentials_path = os.path.expanduser('~/.aws/credentials')
+    if os.path.exists(credentials_path):
+        parser = configparser.ConfigParser()
+        try:
+            parser.read(credentials_path)
+            if 'default' in parser.sections():
+                access_key = parser.get('default',
+                                        'aws_access_key_id',
+                                        fallback=None)
+                secret_key = parser.get('default',
+                                        'aws_secret_access_key',
+                                        fallback=None)
+                if access_key and secret_key:
+                    return access_key.strip(), secret_key.strip()
+        except configparser.Error:
+            pass
+
+    return None, None
+
+
+def _increase_initial_delay_seconds(original_cmd: str,
+                                    factor: float = 2) -> Tuple[str, str]:
+    yaml_file = re.search(r'\s([^ ]+\.yaml)', original_cmd).group(1)
+    with open(yaml_file, 'r') as f:
+        yaml_content = f.read()
+    original_initial_delay_seconds = re.search(r'initial_delay_seconds: (\d+)',
+                                               yaml_content).group(1)
+    new_initial_delay_seconds = int(original_initial_delay_seconds) * factor
+    yaml_content = re.sub(
+        r'initial_delay_seconds: \d+',
+        f'initial_delay_seconds: {new_initial_delay_seconds}', yaml_content)
+    f = tempfile.NamedTemporaryFile('w', suffix='.yaml', delete=False)
+    f.write(yaml_content)
+    f.flush()
+    return f.name, original_cmd.replace(yaml_file, f.name)
+
+
+@contextlib.contextmanager
+def increase_initial_delay_seconds_for_slow_cloud(cloud: str):
+    """Increase initial delay seconds for slow clouds to reduce flakiness and failure during setup."""
+
+    def _context_func(original_cmd: str, factor: float = 2):
+        if cloud != 'kubernetes':
+            return original_cmd
+        file_name, new_cmd = _increase_initial_delay_seconds(
+            original_cmd, factor)
+        files.append(file_name)
+        return new_cmd
+
+    files = []
+    try:
+        yield _context_func
+    finally:
+        for file in files:
+            os.unlink(file)
+
+
+def is_remote_server_test() -> bool:
+    return os.environ.get('PYTEST_SKYPILOT_REMOTE_SERVER_TEST',
+                          None) is not None
+
+
+def pytest_controller_cloud() -> Optional[str]:
+    return os.environ.get('PYTEST_SKYPILOT_CONTROLLER_CLOUD', None)
+
+
+def is_postgres_backend_test() -> bool:
+    return os.environ.get('PYTEST_SKYPILOT_POSTGRES_BACKEND', None) is not None
+
+
+def is_grpc_enabled_test() -> bool:
+    return os.environ.get('PYTEST_SKYPILOT_GRPC_ENABLED', None) is not None
+
+
+def pytest_config_file_override() -> Optional[str]:
+    return os.environ.get('PYTEST_SKYPILOT_CONFIG_FILE_OVERRIDE', None)
+
+
+def services_account_token_configured_in_env_file() -> bool:
+    file_path = pytest_config_file_override()
+    if file_path is not None:
+        with open(file_path, 'r') as f:
+            content = f.read()
+            # Which env-file config a run picked up is worth seeing in the
+            # log, but the file is a client config: it carries
+            # api_server.service_account_token in plaintext. Print it through
+            # the same redaction the config dumps use, never raw.
+            print(config_utils.dump_redacted_yaml(
+                yaml_utils.safe_load(content)),
+                  file=sys.stderr,
+                  flush=True)
+            return 'service_account_token' in content
+    return False
+
+
+def pytest_override_env_config_file(config: Dict[str, str]):
+    """Override the environment variable for the test."""
+    for key, value in config.items():
+        os.environ[key] = value
+
+
+def get_api_server_url() -> str:
+    """Get the API server URL in the test environment."""
+    if is_remote_server_test():
+        file_path = pytest_config_file_override()
+        if file_path is not None:
+            config = skypilot_config.parse_and_validate_config_file(file_path)
+            endpoint = config.get_nested(('api_server', 'endpoint'), None)
+            if endpoint is not None:
+                return endpoint
+        return docker_utils.get_api_server_endpoint_inside_docker()
+    return server_common.get_server_url()
+
+
+def endpoint_url_has_credentials() -> bool:
+    """Whether the API server endpoint URL embeds basic-auth credentials.
+
+    TEMPORARY. This exists to work around a known gap in OSS auth and every
+    caller must be removed once that gap is fixed.
+
+    A URL of the form ``https://user:pw@host`` is the documented login for the
+    helm chart's basic-auth ingress. A job launched with ``api_server_access``
+    gets that URL copied into its pod next to a service-account token. When
+    the pod's client sends a request, ``requests`` builds a Basic header from
+    the URL credentials and overwrites the ``Authorization: Bearer`` header
+    the token was set on (``PreparedRequest.prepare_auth``; reproduced on
+    requests 2.34.2). The ingress validates Basic and strips the header, so
+    the API server gets no credential and records the job under the pod's
+    self-generated user id instead of the launching user's.
+
+    A test that expects the launching user to see a job launched from a task
+    cannot pass under this condition. Callers relax to all-users queries when
+    this returns True and stay strict everywhere else. Returns False when the
+    endpoint URL cannot be parsed.
+    """
+    try:
+        return urllib.parse.urlsplit(get_api_server_url()).username is not None
+    except ValueError:
+        return False
+
+
+def get_metrics_server_url() -> str:
+    """Get the metrics server URL in the test environment."""
+    if is_remote_server_test():
+        return docker_utils.get_metrics_endpoint_inside_docker()
+    return 'http://127.0.0.1:9090'
+
+
+def is_non_docker_remote_api_server() -> bool:
+    if is_remote_server_test():
+        return 'host.docker.internal' not in get_api_server_url()
+    return False
+
+
+def is_docker_remote_api_server() -> bool:
+    if is_remote_server_test():
+        return 'host.docker.internal' in get_api_server_url()
+    return False
+
+
+def get_dashboard_cluster_status_request_id() -> str:
+    """Get the status of the cluster from the dashboard."""
+    body = payloads.StatusBody(all_users=True,)
+    response = server_common.make_authenticated_request(
+        'POST',
+        '/internal/dashboard/status',
+        json=json.loads(body.model_dump_json()),
+        server_url=get_api_server_url())
+    return server_common.get_request_id(response)
+
+
+def get_dashboard_jobs_queue_request_id() -> str:
+    """Get the jobs queue from the dashboard."""
+    body = payloads.JobsQueueV2Body(all_users=True, limit=1000)
+    response = server_common.make_authenticated_request(
+        'POST',
+        '/internal/dashboard/jobs/queue/v2',
+        json=json.loads(body.model_dump_json()),
+        server_url=get_api_server_url())
+    return server_common.get_request_id(response)
+
+
+def get_response_from_request_id_dashboard(request_id: str) -> Any:
+    """Waits for and gets the result of a request.
+
+    Args:
+        request_id: The request ID of the request to get.
+
+    Returns:
+        The ``Request Returns`` of the specified request. See the documentation
+        of the specific requests above for more details.
+
+    Raises:
+        Exception: It raises the same exceptions as the specific requests,
+            see ``Request Raises`` in the documentation of the specific requests
+            above.
+    """
+    response = server_common.make_authenticated_request(
+        'GET',
+        f'/internal/dashboard/api/get?request_id={request_id}',
+        server_url=get_api_server_url(),
+        timeout=25)
+    request_task = None
+    if response.status_code == 200:
+        request_task = requests_lib.Request.decode(
+            payloads.RequestPayload(**response.json()))
+        return request_task.get_return_value()
+    raise RuntimeError(f'Failed to get request {request_id}: '
+                       f'{response.status_code} {response.text}')
+
+
+def with_config(cmd: str, config_path: str) -> str:
+    return (f'export {skypilot_config.ENV_VAR_GLOBAL_CONFIG}={config_path}; '
+            f'{cmd}')
+
+
+def _get_controller_pod_name(controller_name: str) -> str:
+    return (
+        'kubectl get pods -l app -o custom-columns=NAME:.metadata.name,'
+        'APP:.metadata.labels.app --no-headers | '
+        f'awk \'$2 ~ /sky-{controller_name}-controller/ {{print $1; exit}}\'')
+
+
+def kill_and_wait_controller(test_cluster_name: str,
+                             controller_name: str) -> str:
+    """Kill the controller pod and wait for a new one to be ready."""
+    assert controller_name in ['serve', 'jobs'
+                              ], (f'Invalid controller name: {controller_name}')
+    return run_cloud_cmd_on_cluster(
+        test_cluster_name,
+        f'initial_controller_pod=$({_get_controller_pod_name(controller_name)}); '
+        f'echo "Killing {controller_name} controller pod: $initial_controller_pod"; '
+        'kubectl delete pod $initial_controller_pod; '
+        f'until new_controller_pod=$({_get_controller_pod_name(controller_name)}) && '
+        '[ "$new_controller_pod" != "$initial_controller_pod" ] && '
+        'kubectl get pod $new_controller_pod | grep "1/1"; do '
+        f'  echo "Waiting for new {controller_name} controller pod..."; sleep 5; '
+        'done; '
+        f'echo "New {controller_name} controller pod ready: $new_controller_pod"'
+    )
+
+
+def server_side_is_consolidation_mode() -> bool:
+    """Returns whether consolidation mode is active on the server side.
+
+    Consolidation mode is determined by a signal file on the server, which
+    may be auto-enabled for deploy-mode servers. We detect this by checking
+    whether the server has any jobs controller clusters — if not, jobs are
+    running in consolidation mode.
+
+    For local (non-remote) servers without an existing jobs controller, we
+    also check the local signal file directly.
+    """
+    if is_remote_server_test():
+        # For remote servers, we can't check the signal file directly.
+        # Instead, check if a jobs controller cluster exists. If it does,
+        # we're not in consolidation mode.
+        result = subprocess.run(
+            ['sky', 'status', '-u'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        # If we see a jobs controller cluster, consolidation is off.
+        for line in result.stdout.splitlines():
+            if 'sky-jobs-controller-' in line:
+                return False
+        # No controller cluster found. Check if managed jobs work (i.e.
+        # consolidation mode is active) by checking if jobs queue succeeds.
+        result = subprocess.run(
+            ['sky', 'jobs', 'queue'],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0
+    response = server_common.make_authenticated_request(
+        'GET', '/workspaces/config', server_url=get_api_server_url())
+    request_id = server_common.get_request_id(response)
+    config = config_utils.Config.from_dict(sdk.get(request_id))
+    config = skypilot_config.overlay_skypilot_config(
+        original_config=config, override_configs=skypilot_config.to_dict())
+    with skypilot_config.replace_skypilot_config(config):
+        return managed_job_utils.is_consolidation_mode()
+
+
+def is_in_buildkite_env() -> bool:
+    """Check if the test is running in the Buildkite environment."""
+    return env_options.Options.RUNNING_IN_BUILDKITE.get()
+
+
+def get_available_gpus(default_gpu: str = 'T4',
+                       infra: str = 'kubernetes',
+                       count: int = 1) -> str:
+    """Get the available GPUs for K8s or Slurm."""
+    try:
+        prefix = ''
+        env_file = pytest_config_file_override()
+        if env_file is not None:
+            prefix = f'{skypilot_config.ENV_VAR_GLOBAL_CONFIG}={env_file}'
+        command = f'{prefix} sky gpus list --infra {infra} | grep -A1 "^GPU" | grep " {count}" | tail -1 | awk "{{print \$1}}"'
+        Test.echo_without_prefix(command)
+        result = subprocess_utils.run(command,
+                                      shell=True,
+                                      check=True,
+                                      capture_output=True,
+                                      text=True)
+        gpu_name = result.stdout.strip()
+        return gpu_name
+    except Exception as e:
+        Test.echo_without_prefix(f'Error getting available GPUs: {e}')
+        return default_gpu
+
+
+def get_enabled_cloud_storages() -> List[clouds.Cloud]:
+    """Get the enabled cloud storages."""
+    if is_remote_server_test():
+        prefix = ''
+        env_file = pytest_config_file_override()
+        if env_file is not None:
+            prefix = f'{skypilot_config.ENV_VAR_GLOBAL_CONFIG}={env_file}'
+        command = f'{prefix} sky check | grep enabled | grep storage | awk "{{print \\$2}}"'
+        Test.echo_without_prefix(command)
+        result = subprocess_utils.run(command,
+                                      shell=True,
+                                      check=True,
+                                      capture_output=True,
+                                      text=True)
+        cloud_names = result.stdout.strip().split('\n')
+        enabled_clouds = []
+        for cloud_name in cloud_names:
+            if cloud_name:
+                cloud_name = cloud_name.rstrip(':')
+                try:
+                    cloud_obj = registry.CLOUD_REGISTRY.from_str(cloud_name)
+                    if cloud_obj is not None:
+                        enabled_clouds.append(cloud_obj)
+                except ValueError:
+                    pass
+        return enabled_clouds
+    # Local API server: the client shares the server's state, so the cached
+    # enabled-storage-clouds list is authoritative and cheaper than shelling
+    # out to `sky check`.
+    #
+    # Do not hardcode a cloud here. Callers use this to decide which object
+    # stores are usable, so a wrong answer is wrong in both directions: too
+    # narrow silently drops real store coverage, too wide pins a store whose
+    # cloud is disabled and fails the job at FAILED_PRECHECKS.
+    #
+    # Imported lazily: smoke_tests_utils is imported by every test module,
+    # including the limited-dependency lane, and sky.data.storage pulls in the
+    # optional cloud storage SDKs.
+    from sky.data import storage as storage_lib
+    enabled_clouds = []
+    for cloud_name in (
+            storage_lib.get_cached_enabled_storage_cloud_names_or_refresh()):
+        try:
+            cloud_obj = registry.CLOUD_REGISTRY.from_str(cloud_name)
+        except ValueError:
+            # Non-cloud object stores (R2, CoreWeave, VAST, HuggingFace) are
+            # not in the cloud registry.
+            continue
+        if cloud_obj is not None:
+            enabled_clouds.append(cloud_obj)
+    return enabled_clouds
+
+
+def write_blob(file: BinaryIO, total_size: int):
+    """Create a large file."""
+    chunk_size = 1024 * 1024  # 1MB chunks
+    for _ in range(total_size // chunk_size):
+        file.write(os.urandom(chunk_size))
+    remaining_size = total_size % chunk_size
+    if remaining_size > 0:
+        file.write(os.urandom(remaining_size))
+    file.flush()
+
+
+def wait_for_managed_job_status_sdk(job_name: Optional[str] = None,
+                                    target_statuses: Optional[list] = None,
+                                    timeout: int = 360,
+                                    job_id: Optional[int] = None,
+                                    all_users: bool = False) -> dict:
+    """Wait for a managed job to reach one of the target statuses.
+
+    ``all_users`` widens the query past the calling user. Only pass it when
+    the job under test is known to belong to someone else.
+
+    Identify the job by ``job_id`` where possible: job names are not unique,
+    so on a long-lived API server a name-based wait can match a terminal
+    job left over from an earlier run of the same test and return before
+    the current job has even started. When only ``job_name`` is given, the
+    newest exactly-matching job is tracked for the same reason.
+
+    Returns the job record when the status is reached.
+    """
+    assert target_statuses, 'target_statuses must be non-empty'
+    assert (job_id is None) != (job_name is None), (
+        'Exactly one of job_id or job_name must be provided.')
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        jobs_list = sky.get(
+            sky.jobs.queue_v2(refresh=False,
+                              all_users=all_users,
+                              job_ids=None if job_id is None else [job_id],
+                              fields=['job_id', 'job_name', 'status']))[0]
+        if job_id is None:
+            matches = [j for j in jobs_list if j['job_name'] == job_name]
+        else:
+            matches = jobs_list
+        if matches:
+            job = max(matches, key=lambda j: j['job_id'])
+            if job['status'] in target_statuses:
+                return job
+            print(f'Job {job_name or job_id} status: {job["status"]}')
+        time.sleep(5)
+    raise TimeoutError(f'Timeout waiting for job {job_name or job_id} to reach '
+                       f'{target_statuses}')
+
+
+def unprovisionable_storage_class_name(test_name: str) -> str:
+    """Name of a per-test storage class that can never provision a volume."""
+    return f'{test_name}-noprov'
+
+
+def create_unprovisionable_storage_class_cmd(test_name: str,
+                                             binding_mode: str = 'Immediate'
+                                            ) -> str:
+    """Creates a storage class whose provisioner does not exist.
+
+    This is how a test gets a volume that is genuinely not ready without
+    waiting on -- or paying for -- real storage. The class has to exist, or
+    `sky volumes apply` rejects the volume up front when it validates the
+    storage class; with the class present the claim is accepted and then sits
+    unbound forever, because nothing is watching for it.
+
+    `binding_mode` picks which of the two situations to reproduce. Immediate
+    claims are unbound as soon as they are created, so the volume is knowably
+    unusable before any launch. WaitForFirstConsumer claims are not touched
+    until a pod needs them, so nothing about them looks wrong until a launch is
+    already under way.
+    """
+    sc_name = unprovisionable_storage_class_name(test_name)
+    return (f'kubectl apply -f - <<EOF\n'
+            f'apiVersion: storage.k8s.io/v1\n'
+            f'kind: StorageClass\n'
+            f'metadata:\n'
+            f'  name: {sc_name}\n'
+            f'provisioner: skypilot.co/does-not-exist\n'
+            f'volumeBindingMode: {binding_mode}\n'
+            f'EOF')
+
+
+def delete_unprovisionable_storage_class_cmd(test_name: str) -> str:
+    sc_name = unprovisionable_storage_class_name(test_name)
+    return f'kubectl delete sc {sc_name} --ignore-not-found'
+
+
+# A ReadWriteMany StorageClass cannot be fabricated the way the unprovisionable
+# one above can: RWX needs a real backend behind it. The Buildkite kind lane
+# installs a non-default 'nfs-rwx' class (provisioner nfs.csi.k8s.io); a cloud
+# lane has Filestore or EFS under whatever name the cluster gave it, so point
+# this at that name.
+RWX_STORAGE_CLASS_ENV_VAR = 'PYTEST_SKYPILOT_RWX_STORAGE_CLASS'
+_DEFAULT_RWX_STORAGE_CLASS = 'nfs-rwx'
+
+
+def storage_class_exists(name: str) -> bool:
+    return subprocess.run(['kubectl', 'get', 'sc', name],
+                          capture_output=True,
+                          check=False).returncode == 0
+
+
+def rwx_storage_class_name() -> Optional[str]:
+    """The ReadWriteMany StorageClass to test against, if the cluster has one.
+
+    Returns None when it does not, for the caller to fall back to a volume type
+    that needs no storage backend. Falling back rather than skipping keeps the
+    rest of the test -- everything that is not specific to RWX -- running on
+    every lane.
+
+    Raises:
+        AssertionError: if RWX_STORAGE_CLASS_ENV_VAR names a class the cluster
+            does not have. An explicit request that cannot be honoured is an
+            error, not a reason to quietly test something else.
+    """
+    explicit = os.environ.get(RWX_STORAGE_CLASS_ENV_VAR)
+    if explicit is not None:
+        assert storage_class_exists(explicit), (
+            f'{RWX_STORAGE_CLASS_ENV_VAR}={explicit!r} is not a StorageClass '
+            f'on the cluster kubectl points at.')
+        return explicit
+    if storage_class_exists(_DEFAULT_RWX_STORAGE_CLASS):
+        return _DEFAULT_RWX_STORAGE_CLASS
+    return None
+
+
+# How to make each CSI driver refuse to provision. A class whose provisioner
+# does not exist is not enough for the tests that need a *rejection*: nothing
+# answers such a claim at all, so it only ever collects Normal events, and a
+# claim that reports nothing cannot be told from one that is merely slow. What
+# these entries produce is a ProvisioningFailed carrying a terminal gRPC code,
+# which is what a launch is supposed to fail on at once.
+#
+# Both were confirmed against the driver rather than assumed: nfs.csi.k8s.io
+# answers a class with no parameters with `code = InvalidArgument desc = server
+# is a required parameter`, and the Filestore driver answers a tier its API does
+# not have with `code = InvalidArgument desc = Invalid value at 'instance.tier'`.
+# Two other candidates do not work and are recorded so they are not retried: an
+# unreachable `server` binds anyway (the driver does not check connectivity, so
+# the failure only shows up at mount time), and an absurd capacity binds anyway
+# too (an NFS volume is a directory, whatever size it claims).
+_REJECTED_BY_PROVISIONER = {
+    'nfs.csi.k8s.io': '',
+    'filestore.csi.storage.gke.io': '  tier: not-a-real-tier\n',
+}
+
+
+def _storage_class_provisioner(name: str) -> Optional[str]:
+    proc = subprocess.run(
+        ['kubectl', 'get', 'sc', name, '-o', 'jsonpath={.provisioner}'],
+        capture_output=True,
+        text=True,
+        check=False)
+    return proc.stdout.strip() or None
+
+
+def rejecting_storage_class_name(test_name: str) -> str:
+    return f'{test_name}-reject'
+
+
+def create_rejecting_storage_class_cmd(
+        test_name: str,
+        binding_mode: str = 'WaitForFirstConsumer') -> Optional[str]:
+    """Command creating a class whose driver refuses the claims made on it.
+
+    `binding_mode` picks when the refusal arrives. Under
+    WaitForFirstConsumer the driver is not called until a pod asks for the
+    claim, so the volume is correctly ready right up to the launch that breaks
+    it -- the one situation no pre-launch check can catch. Under Immediate the
+    driver is called when the claim is created, so the volume is knowably
+    unusable before any launch.
+
+    Borrows the provisioner from the cluster's RWX class, which is the one
+    driver a lane is known to have. Returns None when that driver has no known
+    way to refuse, for the caller to skip: guessing risks the opposite of the
+    intended failure, a class that provisions real storage.
+    """
+    rwx_class = rwx_storage_class_name()
+    if rwx_class is None:
+        return None
+    provisioner = _storage_class_provisioner(rwx_class)
+    parameters = _REJECTED_BY_PROVISIONER.get(provisioner)
+    if parameters is None:
+        return None
+    body = (f'apiVersion: storage.k8s.io/v1\n'
+            f'kind: StorageClass\n'
+            f'metadata:\n'
+            f'  name: {rejecting_storage_class_name(test_name)}\n'
+            f'provisioner: {provisioner}\n'
+            f'volumeBindingMode: {binding_mode}\n')
+    if parameters:
+        body += f'parameters:\n{parameters}'
+    return f'kubectl apply -f - <<EOF\n{body}EOF'
+
+
+def delete_rejecting_storage_class_cmd(test_name: str) -> str:
+    sc_name = rejecting_storage_class_name(test_name)
+    return f'kubectl delete sc {sc_name} --ignore-not-found'
+
+
+def wait_until_volume_is_rejected_cmd(volume_name: str,
+                                      timeout: int = 180) -> str:
+    """A step that blocks until the volume's record carries a rejection.
+
+    A volume on a rejecting class is not-ready from the moment it is created,
+    but for the first refresh cycle the recorded reason is that it is still
+    being provisioned -- which is what `volume_apply` can see without waiting.
+    Only once the status refresh has read the driver's answer does the record
+    say it was refused, and that is what a launch is refused over: the reason,
+    not the not-ready flag, since being provisioned is also not-ready.
+
+    Measured on the kind lane: the driver answers within seconds, the record
+    catches up in about a minute (the refresh daemon's interval).
+    """
+    return (f'start_time=$SECONDS; '
+            f'while true; do '
+            f'  vols=$(sky volumes ls); '
+            f'  row=$(echo "$vols" | grep {volume_name} || true); '
+            f'  echo "$row"; '
+            f'  if echo "$row" | grep -q ProvisioningFailed; then '
+            f'    echo "Volume {volume_name} is recorded as refused."; break; '
+            f'  fi; '
+            f'  if (( $SECONDS - $start_time > {timeout} )); then '
+            f'    echo "$vols"; '
+            f'    echo "Timeout after {timeout} seconds waiting for volume '
+            f'{volume_name} to be recorded as refused"; exit 1; '
+            f'  fi; '
+            f'  sleep 10; '
+            f'done')
+
+
+# Pins a command to the cluster the agent's kubectl points at, so a volume and
+# the storage class created for it land together.
+AGENT_K8S_INFRA = '--infra k8s/$(kubectl config current-context)'

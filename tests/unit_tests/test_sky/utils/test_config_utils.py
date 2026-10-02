@@ -1,0 +1,1364 @@
+import copy
+
+import pytest
+
+from sky import exceptions
+from sky.utils import config_utils
+
+
+def test_nested_config(monkeypatch) -> None:
+    """Test that the nested config works."""
+    config = config_utils.Config()
+    config.set_nested(('aws', 'ssh_proxy_command'), 'value')
+    assert config == {'aws': {'ssh_proxy_command': 'value'}}
+
+    assert config.get_nested(('admin_policy',), 'default') == 'default'
+    config.set_nested(('aws', 'use_internal_ips'), True)
+    assert config == {
+        'aws': {
+            'ssh_proxy_command': 'value',
+            'use_internal_ips': True
+        }
+    }
+
+
+def test_recursive_update_k8s_config():
+    base_config = {
+        'kubernetes': {
+            'allowed_contexts': ['base1', 'base2'],
+            'pod_config': {
+                'containers': [{
+                    'resources': {
+                        'limits': {
+                            'cpu': '1',
+                            'memory': '1Gi'
+                        },
+                        'requests': {
+                            'cpu': '0.5'
+                        }
+                    }
+                }]
+            }
+        }
+    }
+    override_config = {
+        'kubernetes': {
+            'allowed_contexts': ['override1', 'override2'],
+            'pod_config': {
+                'containers': [{
+                    'resources': {
+                        'limits': {
+                            'memory': '2Gi',
+                        },
+                        'requests': {
+                            'memory': '1Gi'
+                        }
+                    }
+                }]
+            }
+        }
+    }
+
+    config_utils._recursive_update(base_config, override_config)
+    assert base_config['kubernetes']['allowed_contexts'] == [
+        'override1', 'override2'
+    ]
+    container = base_config['kubernetes']['pod_config']['containers'][0]
+    assert container['resources']['limits'] == {'cpu': '1', 'memory': '2Gi'}
+    assert container['resources']['requests'] == {'cpu': '0.5', 'memory': '1Gi'}
+
+
+def test_merge_k8s_configs_with_container_resources():
+    """Test merging Kubernetes configs with container resource specifications."""
+    base_config = {
+        'containers': [{
+            'resources': {
+                'limits': {
+                    'cpu': '1',
+                    'memory': '1Gi'
+                },
+                'requests': {
+                    'cpu': '0.5'
+                }
+            }
+        }]
+    }
+    override_config = {
+        'containers': [{
+            'resources': {
+                'limits': {
+                    'memory': '2Gi'
+                },
+                'requests': {
+                    'memory': '1Gi'
+                }
+            }
+        }]
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+    container = base_config['containers'][0]
+    assert container['resources']['limits'] == {'cpu': '1', 'memory': '2Gi'}
+    assert container['resources']['requests'] == {'cpu': '0.5', 'memory': '1Gi'}
+
+
+def test_merge_k8s_configs_with_init_container_resources():
+    """Test merging Kubernetes configs with initContainer specifications."""
+    base_config = {
+        'initContainers': [{
+            'name': 'init-container',
+            'image': 'init-image:latest',
+        }]
+    }
+    override_config = {
+        'initContainers': [{
+            'name': 'init-container',
+            'image': 'override-image:latest',
+        }]
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+    assert len(base_config['initContainers']) == 1
+    container = base_config['initContainers'][0]
+    assert container['image'] == 'override-image:latest'
+
+
+def test_merge_k8s_configs_with_deeper_override():
+    base_config = {
+        'containers': [{
+            'resources': {
+                'limits': {
+                    'cpu': '1',
+                    'memory': '1Gi'
+                },
+            }
+        }]
+    }
+    override_config = {
+        'containers': [{
+            'resources': {
+                'limits': {
+                    'memory': '2Gi'
+                },
+                'requests': {
+                    'memory': '1Gi'
+                }
+            }
+        }]
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+    container = base_config['containers'][0]
+    assert container['resources']['limits'] == {'cpu': '1', 'memory': '2Gi'}
+    assert container['resources']['requests'] == {'memory': '1Gi'}
+
+
+def test_config_nested_empty_intermediate():
+    """Test setting nested config with empty intermediate dictionaries."""
+    config = config_utils.Config()
+
+    # Set deeply nested value with no existing intermediate dicts
+    config.set_nested(('a', 'b', 'c', 'd'), 'value')
+    assert config.get_nested(('a', 'b', 'c', 'd'), None) == 'value'
+
+    # Verify intermediate dictionaries were created
+    assert isinstance(config['a'], dict)
+    assert isinstance(config['a']['b'], dict)
+    assert isinstance(config['a']['b']['c'], dict)
+
+
+def test_config_get_nested_with_override():
+    """Test getting nested config with overrides."""
+    config = config_utils.Config({'a': {'b': {'c': 1}}})
+
+    # Test simple override
+    value = config.get_nested(('a', 'b', 'c'),
+                              default_value=None,
+                              override_configs={'a': {
+                                  'b': {
+                                      'c': 2
+                                  }
+                              }})
+    assert value == 2
+
+    # Test override with allowed keys
+    value = config.get_nested(('a', 'b', 'c'),
+                              default_value=None,
+                              override_configs={'a': {
+                                  'b': {
+                                      'c': 3
+                                  }
+                              }},
+                              allowed_override_keys=[('a', 'b', 'c')])
+    assert value == 3
+
+    # Test override with disallowed keys
+    with pytest.raises(ValueError):
+        config.get_nested(('a', 'b', 'c'),
+                          default_value=None,
+                          override_configs={'a': {
+                              'b': {
+                                  'c': 4
+                              }
+                          }},
+                          disallowed_override_keys=[('a', 'b', 'c')])
+
+
+def test_merge_k8s_configs_with_image_pull_secrets():
+    """Test merging Kubernetes configs with imagePullSecrets."""
+    base_config = {'imagePullSecrets': [{'name': 'secret1'}]}
+    override_config = {
+        'imagePullSecrets': [{
+            'name': 'secret2',
+            'namespace': 'test'
+        }]
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+    assert len(base_config['imagePullSecrets']) == 1
+    assert base_config['imagePullSecrets'][0]['name'] == 'secret2'
+    assert base_config['imagePullSecrets'][0]['namespace'] == 'test'
+
+
+def test_merge_k8s_configs_image_pull_secrets_empty_override_clears():
+    """An empty override list clears the inherited secrets."""
+    base_config = {'imagePullSecrets': [{'name': 'regcred'}]}
+
+    config_utils.merge_k8s_configs(base_config, {'imagePullSecrets': []})
+    assert base_config['imagePullSecrets'] == []
+
+
+def test_merge_k8s_configs_image_pull_secrets_multiple():
+    """More than one secret in the override replaces the base list."""
+    base_config = {'imagePullSecrets': [{'name': 'regcred'}]}
+    override_config = {
+        'imagePullSecrets': [{
+            'name': 'secret1'
+        }, {
+            'name': 'secret2'
+        }]
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+    assert base_config['imagePullSecrets'] == [{
+        'name': 'secret1'
+    }, {
+        'name': 'secret2'
+    }]
+
+
+def test_merge_k8s_configs_image_pull_secrets_empty_base():
+    """An empty base list must not be indexed into."""
+    base_config = {'imagePullSecrets': []}
+
+    config_utils.merge_k8s_configs(base_config,
+                                   {'imagePullSecrets': [{
+                                       'name': 'regcred'
+                                   }]})
+    assert base_config['imagePullSecrets'] == [{'name': 'regcred'}]
+
+
+@pytest.mark.parametrize(
+    'key,base_value,override_value',
+    [
+        ('containers', {
+            'name': 'ray-node'
+        }, [{
+            'name': 'other'
+        }]),
+        ('tolerations', 'oops', [{
+            'key': 'a'
+        }]),
+        # An atomic field is exempt only for a list override: a dict override
+        # recurses into the base, so it still needs a dict there.
+        ('imagePullSecrets', [{
+            'name': 'regcred'
+        }], {
+            'name': 'other'
+        }),
+        ('imagePullSecrets', [{
+            'name': 'regcred'
+        }], 'oops'),
+    ],
+    ids=[
+        'keyed-list-over-dict-base',
+        'appended-list-over-scalar-base',
+        'dict-over-atomic-list-base',
+        'scalar-over-list-base',
+    ])
+def test_merge_k8s_configs_rejects_shape_mismatch(key, base_value,
+                                                  override_value):
+    """A dict/list/scalar mismatch is user input, not an internal error.
+
+    Nested pod_config content is not type-checked by the schema, so these
+    shapes reach the merge and used to raise a bare AssertionError/TypeError
+    or silently replace the whole field.
+    """
+    base_config = {key: base_value}
+
+    with pytest.raises(exceptions.InvalidSkyPilotConfigError, match=key):
+        config_utils.merge_k8s_configs(base_config, {key: override_value})
+
+
+def test_merge_k8s_configs_atomic_list_ignores_base_shape():
+    """An atomic list replaces the base, so its shape is irrelevant."""
+    base_config = {'imagePullSecrets': {'name': 'regcred'}}
+
+    config_utils.merge_k8s_configs(base_config,
+                                   {'imagePullSecrets': [{
+                                       'name': 'other'
+                                   }]})
+    assert base_config['imagePullSecrets'] == [{'name': 'other'}]
+
+
+@pytest.mark.parametrize('base_value', [{'runAsUser': 0}, [{'key': 'a'}], 'x'])
+def test_merge_k8s_configs_null_override_clears(base_value):
+    """An explicit null replaces the value, whatever shape the base has.
+
+    Kubernetes reads a null field as absent, so this is how a config clears a
+    subtree inherited from a lower-priority source.
+    """
+    base_config = {'securityContext': base_value}
+
+    config_utils.merge_k8s_configs(base_config, {'securityContext': None})
+    assert base_config == {'securityContext': None}
+
+
+@pytest.mark.parametrize('key,override_value', [
+    ('securityContext', {
+        'runAsUser': 0
+    }),
+    ('containers', [{
+        'name': 'x'
+    }]),
+    ('tolerations', [{
+        'key': 'a'
+    }]),
+    ('imagePullSecrets', [{
+        'name': 'regcred'
+    }]),
+    ('runtimeClassName', 'nvidia'),
+    ('securityContext', None),
+])
+def test_merge_k8s_configs_adds_key_missing_from_base(key, override_value):
+    """A key the base does not have is added as-is, whatever its shape.
+
+    The shape check only applies to keys present on both sides, so it must not
+    reject a field that only the higher-priority config sets.
+    """
+    base_config = {'unrelated': 1}
+
+    config_utils.merge_k8s_configs(base_config, {key: override_value})
+    assert base_config == {'unrelated': 1, key: override_value}
+
+
+def test_merge_k8s_configs_allows_scalar_override():
+    """Only container/scalar mismatches are rejected, not scalar retyping."""
+    base_config = {'runtimeClassName': 'nvidia', 'replicas': 1}
+
+    config_utils.merge_k8s_configs(base_config, {
+        'runtimeClassName': 'gvisor',
+        'replicas': '2'
+    })
+    assert base_config == {'runtimeClassName': 'gvisor', 'replicas': '2'}
+
+
+def test_merge_k8s_configs_self_merge_keyed_lists_are_idempotent():
+    """Self-merging must not duplicate items in lists with a patch merge key.
+
+    Lists without a patch merge key are appended by design, so they are
+    excluded here; callers that may self-merge must avoid it themselves.
+    """
+    pod_config = {
+        'metadata': {
+            'annotations': {
+                'existing': 'annotation'
+            }
+        },
+        'spec': {
+            'containers': [{
+                'name': 'ray-node',
+                'env': [{
+                    'name': 'FOO',
+                    'value': 'bar'
+                }],
+                'args': ['--flag'],
+            }],
+            'volumes': [{
+                'name': 'vol',
+                'emptyDir': {}
+            }],
+            'imagePullSecrets': [{
+                'name': 'regcred'
+            }],
+        },
+    }
+    expected = copy.deepcopy(pod_config)
+
+    config_utils.merge_k8s_configs(pod_config, copy.deepcopy(pod_config))
+    assert pod_config == expected
+
+
+def test_merge_k8s_configs_self_merge_with_empty_image_pull_secrets():
+    """Self-merge of a config that clears imagePullSecrets must not raise."""
+    pod_config = {
+        'spec': {
+            'containers': [{
+                'imagePullPolicy': 'IfNotPresent'
+            }],
+            'imagePullSecrets': [],
+        }
+    }
+
+    config_utils.merge_k8s_configs(pod_config, copy.deepcopy(pod_config))
+    assert pod_config['spec']['imagePullSecrets'] == []
+
+
+def test_config_override_with_allowed_keys():
+    """Test config override with allowed keys restrictions."""
+    base_config = config_utils.Config({
+        'aws': {
+            'vpc_name': 'default-vpc',
+            'security_group': 'default-sg'
+        },
+        'gcp': {
+            'project_id': 'default-project'
+        }
+    })
+
+    override_config = {
+        'aws': {
+            'vpc_name': 'custom-vpc'
+        },
+        'gcp': {
+            'project_id': 'custom-project'  # This should fail
+        }
+    }
+
+    # Only allow aws.vpc_name to be overridden
+    allowed_keys = [('aws', 'vpc_name')]
+
+    # We raise error whenever the override key is not in the allowed keys.
+    with pytest.raises(ValueError, match='not in allowed override keys:'):
+        base_config.get_nested(('aws', 'vpc_name'),
+                               default_value=None,
+                               override_configs=override_config,
+                               allowed_override_keys=allowed_keys)
+
+    # Should raise error when trying to override disallowed key
+    with pytest.raises(ValueError, match='not in allowed override keys:'):
+        base_config.get_nested(('gcp', 'project_id'),
+                               default_value=None,
+                               override_configs=override_config,
+                               allowed_override_keys=allowed_keys)
+
+    allowed_keys = [('aws', 'vpc_name'), ('gcp', 'project_id')]
+    value = base_config.get_nested(('aws', 'vpc_name'),
+                                   default_value=None,
+                                   override_configs=override_config,
+                                   allowed_override_keys=allowed_keys)
+    assert value == 'custom-vpc'
+
+    value = base_config.get_nested(('gcp', 'project_id'),
+                                   default_value=None,
+                                   override_configs=override_config,
+                                   allowed_override_keys=allowed_keys)
+    assert value == 'custom-project'
+
+    override_config = {
+        'aws': {
+            'vpc_name': 'custom-vpc',
+            'security_group': 'custom-sg'
+        }
+    }
+    with pytest.raises(ValueError, match='not in allowed override keys:'):
+        base_config.get_nested(('aws', 'vpc_name'),
+                               default_value=None,
+                               override_configs=override_config,
+                               allowed_override_keys=allowed_keys)
+
+    allowed_keys = [('aws', 'vpc_name'), ('aws', 'security_group')]
+    value = base_config.get_nested(('aws', 'security_group'),
+                                   default_value=None,
+                                   override_configs=override_config,
+                                   allowed_override_keys=allowed_keys)
+    assert value == 'custom-sg'
+
+    allowed_keys = [('aws',)]
+    value = base_config.get_nested(('aws', 'vpc_name'),
+                                   default_value=None,
+                                   override_configs=override_config,
+                                   allowed_override_keys=allowed_keys)
+    assert value == 'custom-vpc'
+
+
+def test_k8s_config_merge_with_multiple_volumes():
+    """Test merging Kubernetes configs with multiple volume configurations."""
+    base_config = {
+        'volumes': [{
+            'name': 'vol1',
+            'hostPath': '/path1'
+        }, {
+            'name': 'vol2',
+            'hostPath': '/path2'
+        }],
+        'volumeMounts': [{
+            'name': 'vol1',
+            'mountPath': '/mnt1'
+        }, {
+            'name': 'vol2',
+            'mountPath': '/mnt2'
+        }]
+    }
+
+    override_config = {
+        'volumes': [
+            {
+                'name': 'vol1',
+                'hostPath': '/new-path1'
+            },  # Should update existing
+            {
+                'name': 'vol3',
+                'hostPath': '/path3'
+            }  # Should append
+        ],
+        'volumeMounts': [
+            {
+                'name': 'vol1',
+                'mountPath': '/new-mnt1'
+            },  # Should update existing
+            {
+                'name': 'vol3',
+                'mountPath': '/mnt3'
+            }  # Should append
+        ]
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+
+    # Check volumes
+    assert len(base_config['volumes']) == 3
+    vol1 = next(v for v in base_config['volumes'] if v['name'] == 'vol1')
+    assert vol1['hostPath'] == '/new-path1'
+    vol3 = next(v for v in base_config['volumes'] if v['name'] == 'vol3')
+    assert vol3['hostPath'] == '/path3'
+
+    # Check volumeMounts - mountPath is the merge key per K8s API spec,
+    # so vol1 at /new-mnt1 is a new entry (different mountPath from /mnt1),
+    # giving us 4 total: /mnt1, /mnt2, /new-mnt1, /mnt3
+    assert len(base_config['volumeMounts']) == 4
+    expected_mounts = [
+        ('vol1', '/mnt1'),
+        ('vol2', '/mnt2'),
+        ('vol1', '/new-mnt1'),
+        ('vol3', '/mnt3'),
+    ]
+    actual_mounts = [
+        (m['name'], m['mountPath']) for m in base_config['volumeMounts']
+    ]
+    assert sorted(actual_mounts) == sorted(expected_mounts)
+
+
+def test_k8s_config_merge_volumemounts_same_name_different_subpath():
+    """Two volumeMounts sharing a volume name but different
+    mountPath/subPath must both survive the merge. This is the
+    standard K8s pattern for projecting Secret keys into paths."""
+    base_config = {
+        'volumes': [{
+            'name': 'git-creds',
+            'secret': {
+                'secretName': 'creds'
+            }
+        }],
+        'volumeMounts': []
+    }
+
+    override_config = {
+        'volumeMounts': [{
+            'name': 'git-creds',
+            'mountPath': '/home/sky/.gitconfig',
+            'subPath': 'gitconfig',
+            'readOnly': True
+        }, {
+            'name': 'git-creds',
+            'mountPath': '/home/sky/.git-credentials',
+            'subPath': 'credentials',
+            'readOnly': True
+        }]
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+
+    assert len(base_config['volumeMounts']) == 2
+    expected_mounts = [
+        ('git-creds', '/home/sky/.gitconfig'),
+        ('git-creds', '/home/sky/.git-credentials'),
+    ]
+    actual_mounts = [
+        (m['name'], m['mountPath']) for m in base_config['volumeMounts']
+    ]
+    assert sorted(actual_mounts) == sorted(expected_mounts)
+
+
+def test_k8s_config_merge_volumemounts_same_name_base_and_override():
+    """Override adds a volumeMount with same volume name as base but different
+    mountPath. Both must survive."""
+    base_config = {
+        'volumeMounts': [{
+            'name': 'shared-vol',
+            'mountPath': '/data/a',
+            'subPath': 'a'
+        }]
+    }
+    override_config = {
+        'volumeMounts': [{
+            'name': 'shared-vol',
+            'mountPath': '/data/b',
+            'subPath': 'b'
+        }]
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+
+    assert len(base_config['volumeMounts']) == 2
+    expected_mounts = [
+        ('shared-vol', '/data/a'),
+        ('shared-vol', '/data/b'),
+    ]
+    actual_mounts = [
+        (m['name'], m['mountPath']) for m in base_config['volumeMounts']
+    ]
+    assert sorted(actual_mounts) == sorted(expected_mounts)
+
+
+def test_nested_config_override_precedence():
+    """Test that config overrides follow correct precedence rules."""
+    base_config = config_utils.Config({
+        'kubernetes': {
+            'pod_config': {
+                'metadata': {
+                    'labels': {
+                        'env': 'prod',
+                        'team': 'ml'
+                    }
+                },
+                'spec': {
+                    'containers': [{
+                        'resources': {
+                            'limits': {
+                                'cpu': '1',
+                                'memory': '1Gi'
+                            }
+                        }
+                    }]
+                }
+            }
+        }
+    })
+
+    override_config = {
+        'kubernetes': {
+            'pod_config': {
+                'metadata': {
+                    'labels': {
+                        'env': 'dev',  # Should override
+                        'project': 'skypilot'  # Should add
+                    }
+                },
+                'spec': {
+                    'containers': [{
+                        'resources': {
+                            'limits': {
+                                'memory': '2Gi'  # Should override
+                            }
+                        }
+                    }]
+                }
+            }
+        }
+    }
+
+    # Get nested value with override
+    result = base_config.get_nested(('kubernetes', 'pod_config'),
+                                    default_value=None,
+                                    override_configs=override_config)
+
+    # Check that labels were properly merged
+    assert result['metadata']['labels'] == {
+        'env': 'dev',
+        'team': 'ml',
+        'project': 'skypilot'
+    }
+
+    # Check that container resources were properly merged
+    container = result['spec']['containers'][0]
+    assert container['resources']['limits'] == {'cpu': '1', 'memory': '2Gi'}
+
+
+def test_nested_config_override_with_nonexistent_key():
+    """Test that config override with nonexistent key in base config."""
+    base_config = config_utils.Config({})
+    override_config = {
+        'kubernetes': {
+            'pod_config': {
+                'metadata': {
+                    'labels': {
+                        'env': 'dev',
+                        'project': 'skypilot'
+                    }
+                }
+            }
+        }
+    }
+    result = base_config.get_nested(('kubernetes', 'pod_config'),
+                                    default_value=None,
+                                    override_configs=override_config)
+    assert result == override_config['kubernetes']['pod_config']
+
+
+def test_get_cloud_config_value_from_dict_ssh_with_context():
+    """Test get_cloud_config_value_from_dict for SSH cloud with context_configs."""
+    # Test SSH cloud with context_configs
+    dict_config = {
+        'ssh': {
+            'pod_config': {
+                'metadata': {
+                    'labels': {
+                        'default': 'true'
+                    }
+                }
+            },
+            'context_configs': {
+                'my-cluster': {
+                    'pod_config': {
+                        'metadata': {
+                            'labels': {
+                                'cluster': 'my-cluster'
+                            }
+                        }
+                    },
+                    'provision_timeout': 3600
+                }
+            }
+        }
+    }
+
+    # Get context-specific pod_config
+    result = config_utils.get_cloud_config_value_from_dict(
+        dict_config=dict_config,
+        cloud='ssh',
+        region='my-cluster',
+        keys=('pod_config',),
+        default_value={})
+
+    expected = {'metadata': {'labels': {'cluster': 'my-cluster'}}}
+    assert result == expected
+
+    # Get context-specific provision_timeout
+    result = config_utils.get_cloud_config_value_from_dict(
+        dict_config=dict_config,
+        cloud='ssh',
+        region='my-cluster',
+        keys=('provision_timeout',),
+        default_value=600)
+    assert result == 3600
+
+    # Get config for non-existent context (should return default)
+    result = config_utils.get_cloud_config_value_from_dict(
+        dict_config=dict_config,
+        cloud='ssh',
+        region='non-existent-cluster',
+        keys=('provision_timeout',),
+        default_value=600)
+    assert result == 600
+
+
+def test_get_cloud_config_value_from_dict_ssh_without_context():
+    """Test get_cloud_config_value_from_dict for SSH cloud without context."""
+    dict_config = {
+        'ssh': {
+            'pod_config': {
+                'metadata': {
+                    'labels': {
+                        'default': 'true'
+                    }
+                }
+            },
+            'provision_timeout': 1800
+        }
+    }
+
+    # Get top-level pod_config (no context)
+    result = config_utils.get_cloud_config_value_from_dict(
+        dict_config=dict_config,
+        cloud='ssh',
+        region=None,
+        keys=('pod_config',),
+        default_value={})
+
+    expected = {'metadata': {'labels': {'default': 'true'}}}
+    assert result == expected
+
+    # Get top-level provision_timeout (no context)
+    result = config_utils.get_cloud_config_value_from_dict(
+        dict_config=dict_config,
+        cloud='ssh',
+        region=None,
+        keys=('provision_timeout',),
+        default_value=600)
+    assert result == 1800
+
+
+def test_get_cloud_config_value_from_dict_kubernetes_with_context():
+    """Test get_cloud_config_value_from_dict for Kubernetes cloud with context_configs."""
+    dict_config = {
+        'kubernetes': {
+            'pod_config': {
+                'metadata': {
+                    'labels': {
+                        'default': 'true'
+                    }
+                }
+            },
+            'context_configs': {
+                'k8s-cluster-1': {
+                    'pod_config': {
+                        'metadata': {
+                            'labels': {
+                                'cluster': 'k8s-cluster-1'
+                            }
+                        }
+                    },
+                    'autoscaler': 'gke'
+                }
+            }
+        }
+    }
+
+    # Get context-specific pod_config
+    # Note: Context configs are MERGED with default configs, not replaced
+    result = config_utils.get_cloud_config_value_from_dict(
+        dict_config=dict_config,
+        cloud='kubernetes',
+        region='k8s-cluster-1',
+        keys=('pod_config',),
+        default_value={})
+
+    expected = {
+        'metadata': {
+            'labels': {
+                'cluster': 'k8s-cluster-1',
+                'default': 'true'  # Default label is preserved and merged
+            }
+        }
+    }
+    assert result == expected
+
+    # Get context-specific autoscaler
+    result = config_utils.get_cloud_config_value_from_dict(
+        dict_config=dict_config,
+        cloud='kubernetes',
+        region='k8s-cluster-1',
+        keys=('autoscaler',),
+        default_value=None)
+    assert result == 'gke'
+
+
+def test_merge_k8s_configs_with_patch_merge_keys():
+    """Test merging Kubernetes configs using patch merge keys."""
+    base_config = {
+        'env': [{
+            'name': 'ENV1',
+            'value': 'value1'
+        }, {
+            'name': 'ENV2',
+            'value': 'value2'
+        }],
+        'ports': [{
+            'containerPort': 8080,
+            'protocol': 'TCP'
+        }]
+    }
+    override_config = {
+        'env': [{
+            'name': 'ENV1',
+            'value': 'updated_value1'
+        }, {
+            'name': 'ENV3',
+            'value': 'value3'
+        }],
+        'ports': [{
+            'containerPort': 8080,
+            'protocol': 'UDP'
+        }, {
+            'containerPort': 9090,
+            'protocol': 'TCP'
+        }]
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+
+    # Check env variables
+    assert len(base_config['env']) == 3
+    env1 = next(e for e in base_config['env'] if e['name'] == 'ENV1')
+    assert env1['value'] == 'updated_value1'
+    env3 = next(e for e in base_config['env'] if e['name'] == 'ENV3')
+    assert env3['value'] == 'value3'
+
+    # Check ports
+    assert len(base_config['ports']) == 2
+    port_8080 = next(
+        p for p in base_config['ports'] if p['containerPort'] == 8080)
+    assert port_8080['protocol'] == 'UDP'
+    port_9090 = next(
+        p for p in base_config['ports'] if p['containerPort'] == 9090)
+    assert port_9090['protocol'] == 'TCP'
+
+
+def test_merge_k8s_configs_with_sidecar_containers():
+    """Test merging Kubernetes configs with sidecar containers.
+
+    This test verifies that adding a sidecar container via pod_config
+    correctly adds a new container instead of replacing the primary container.
+    """
+    base_config = {
+        'spec': {
+            'containers': [{
+                'name': 'ray-node',
+                'image': 'rayproject/ray:latest',
+                'command': ['/bin/bash', '-c', '--'],
+                'args': ['echo hello'],
+                'resources': {
+                    'requests': {
+                        'cpu': '2',
+                        'memory': '4Gi'
+                    }
+                }
+            }]
+        }
+    }
+    override_config = {
+        'spec': {
+            'containers': [{
+                'name': 'sidecar',
+                'image': 'busybox:latest',
+                'command': ['sh', '-c', 'while true; do sleep 60; done'],
+                'resources': {
+                    'requests': {
+                        'cpu': '100m',
+                        'memory': '64Mi'
+                    }
+                }
+            }]
+        }
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+
+    # Verify both containers exist
+    containers = base_config['spec']['containers']
+    assert len(containers) == 2
+
+    # Verify ray-node container is preserved
+    ray_node = next(c for c in containers if c['name'] == 'ray-node')
+    assert ray_node['image'] == 'rayproject/ray:latest'
+    assert ray_node['command'] == ['/bin/bash', '-c', '--']
+    assert ray_node['resources']['requests']['cpu'] == '2'
+
+    # Verify sidecar container is added
+    sidecar = next(c for c in containers if c['name'] == 'sidecar')
+    assert sidecar['image'] == 'busybox:latest'
+    assert sidecar['resources']['requests']['cpu'] == '100m'
+
+
+def test_merge_k8s_configs_with_sidecar_and_primary_container_override():
+    """Test merging configs that override the primary container and add a sidecar."""
+    base_config = {
+        'spec': {
+            'containers': [{
+                'name': 'ray-node',
+                'image': 'rayproject/ray:latest',
+                'resources': {
+                    'requests': {
+                        'cpu': '2',
+                        'memory': '4Gi'
+                    }
+                }
+            }]
+        }
+    }
+    override_config = {
+        'spec': {
+            'containers': [
+                {
+                    'name': 'ray-node',  # Override primary container
+                    'resources': {
+                        'limits': {
+                            'cpu': '4',
+                            'memory': '8Gi'
+                        }
+                    }
+                },
+                {
+                    'name': 'sidecar',  # Add sidecar container
+                    'image': 'busybox:latest',
+                }
+            ]
+        }
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+
+    containers = base_config['spec']['containers']
+    assert len(containers) == 2
+
+    # Verify ray-node container is merged (not replaced)
+    ray_node = next(c for c in containers if c['name'] == 'ray-node')
+    assert ray_node['image'] == 'rayproject/ray:latest'  # Preserved
+    assert ray_node['resources']['requests']['cpu'] == '2'  # Preserved
+    assert ray_node['resources']['limits']['cpu'] == '4'  # Added from override
+
+    # Verify sidecar is added
+    sidecar = next(c for c in containers if c['name'] == 'sidecar')
+    assert sidecar['image'] == 'busybox:latest'
+
+
+def test_merge_k8s_configs_args_replaced_not_extended():
+    """Test that container args are replaced, not extended, when merging.
+
+    This is a regression test for a bug where merging two containers with
+    the same name would extend (concatenate) the args list instead of
+    replacing it. For example, args: ["echo", "hello"] would become
+    args: ["echo", "hello", "echo", "hello"] after merge.
+    """
+    base_config = {
+        'spec': {
+            'initContainers': [{
+                'name': 'my-init',
+                'image': 'busybox:latest',
+                'args': ['echo', 'hello']
+            }]
+        }
+    }
+    override_config = {
+        'spec': {
+            'initContainers': [{
+                'name': 'my-init',
+                'image': 'busybox:latest',
+                'args': ['echo', 'hello']
+            }]
+        }
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+
+    # Args should be replaced, not extended
+    init_container = base_config['spec']['initContainers'][0]
+    assert init_container['args'] == [
+        'echo', 'hello'
+    ], (f"Expected args to be replaced, not extended. Got: {init_container['args']}"
+       )
+
+
+def test_merge_k8s_configs_command_replaced_not_extended():
+    """Test that container command is replaced, not extended, when merging.
+
+    Similar to test_merge_k8s_configs_args_replaced_not_extended but for
+    the command field.
+    """
+    base_config = {
+        'spec': {
+            'containers': [{
+                'name': 'main',
+                'image': 'nginx:latest',
+                'command': ['/bin/sh', '-c']
+            }]
+        }
+    }
+    override_config = {
+        'spec': {
+            'containers': [{
+                'name': 'main',
+                'image': 'nginx:latest',
+                'command': ['/bin/sh', '-c']
+            }]
+        }
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+
+    # Command should be replaced, not extended
+    container = base_config['spec']['containers'][0]
+    assert container['command'] == [
+        '/bin/sh', '-c'
+    ], (f"Expected command to be replaced, not extended. Got: {container['command']}"
+       )
+
+
+def test_merge_k8s_configs_args_override_replaces():
+    """Test that args from override completely replace base args."""
+    base_config = {
+        'spec': {
+            'containers': [{
+                'name': 'main',
+                'args': ['--old-flag', '--old-value']
+            }]
+        }
+    }
+    override_config = {
+        'spec': {
+            'containers': [{
+                'name': 'main',
+                'args': ['--new-flag', '--new-value']
+            }]
+        }
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+
+    container = base_config['spec']['containers'][0]
+    assert container['args'] == [
+        '--new-flag', '--new-value'
+    ], (f"Expected args to be replaced with override. Got: {container['args']}")
+
+
+def test_merge_k8s_configs_env_still_merged_by_name():
+    """Test that env vars are still merged by name (existing behavior preserved)."""
+    base_config = {
+        'spec': {
+            'containers': [{
+                'name': 'main',
+                'env': [{
+                    'name': 'FOO',
+                    'value': '1'
+                }, {
+                    'name': 'BAR',
+                    'value': '2'
+                }]
+            }]
+        }
+    }
+    override_config = {
+        'spec': {
+            'containers': [{
+                'name': 'main',
+                'env': [{
+                    'name': 'FOO',
+                    'value': 'updated'
+                }, {
+                    'name': 'BAZ',
+                    'value': '3'
+                }]
+            }]
+        }
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+
+    container = base_config['spec']['containers'][0]
+    env_names = [e['name'] for e in container['env']]
+
+    # All three env vars should exist (merged by name)
+    assert len(container['env']) == 3
+    assert 'FOO' in env_names
+    assert 'BAR' in env_names
+    assert 'BAZ' in env_names
+
+    # FOO should be updated
+    foo = next(e for e in container['env'] if e['name'] == 'FOO')
+    assert foo['value'] == 'updated'
+
+
+def test_merge_k8s_configs_claims_merged_by_name():
+    """Container-level DRA resources.claims merge by name, no duplicates."""
+    base_config = {
+        'containers': [{
+            'name': 'ray-node',
+            'resources': {
+                'claims': [
+                    {
+                        'name': 'roce-claim'
+                    },
+                    {
+                        'name': 'cd'
+                    },
+                ],
+            },
+        }],
+    }
+    override_config = {
+        'containers': [{
+            'name': 'ray-node',
+            'resources': {
+                'claims': [
+                    {
+                        'name': 'roce-claim'
+                    },
+                    {
+                        'name': 'cd'
+                    },
+                    {
+                        'name': 'extra-claim'
+                    },
+                ],
+            },
+        }],
+    }
+
+    config_utils.merge_k8s_configs(base_config, override_config)
+
+    claims = base_config['containers'][0]['resources']['claims']
+    names = [c['name'] for c in claims]
+    assert len(claims) == 3
+    assert names == ['roce-claim', 'cd', 'extra-claim']
+    assert len(names) == len(set(names))
+
+
+def test_redact_sensitive_values() -> None:
+    """Secret values are hidden from a config that is about to be logged."""
+    token = 'sky_eyJhbGciOiJIUzI1NiJ9.payload.signature'
+    config = {
+        'api_server': {
+            'endpoint': 'https://api.example.com',
+            'service_account_token': token,
+        },
+        'db': 'postgresql://user:hunter2@host:5432/state',
+        'active_workspace': 'default',
+        'logs': {
+            'aws': {
+                'credentials_file': '~/.aws/credentials'
+            }
+        },
+    }
+    original = copy.deepcopy(config)
+
+    redacted = config_utils.redact_sensitive_values(config)
+
+    assert redacted['api_server'][
+        'service_account_token'] == config_utils.REDACTED_VALUE
+    assert redacted['db'] == config_utils.REDACTED_VALUE
+    # Non-secrets survive, including a field that merely names a credential
+    # file rather than holding one.
+    assert redacted['api_server']['endpoint'] == 'https://api.example.com'
+    assert redacted['active_workspace'] == 'default'
+    assert redacted['logs']['aws']['credentials_file'] == '~/.aws/credentials'
+    # The caller still needs the real values, so the input is untouched.
+    assert config == original
+
+
+def test_redact_sensitive_values_docker_login_lists() -> None:
+    """A docker login password is hidden inside any_of / ordered entries."""
+    config = {
+        'jobs': {
+            'controller': {
+                'resources': {
+                    '_docker_login_config': {
+                        'username': 'u',
+                        'password': 'direct',
+                    },
+                    'any_of': [
+                        {
+                            '_docker_login_config': {
+                                'password': 'in-any-of'
+                            }
+                        },
+                        {
+                            'infra': 'aws'
+                        },
+                    ],
+                    'ordered': [{
+                        '_docker_login_config': {
+                            'password': 'in-ordered'
+                        }
+                    }],
+                }
+            }
+        }
+    }
+
+    redacted = config_utils.redact_sensitive_values(config)
+
+    resources = redacted['jobs']['controller']['resources']
+    assert resources['_docker_login_config'][
+        'password'] == config_utils.REDACTED_VALUE
+    assert resources['any_of'][0]['_docker_login_config'][
+        'password'] == config_utils.REDACTED_VALUE
+    assert resources['ordered'][0]['_docker_login_config'][
+        'password'] == config_utils.REDACTED_VALUE
+    # The username is not a secret and identifies which login was used.
+    assert resources['_docker_login_config']['username'] == 'u'
+    # An entry without a docker login is left alone.
+    assert resources['any_of'][1] == {'infra': 'aws'}
+
+
+def test_redact_sensitive_values_absent_and_empty() -> None:
+    """Redaction neither invents keys nor trips over missing ones."""
+    assert config_utils.redact_sensitive_values(None) == {}
+    assert config_utils.redact_sensitive_values({}) == {}
+
+    # An unset secret stays unset, so a redaction marker never implies that a
+    # value was configured.
+    config = {'api_server': {'service_account_token': None}}
+    assert config_utils.redact_sensitive_values(config) == {
+        'api_server': {
+            'service_account_token': None
+        }
+    }
+
+    # Paths that do not exist are simply skipped.
+    assert config_utils.redact_sensitive_values(
+        {'kubernetes': {
+            'autoscaler': 'karpenter'
+        }}) == {
+            'kubernetes': {
+                'autoscaler': 'karpenter'
+            }
+        }
+
+
+def test_register_sensitive_config_paths() -> None:
+    """A plugin-registered path is redacted like a built-in one."""
+    original = list(config_utils.SENSITIVE_CONFIG_PATHS)
+    try:
+        config_utils.register_sensitive_config_paths([
+            ('my_plugin', 'api_key'),
+            ('my_plugin', 'endpoints', '*', 'token'),
+        ])
+        config = {
+            'my_plugin': {
+                'api_key': 'plugin-secret',
+                'name': 'keep-me',
+                'endpoints': {
+                    'east': {
+                        'token': 'east-secret',
+                        'url': 'https://east.example.com',
+                    },
+                },
+            },
+        }
+
+        redacted = config_utils.redact_sensitive_values(config)
+
+        plugin = redacted['my_plugin']
+        assert plugin['api_key'] == config_utils.REDACTED_VALUE
+        assert plugin['endpoints']['east'][
+            'token'] == config_utils.REDACTED_VALUE
+        assert plugin['name'] == 'keep-me'
+        assert plugin['endpoints']['east']['url'] == 'https://east.example.com'
+    finally:
+        config_utils.SENSITIVE_CONFIG_PATHS[:] = original
+
+
+def test_dump_redacted_yaml() -> None:
+    """The log-facing serializer hides secrets and keeps the rest readable."""
+    dumped = config_utils.dump_redacted_yaml({
+        'api_server': {
+            'endpoint': 'https://api.example.com',
+            'service_account_token': 'sky_eyJhbGciOiJIUzI1NiJ9.canary.sig',
+        },
+    })
+
+    assert 'canary' not in dumped
+    assert 'service_account_token: <redacted>' in dumped
+    assert 'endpoint: https://api.example.com' in dumped
+    assert config_utils.dump_redacted_yaml(None) == '{}\n'

@@ -1,0 +1,1301 @@
+"""Kubernetes volume provisioning (PVC and hostPath)."""
+import decimal
+import enum
+import re
+import time as time_module
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from sky import clouds
+from sky import global_user_state
+from sky import models
+from sky import sky_logging
+from sky.adaptors import kubernetes
+from sky.provision import constants
+from sky.provision.kubernetes import config as config_lib
+from sky.provision.kubernetes import constants as k8s_constants
+from sky.provision.kubernetes import utils as kubernetes_utils
+from sky.utils import volume as volume_lib
+
+logger = sky_logging.init_logger(__name__)
+
+# A volume's size is recorded in gibibytes, which is also the unit the PVC
+# spec is written in.
+_BYTES_PER_GIB = 1024**3
+
+PVC_FAILING_EVENT_REASONS = ('ProvisioningFailed',)
+WARNING_EVENT_TYPE = 'Warning'
+# Normal event reasons that explain why a claim is still pending. Reported to
+# the user, never treated as failures -- the PV controller and the provisioner
+# record these while working, and every reason either of them uses to report a
+# problem is a Warning, which is judged separately.
+#
+# They report progress in this order, and the newest is the one worth showing:
+# nothing has claimed the volume yet, a pod has but is not scheduled, the
+# provisioner has been handed it, the provisioner is working on it.
+PVC_PENDING_EVENT_REASONS = ('WaitForFirstConsumer', 'WaitForPodScheduled',
+                             'ExternalProvisioning', 'Provisioning')
+
+# CSI is a gRPC interface, so a provisioner's failure message carries the code
+# the storage backend returned, in grpc-go's standard rendering.
+_GRPC_CODE_PATTERN = re.compile(r'\bcode = (\w+)')
+# Codes whose documented recovery behaviour is that the caller has to change
+# something before retrying, so retrying as-is cannot succeed. Taken from the
+# CreateVolume error table in the CSI spec: INVALID_ARGUMENT ("use different
+# parameters"), ALREADY_EXISTS ("fix the arguments or use a different name"),
+# OUT_OF_RANGE ("fix the capacity range"), NOT_FOUND ("verify the source").
+# InvalidArgument is also exactly what sig-storage's provisioner library calls
+# an infeasible error, after which it retries only every retry-interval-max.
+#
+# Deliberately conservative: leaving a code out costs time (the claim falls back
+# to the slower judgement below), while wrongly including one fails a launch
+# whose volume was going to work.
+_TERMINAL_GRPC_CODES = ('InvalidArgument', 'AlreadyExists', 'OutOfRange',
+                        'NotFound')
+# Codes that mean the CreateVolume call may still be running. From
+# external-provisioner's own checkError(), which maps exactly these to
+# "provisioning in background". A network filesystem reports these while it is
+# being created -- GKE Filestore emits DeadlineExceeded ("volume not ready,
+# current state: CREATING") and Aborted ("an operation with the given volume key
+# already exists") for minutes on the way to a healthy volume -- so they must
+# never fail a launch.
+_IN_PROGRESS_GRPC_CODES = ('Canceled', 'DeadlineExceeded', 'Unavailable',
+                           'Aborted')
+
+# Every resize state a claim reports on its conditions, and what each means
+# for the volume. This is the only place the claim explains itself in words,
+# so it is also where the state is read from -- see `_pvc_resize_state`.
+#
+# Ordered, because a claim holds several at once: one waiting to be mounted is
+# still `Resizing` too. Reading them in list order would report the wrong one,
+# so they are read worst-first: a failure to look at, then work that cannot
+# proceed, then work that is proceeding.
+_RESIZE_CONDITIONS = (
+    ('ControllerResizeError', models.VolumeResizeStatus.FAILED),
+    ('NodeResizeError', models.VolumeResizeStatus.FAILED),
+    ('FileSystemResizePending', models.VolumeResizeStatus.PENDING_ON_NODE),
+    ('Resizing', models.VolumeResizeStatus.IN_PROGRESS),
+)
+
+
+class PvcFailure(enum.Enum):
+    """What a failure reported on a PVC says about waiting any longer."""
+    # The request has to change; waiting cannot help.
+    TERMINAL = 'terminal'
+    # The call may still be running, or the obstacle may clear by itself.
+    IN_PROGRESS = 'in_progress'
+    # No code to go on: another provisioner, or a failure raised before the
+    # gRPC call. Judged on how long it persists instead.
+    UNKNOWN = 'unknown'
+
+
+def classify_pvc_failure(message: Optional[str]) -> PvcFailure:
+    """Classifies a PVC failure event message by the gRPC code it carries.
+
+    A message can carry more than one code: grpc-go wraps a status in another
+    status, giving `code = Unknown desc = rpc error: code = InvalidArgument
+    desc = ...`, where the outer code is the less specific of the two. So every
+    code is read, and:
+
+    - any sign that the call may still be running wins outright, wherever it
+      appears. The cost of missing a terminal code is waiting; the cost of
+      inventing one is failing a launch whose volume was going to work.
+    - otherwise the innermost code decides, since that is the one the storage
+      backend actually returned.
+    """
+    codes = _GRPC_CODE_PATTERN.findall(message or '')
+    if not codes:
+        return PvcFailure.UNKNOWN
+    if any(code in _IN_PROGRESS_GRPC_CODES for code in codes):
+        return PvcFailure.IN_PROGRESS
+    if codes[-1] in _TERMINAL_GRPC_CODES:
+        return PvcFailure.TERMINAL
+    # Everything else -- ResourceExhausted, Internal, Unknown, PermissionDenied
+    # -- is neither provably hopeless nor provably in flight. Quota, for one,
+    # can be raised while a launch waits.
+    return PvcFailure.UNKNOWN
+
+
+def _is_rbac_permission_error(e: Exception) -> bool:
+    """True if the K8s ApiException is a 401/403 RBAC denial.
+
+    Namespace-constrained users on multi-tenant clusters often lack the
+    cluster-scoped `list`/`get` perms on `storageclasses` that the
+    pre-flight checks require, but they can still create PVCs in their
+    namespace and rely on K8s admission to bind. Don't block them just
+    because we can't validate up front.
+    """
+    return getattr(e, 'status', None) in (401, 403)
+
+
+def _resolve_context_for_new_volume() -> Optional[str]:
+    """The context to create a volume on when its config names none.
+
+    A Kubernetes volume's `region` is its kubeconfig context. When the user
+    leaves it unset (e.g. `sky volumes apply --infra k8s`), the context has to
+    be chosen -- and the choice has to agree with where workloads actually
+    run, or the PVC is created on a cluster no pod can ever mount it from.
+
+    The kubeconfig's `current-context` alone is not that answer on a server
+    with several contexts: `allowed_contexts` may exclude it entirely, in
+    which case every pod lands somewhere else. So resolve through
+    `Kubernetes.existing_allowed_contexts()`, the same list the scheduling
+    path uses, and keep `current-context` only when it is actually allowed --
+    which preserves the existing behavior for the ordinary single-cluster
+    case.
+
+    Only for volumes being created. Looking up a volume that already exists
+    is a different question -- see `_get_context_namespace`.
+    """
+    current_context = kubernetes_utils.get_current_kube_config_context_name()
+    allowed_contexts = clouds.Kubernetes.existing_allowed_contexts(silent=True)
+    if not allowed_contexts:
+        # Nothing to cross-check against: no kubeconfig, or Kubernetes is not
+        # enabled. Fall back to the previous behavior rather than failing
+        # here -- the K8s API call that follows raises a clearer error.
+        return current_context
+    if current_context in allowed_contexts:
+        return current_context
+    context = allowed_contexts[0]
+    logger.info(
+        f'Volume does not specify a context and the kubeconfig\'s current '
+        f'context {current_context!r} is not in allowed_contexts; using '
+        f'{context!r}. Set the volume\'s infra to a specific context '
+        f'(e.g. `--infra k8s/<context>`) to choose explicitly.')
+    return context
+
+
+def _get_context_namespace(config: models.VolumeConfig,
+                           creating: bool = False) -> Tuple[Optional[str], str]:
+    """Gets the context and namespace of a volume.
+
+    `creating` separates the two questions this answers for a config with no
+    `region`. Creating a volume *chooses* a context, and the choice has to
+    agree with where workloads run. Every other caller is *looking up* a
+    volume that already exists somewhere -- and for a volume predating the
+    region pinning below (`refresh_volume_config` repairs those only under
+    in-cluster auth, so elsewhere they stay region-less), the only honest
+    guess is the one its own creation made: the kubeconfig's current context.
+    Re-deciding that on a lookup would point at a different cluster and
+    report a perfectly healthy volume as deleted.
+
+    The context is None only when no context could be resolved at all (no
+    kubeconfig and no in-cluster auth); the K8s adaptor treats that as "use
+    whatever config loading finds", which is the pre-existing behavior.
+    """
+    if config.region is None:
+        context = (_resolve_context_for_new_volume() if creating else
+                   kubernetes_utils.get_current_kube_config_context_name())
+        config.region = context
+    else:
+        context = config.region
+    namespace = config.config.get('namespace')
+    if namespace is None:
+        namespace = kubernetes_utils.get_namespace(context=context)
+        config.config['namespace'] = namespace
+    return context, namespace
+
+
+def check_pvc_usage_for_pod(context: Optional[str], namespace: str,
+                            pod_spec: Dict[str, Any]) -> None:
+    """Checks if the PVC is used by any pod in the namespace."""
+    volumes = pod_spec.get('spec', {}).get('volumes', [])
+    if not volumes:
+        return
+    once_modes = [
+        volume_lib.VolumeAccessMode.READ_WRITE_ONCE.value,
+        volume_lib.VolumeAccessMode.READ_WRITE_ONCE_POD.value
+    ]
+    for volume in volumes:
+        pvc_name = volume.get('persistentVolumeClaim', {}).get('claimName')
+        if not pvc_name:
+            continue
+        pvc = kubernetes.core_api(
+            context).read_namespaced_persistent_volume_claim(
+                name=pvc_name,
+                namespace=namespace,
+                _request_timeout=kubernetes.API_TIMEOUT)
+        access_mode = pvc.spec.access_modes[0]
+        if access_mode not in once_modes:
+            continue
+        usedby_pods, _ = _get_volume_usedby(context, namespace, pvc_name)
+        if usedby_pods:
+            raise config_lib.KubernetesError(f'Volume {pvc_name} with access '
+                                             f'mode {access_mode} is already '
+                                             f'in use by Pods {usedby_pods}.')
+
+
+def apply_volume(config: models.VolumeConfig) -> models.VolumeConfig:
+    """Creates or registers a volume."""
+    if config.type == volume_lib.VolumeType.HOSTPATH.value:
+        return _apply_hostpath_volume(config)
+    return _apply_pvc_volume(config)
+
+
+def _check_cluster_has_default_storage_class(context: Optional[str]) -> None:
+    """Verifies the cluster has a default StorageClass annotated.
+
+    Called when the user did not specify `storage_class_name` in the volume
+    config: Kubernetes will fall back to the cluster default at PVC-bind
+    time, and if no default is annotated the PVC sits in Pending forever
+    with no clear signal to the user. Fail fast with an actionable error
+    instead.
+
+    Skips the check (logs a warning) on 401/403 — see
+    `_is_rbac_permission_error`. The PVC create may still succeed if a
+    default actually exists.
+    """
+    try:
+        sc_list = kubernetes.storage_api(context).list_storage_class(
+            _request_timeout=kubernetes.API_TIMEOUT)
+    except kubernetes.api_exception() as e:
+        if _is_rbac_permission_error(e):
+            logger.warning(
+                f'Cannot list storage classes in context {context!r} '
+                f'({e}). Proceeding with PVC creation; if no default '
+                f'StorageClass exists, the PVC will hang in Pending. '
+                f'Set config.storage_class_name in your volume YAML to '
+                f'avoid this ambiguity.')
+            return
+        raise config_lib.KubernetesError(
+            f'Failed to list storage classes in context {context!r} '
+            f'while checking for a default StorageClass: {e}')
+    for sc in sc_list.items:
+        if kubernetes_utils.is_default_storage_class(sc):
+            return
+    raise config_lib.KubernetesError(
+        f'No storage class specified and cluster {context!r} has no default '
+        f'StorageClass (no storage class annotated '
+        f'"{kubernetes_utils.DEFAULT_STORAGE_CLASS_ANNOTATION}: true"). '
+        f'Set config.storage_class_name in your volume YAML to an explicit '
+        f'storage class, or mark one as default on the cluster.')
+
+
+def _validate_explicit_storage_class(context: Optional[str],
+                                     storage_class_name: str) -> None:
+    """Verifies the named StorageClass exists on the cluster.
+
+    Skips validation (logs a warning) on 401/403 — see
+    `_is_rbac_permission_error`. K8s admission will surface a binding
+    error at PVC-create time if the name is actually wrong.
+    """
+    try:
+        kubernetes.storage_api(context).read_storage_class(
+            name=storage_class_name, _request_timeout=kubernetes.API_TIMEOUT)
+    except kubernetes.api_exception() as e:
+        if _is_rbac_permission_error(e):
+            logger.warning(
+                f'Cannot validate storage class {storage_class_name!r} '
+                f'in context {context!r} ({e}). Proceeding with PVC '
+                f'creation; if the storage class is invalid, K8s will '
+                f'surface a binding error.')
+            return
+        raise config_lib.KubernetesError(
+            f'Check storage class {storage_class_name} error: {e}')
+
+
+def _apply_pvc_volume(config: models.VolumeConfig) -> models.VolumeConfig:
+    """Creates or registers a PVC volume."""
+    context, namespace = _get_context_namespace(config, creating=True)
+    pvc_spec = _get_pvc_spec(namespace, config)
+    # use_existing volumes look up an existing PVC; no new provisioning
+    # happens. Storage-class validation (either the explicit-name check
+    # or the empty-default safety net) is irrelevant — the existing PVC
+    # already has its own SC binding.
+    if not config.config.get('use_existing'):
+        storage_class_name = pvc_spec['spec'].get('storageClassName')
+        if storage_class_name:
+            # Non-empty name: validate that the class exists.
+            _validate_explicit_storage_class(context, storage_class_name)
+        elif storage_class_name is None:
+            # Omitted: K8s will use the cluster default. Verify one exists.
+            _check_cluster_has_default_storage_class(context)
+        # else: storage_class_name == '' — the K8s convention for "no
+        # storage class" (opt out of dynamic provisioning, e.g. for
+        # static binding to a pre-created PV). Skip both checks; K8s
+        # handles the binding semantics.
+    create_persistent_volume_claim(namespace, context, pvc_spec, config)
+    return config
+
+
+def _apply_hostpath_volume(config: models.VolumeConfig) -> models.VolumeConfig:
+    """Registers a hostPath volume (no K8s API call needed).
+
+    hostPath volumes are node-local directories. The actual directory is
+    created automatically by Kubernetes using DirectoryOrCreate when a pod
+    mounts it. This function only validates config and registers metadata.
+    """
+    host_path = config.config.get('host_path')
+    if not host_path:
+        raise config_lib.KubernetesError(
+            'host_path is required in config for k8s-hostpath volumes.')
+    if not host_path.startswith('/'):
+        raise config_lib.KubernetesError(
+            f'host_path must be an absolute path, got: {host_path!r}')
+    # Use the volume name as name_on_cloud since there is no K8s resource
+    if not config.name_on_cloud:
+        config.name_on_cloud = config.name
+    logger.info(f'Registered hostPath volume {config.name!r} '
+                f'with path {host_path!r}')
+    return config
+
+
+def delete_volume(config: models.VolumeConfig) -> models.VolumeConfig:
+    """Deletes a volume."""
+    if config.type == volume_lib.VolumeType.HOSTPATH.value:
+        return _delete_hostpath_volume(config)
+    return _delete_pvc_volume(config)
+
+
+def _delete_pvc_volume(config: models.VolumeConfig) -> models.VolumeConfig:
+    """Deletes a PVC volume.
+
+    If the volume was registered with ``use_existing=True``, the underlying
+    PVC is left intact (SkyPilot did not create it, and another SkyPilot
+    instance may also have it registered).
+    """
+    context, namespace = _get_context_namespace(config)
+    pvc_name = config.name_on_cloud
+    if config.config.get('use_existing'):
+        logger.info(f'Leaving PVC {pvc_name} in namespace {namespace} intact '
+                    f'(use_existing=True)')
+        return config
+    kubernetes_utils.delete_k8s_resource_with_retry(
+        delete_func=lambda pvc_name=pvc_name: kubernetes.core_api(
+            context).delete_namespaced_persistent_volume_claim(
+                name=pvc_name,
+                namespace=namespace,
+                _request_timeout=kubernetes.API_TIMEOUT),
+        resource_type='pvc',
+        resource_name=pvc_name)
+    logger.info(f'Deleted PVC {pvc_name} in namespace {namespace}')
+    return config
+
+
+def _delete_hostpath_volume(config: models.VolumeConfig) -> models.VolumeConfig:
+    """Deletes a hostPath volume.
+
+    If cleanup_on_deletion is true, launches a DaemonSet to clean up the
+    host directory on all nodes, then removes the DaemonSet.
+    """
+    cleanup = config.config.get('cleanup_on_deletion', False)
+    if not cleanup:
+        logger.info(f'Removed hostPath volume {config.name!r} from SkyPilot '
+                    f'(host directory not cleaned up)')
+        return config
+
+    host_path = config.config.get('host_path', '')
+    context, namespace = _get_context_namespace(config)
+    ds_name = f'skypilot-hostpath-cleanup-{config.name}'
+    # Truncate to K8s name limit
+    ds_name = ds_name[:63]
+
+    daemonset_spec = {
+        'apiVersion': 'apps/v1',
+        'kind': 'DaemonSet',
+        'metadata': {
+            'name': ds_name,
+            'namespace': namespace,
+            'labels': {
+                'parent': 'skypilot',
+                'skypilot-volume': config.name,
+            },
+        },
+        'spec': {
+            'selector': {
+                'matchLabels': {
+                    'app': ds_name,
+                },
+            },
+            'template': {
+                'metadata': {
+                    'labels': {
+                        'app': ds_name,
+                    },
+                },
+                'spec': {
+                    'tolerations': [{
+                        'operator': 'Exists',
+                    }],
+                    'containers': [{
+                        'name': 'cleanup',
+                        'image': 'busybox:1.36',
+                        'command': [
+                            'sh', '-c',
+                            'find /cleanup-target -mindepth 1 -delete '
+                            '&& sleep infinity'
+                        ],
+                        'volumeMounts': [{
+                            'name': 'target',
+                            'mountPath': '/cleanup-target',
+                        }],
+                    }],
+                    'volumes': [{
+                        'name': 'target',
+                        'hostPath': {
+                            'path': host_path,
+                            'type': 'DirectoryOrCreate',
+                        },
+                    }],
+                },
+            },
+        },
+    }
+
+    logger.info(f'Cleaning up hostPath {host_path!r} on all nodes...')
+    try:
+        kubernetes.apps_api(context).create_namespaced_daemon_set(
+            namespace=namespace,
+            body=daemonset_spec,
+            _request_timeout=kubernetes.API_TIMEOUT)
+    except kubernetes.api_exception() as e:
+        if e.status == 409:
+            # DaemonSet already exists (e.g., from a previous failed cleanup)
+            kubernetes.apps_api(context).delete_namespaced_daemon_set(
+                name=ds_name,
+                namespace=namespace,
+                _request_timeout=kubernetes.API_TIMEOUT)
+            kubernetes.apps_api(context).create_namespaced_daemon_set(
+                namespace=namespace,
+                body=daemonset_spec,
+                _request_timeout=kubernetes.API_TIMEOUT)
+        else:
+            raise
+
+    # Wait for all DaemonSet pods to become ready (cleanup complete)
+    _wait_for_daemonset_ready(context, namespace, ds_name)
+
+    # Delete the DaemonSet
+    kubernetes_utils.delete_k8s_resource_with_retry(
+        delete_func=lambda: kubernetes.apps_api(context).
+        delete_namespaced_daemon_set(name=ds_name,
+                                     namespace=namespace,
+                                     _request_timeout=kubernetes.API_TIMEOUT),
+        resource_type='daemonset',
+        resource_name=ds_name)
+    logger.info(f'Cleaned up hostPath volume {config.name!r}')
+    return config
+
+
+def _wait_for_daemonset_ready(context: Optional[str],
+                              namespace: str,
+                              ds_name: str,
+                              timeout: int = 300) -> None:
+    """Waits for all DaemonSet pods to be ready."""
+    start = time_module.time()
+    while time_module.time() - start < timeout:
+        try:
+            ds = kubernetes.apps_api(context).read_namespaced_daemon_set(
+                name=ds_name,
+                namespace=namespace,
+                _request_timeout=kubernetes.API_TIMEOUT)
+            desired = ds.status.desired_number_scheduled or 0
+            ready = ds.status.number_ready or 0
+            if desired > 0 and ready >= desired:
+                return
+        except kubernetes.api_exception():
+            pass
+        time_module.sleep(5)
+    logger.warning(f'Timed out waiting for DaemonSet {ds_name} to be ready. '
+                   f'Some nodes may not have been cleaned up.')
+
+
+def _get_volume_usedby(
+    context: Optional[str],
+    namespace: str,
+    pvc_name: str,
+) -> Tuple[List[str], List[str]]:
+    """Gets the usedby resources of a volume.
+
+    This function returns the pods and clusters that are using the volume.
+    The usedby_pods is accurate, which also includes the Pods that are not
+    managed by SkyPilot.
+
+    Args:
+        context: Kubernetes context
+        namespace: Kubernetes namespace
+        pvc_name: PVC name
+
+    Returns:
+        usedby_pods: List of pods using the volume. These may include pods
+                     not created by SkyPilot.
+        usedby_clusters: List of clusters using the volume.
+    """
+    usedby_pods = []
+    usedby_clusters = []
+    field_selector = ','.join([
+        f'status.phase!={phase}'
+        for phase in k8s_constants.PVC_NOT_HOLD_POD_PHASES
+    ])
+    cloud_to_name_map = _get_cluster_name_on_cloud_to_cluster_name_map()
+    # Get all pods in the namespace
+    pods = kubernetes.core_api(context).list_namespaced_pod(
+        namespace=namespace,
+        field_selector=field_selector,
+        _request_timeout=kubernetes.API_TIMEOUT)
+    for pod in pods.items:
+        if pod.spec.volumes is None:
+            continue
+        # Skip terminating pods. Terminating is not a pod phase (the phase
+        # is still Running), but the pod has a deletionTimestamp set.
+        # It is safe to proceed with PVC deletion even if terminating pods
+        # reference it: the pvc-protection finalizer will keep the PVC
+        # alive until all pods fully terminate.
+        if pod.metadata.deletion_timestamp is not None:
+            continue
+        for volume in pod.spec.volumes:
+            if volume.persistent_volume_claim is None:
+                continue
+            if volume.persistent_volume_claim.claim_name == pvc_name:
+                usedby_pods.append(pod.metadata.name)
+                # Get the real cluster name
+                cluster_name_on_cloud = pod.metadata.labels.get(
+                    constants.TAG_SKYPILOT_CLUSTER_NAME)
+                if cluster_name_on_cloud is None:
+                    continue
+                cluster_name = cloud_to_name_map.get(cluster_name_on_cloud)
+                if cluster_name is not None:
+                    usedby_clusters.append(cluster_name)
+    if usedby_pods:
+        logger.debug(f'Volume {pvc_name} is used by Pods {usedby_pods}'
+                     f' and clusters {usedby_clusters}')
+    return usedby_pods, usedby_clusters
+
+
+def _get_cluster_name_on_cloud_to_cluster_name_map() -> Dict[str, str]:
+    """Gets the map from cluster name on cloud to cluster name."""
+    clusters = global_user_state.get_clusters()
+    cloud_to_name_map = {}
+    for cluster in clusters:
+        handle = cluster['handle']
+        if handle is None:
+            continue
+        cloud_to_name_map[handle.cluster_name_on_cloud] = cluster['name']
+    return cloud_to_name_map
+
+
+def get_volume_usedby(
+    config: models.VolumeConfig,) -> Tuple[List[str], List[str]]:
+    """Gets the usedby resources of a volume."""
+    # hostPath volumes have no PVC — cannot track usage via K8s API
+    if config.type == volume_lib.VolumeType.HOSTPATH.value:
+        return [], []
+    context, namespace = _get_context_namespace(config)
+    pvc_name = config.name_on_cloud
+    return _get_volume_usedby(context, namespace, pvc_name)
+
+
+def refresh_volume_config(
+    config: models.VolumeConfig,) -> Tuple[bool, models.VolumeConfig]:
+    """Refreshes the volume config.
+
+    For volumes created without an explicit region before PR #8386, the
+    region is None. If we're currently running with in-cluster auth, those
+    volumes belong to the in-cluster context, so rewrite the region. If
+    in-cluster auth is NOT available (e.g. the API server authenticates via
+    kubeconfig), leave region=None so it gets resolved from the task's
+    --infra at launch time. Otherwise the optimizer would compare a literal
+    'in-cluster' against the kubeconfig contexts and raise
+    ResourcesUnavailableError on every launch that references the volume.
+
+    Returns:
+        need_refresh: Whether need to refresh the volume config.
+        volume_config: The volume config to be refreshed.
+    """
+    if (config.region is None and
+            kubernetes_utils.is_incluster_config_available()):
+        config.region = kubernetes.in_cluster_context_name()
+        return True, config
+    return False, config
+
+
+def get_all_volumes_usedby(
+    configs: List[models.VolumeConfig],
+) -> Tuple[Dict[Optional[str], Any], Dict[Optional[str], Any], Set[str]]:
+    """Gets the usedby resources of all volumes.
+
+    Args:
+        configs: List of VolumeConfig objects.
+
+    Returns:
+        usedby_pods: Dictionary of context to namespace to volume name to pods
+                     using the volume. These may include pods not created by
+                     SkyPilot.
+        usedby_clusters: Dictionary of context to namespace to volume name to
+                         clusters using the volume.
+        failed_volume_names: Set of volume names whose usedby info failed to
+          fetch.
+    """
+    field_selector = ','.join([
+        f'status.phase!={phase}'
+        for phase in k8s_constants.PVC_NOT_HOLD_POD_PHASES
+    ])
+    label_selector = 'parent=skypilot'
+    context_to_namespaces: Dict[Optional[str], Set[str]] = {}
+    pvc_names = set()
+    original_volume_names: Dict[Optional[str], Dict[str, List[str]]] = {}
+    for config in configs:
+        # Skip hostPath volumes — they have no PVC to track
+        if config.type == volume_lib.VolumeType.HOSTPATH.value:
+            continue
+        context, namespace = _get_context_namespace(config)
+        context_to_namespaces.setdefault(context, set()).add(namespace)
+        original_volume_names.setdefault(context,
+                                         {}).setdefault(namespace,
+                                                        []).append(config.name)
+        pvc_names.add(config.name_on_cloud)
+    cloud_to_name_map = _get_cluster_name_on_cloud_to_cluster_name_map()
+    # Get all pods in the namespace
+    used_by_pods: Dict[Optional[str], Dict[str, Dict[str, List[str]]]] = {}
+    used_by_clusters: Dict[Optional[str], Dict[str, Dict[str, List[str]]]] = {}
+    failed_volume_names: Set[str] = set()
+    for context, namespaces in context_to_namespaces.items():
+        used_by_pods[context] = {}
+        used_by_clusters[context] = {}
+        for namespace in namespaces:
+            used_by_pods[context][namespace] = {}
+            used_by_clusters[context][namespace] = {}
+            try:
+                pods = kubernetes.core_api(context).list_namespaced_pod(
+                    namespace=namespace,
+                    field_selector=field_selector,
+                    label_selector=label_selector,
+                    _request_timeout=kubernetes.API_TIMEOUT)
+            except Exception as e:  # pylint: disable=broad-except
+                logger.debug(f'Failed to get pods in namespace {namespace} '
+                             f'in context {context}: {e}')
+                # Mark all volumes in this namespace as failed
+                for original_volume_name in original_volume_names[context][
+                        namespace]:
+                    failed_volume_names.add(original_volume_name)
+                continue
+            for pod in pods.items:
+                if pod.spec.volumes is None:
+                    continue
+                if pod.metadata.deletion_timestamp is not None:
+                    continue
+                for volume in pod.spec.volumes:
+                    if volume.persistent_volume_claim is None:
+                        continue
+                    volume_name = volume.persistent_volume_claim.claim_name
+                    if volume_name not in pvc_names:
+                        continue
+                    if volume_name not in used_by_pods[context][namespace]:
+                        used_by_pods[context][namespace][volume_name] = []
+                    used_by_pods[context][namespace][volume_name].append(
+                        pod.metadata.name)
+                    cluster_name_on_cloud = pod.metadata.labels.get(
+                        constants.TAG_SKYPILOT_CLUSTER_NAME)
+                    if cluster_name_on_cloud is None:
+                        continue
+                    cluster_name = cloud_to_name_map.get(cluster_name_on_cloud)
+                    if cluster_name is None:
+                        continue
+                    if volume_name not in used_by_clusters[context][namespace]:
+                        used_by_clusters[context][namespace][volume_name] = []
+                    used_by_clusters[context][namespace][volume_name].append(
+                        cluster_name)
+    return used_by_pods, used_by_clusters, failed_volume_names
+
+
+def map_all_volumes_usedby(
+        used_by_pods: Dict[Optional[str],
+                           Any], used_by_clusters: Dict[Optional[str], Any],
+        config: models.VolumeConfig) -> Tuple[List[str], List[str]]:
+    """Maps the usedby resources of a volume."""
+    context, namespace = _get_context_namespace(config)
+    pvc_name = config.name_on_cloud
+
+    return (used_by_pods.get(context, {}).get(namespace, {}).get(pvc_name, []),
+            used_by_clusters.get(context, {}).get(namespace,
+                                                  {}).get(pvc_name, []))
+
+
+def _first_pvc_failure_event(context: Optional[str], namespace: str,
+                             pvc_name: str) -> Optional[str]:
+    """Returns 'reason: message' for the newest failing PVC event, if any.
+
+    A failing event is the only positive evidence that a pending PVC will not
+    bind on its own; a pending PVC without one may still be mid-provisioning.
+
+    A warning the provisioner reports while its CreateVolume call is still
+    running is not such evidence: a network filesystem being created emits them
+    for minutes and then binds. Counting those made a volume read as unusable
+    for the middle of its own creation, which in turn refused every launch that
+    wanted it.
+    """
+    for event in kubernetes_utils.get_pvc_events(context, namespace, pvc_name):
+        if (event.type == WARNING_EVENT_TYPE or
+                event.reason in PVC_FAILING_EVENT_REASONS):
+            if classify_pvc_failure(event.message) == PvcFailure.IN_PROGRESS:
+                continue
+            if event.message:
+                return f'{event.reason}: {event.message}'
+            return str(event.reason)
+    return None
+
+
+def _get_pvc_error(context: Optional[str], namespace: str,
+                   pvc: Any) -> Optional[str]:
+    """Returns an error message for a PVC, or None if it is healthy.
+
+    Note that a pending PVC under WaitForFirstConsumer is *not* an error: the
+    provisioner is not even triggered until a pod claims it, so there is
+    nothing to detect yet.
+    """
+    pvc_name = pvc.metadata.name
+    debug_hint = (f'To debug, run: kubectl describe pvc {pvc_name} '
+                  f'-n {namespace}')
+    pvc_phase = pvc.status.phase
+
+    if pvc_phase == 'Bound':
+        return None
+
+    if pvc_phase == 'Pending':
+        error_msg = _check_pvc_access_mode_error(context, pvc)
+        if error_msg:
+            return error_msg
+        failure = _first_pvc_failure_event(context, namespace, pvc_name)
+        if failure is not None:
+            return f'PVC is pending. {failure}. {debug_hint}'
+        volume_binding_mode = _check_storage_class_volume_binding_mode(
+            context, pvc)
+        if (volume_binding_mode is None or
+                volume_binding_mode == 'WaitForFirstConsumer'):
+            # Binding is deferred until a pod consumes the PVC, so pending is
+            # the expected steady state here.
+            return None
+        # Immediate binding: provisioning has started and has not finished.
+        # Word this as in-progress -- provisioning a network volume can
+        # legitimately take minutes -- while still reporting it as not ready.
+        # The first sentence is the shared constant, which is what tells a
+        # caller deciding whether to refuse a launch that waiting is enough.
+        return (f'{volume_lib.PVC_PROVISIONING_MESSAGE} If this does not '
+                f'resolve, the storage class may be misconfigured or the '
+                f'cluster may be out of storage capacity. {debug_hint}')
+
+    if pvc_phase == 'Lost':
+        return ('PVC is in Lost state. The bound PersistentVolume '
+                f'has been deleted or is unavailable. {debug_hint}')
+
+    # Other phases (e.g., Terminating)
+    return None
+
+
+def get_all_volumes_state(
+    configs: List[models.VolumeConfig],
+) -> Tuple[Dict[str, Optional[str]], Dict[str, models.ObservedVolumeState],
+           Set[str]]:
+    """Gets the cluster's view of all Kubernetes PVC volumes.
+
+    Both the error check and the cloud-owned fields come out of the same PVC
+    objects, so they are read in one pass: no volume can be judged against one
+    version of a PVC and described from another, and the listing is not paid
+    for twice.
+
+    Args:
+        configs: List of VolumeConfig objects.
+
+    Returns:
+        A tuple of (errors, observed, failed_volume_names):
+        - errors maps volume name to an error message, or to None when the
+          volume is healthy.
+        - observed maps volume name to what the PVC reports about the fields
+          the cluster owns. Absent for a volume whose PVC could not be read.
+        - failed_volume_names holds volumes whose status could not be
+          determined because the cluster could not be queried. Callers must
+          leave the recorded status of these volumes untouched rather than
+          reading their absence from ``errors`` as "healthy".
+
+        Every input config lands in exactly one of errors and
+        failed_volume_names, so a caller never has to guess what an absent
+        volume means.
+    """
+    # Keyed by (context, namespace): the same PVC name may exist in several
+    # namespaces, and resolving it against the wrong one would mismatch.
+    configs_by_location: Dict[Tuple[Optional[str], str],
+                              Dict[str, models.VolumeConfig]] = {}
+
+    volume_errors: Dict[str, Optional[str]] = {}
+    observed: Dict[str, models.ObservedVolumeState] = {}
+    failed_volume_names: Set[str] = set()
+
+    for config in configs:
+        if config.type == volume_lib.VolumeType.HOSTPATH.value:
+            # No PVC to check: the directory is created by the kubelet when
+            # a pod first mounts it, so there is nothing that can be broken
+            # ahead of time. Report it healthy rather than omitting it.
+            volume_errors[config.name] = None
+            continue
+        context, namespace = _get_context_namespace(config)
+        configs_by_location.setdefault((context, namespace),
+                                       {})[config.name_on_cloud] = config
+
+    for (context, namespace), configs_by_pvc in configs_by_location.items():
+        try:
+            # List all PVCs in the namespace with the skypilot label
+            pvcs = kubernetes.core_api(
+                context).list_namespaced_persistent_volume_claim(
+                    namespace=namespace,
+                    label_selector='parent=skypilot',
+                    _request_timeout=kubernetes.API_TIMEOUT)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.debug(f'Failed to get PVCs in namespace {namespace} '
+                         f'in context {context}: {e}')
+            failed_volume_names.update(
+                config.name for config in configs_by_pvc.values())
+            continue
+
+        seen_pvc_names: Set[str] = set()
+        for pvc in pvcs.items:
+            vol_config = configs_by_pvc.get(pvc.metadata.name)
+            if vol_config is None:
+                continue
+            seen_pvc_names.add(pvc.metadata.name)
+            volume_errors[vol_config.name] = _get_pvc_error(
+                context, namespace, pvc)
+            observed[vol_config.name] = _observed_volume_state(pvc)
+
+        # A registered PVC missing from the labelled listing is either a
+        # use_existing volume (adopted as-is, so it never got the skypilot
+        # label) or a PVC deleted outside SkyPilot. Only a direct read tells
+        # them apart, and leaving the latter unreported would keep a volume
+        # whose storage no longer exists looking healthy.
+        for pvc_name, vol_config in configs_by_pvc.items():
+            if pvc_name in seen_pvc_names:
+                continue
+            try:
+                pvc = kubernetes.core_api(
+                    context).read_namespaced_persistent_volume_claim(
+                        name=pvc_name,
+                        namespace=namespace,
+                        _request_timeout=kubernetes.API_TIMEOUT)
+            except kubernetes.api_exception() as e:
+                if e.status == 404:
+                    volume_errors[vol_config.name] = (
+                        f'PVC {pvc_name} no longer exists in namespace '
+                        f'{namespace}. It may have been deleted outside '
+                        f'SkyPilot. Recreate the volume, or run `sky volumes '
+                        f'delete {vol_config.name}` to deregister it.')
+                else:
+                    logger.debug(f'Failed to read PVC {pvc_name} in namespace '
+                                 f'{namespace} in context {context}: {e}')
+                    failed_volume_names.add(vol_config.name)
+                continue
+            except Exception as e:  # pylint: disable=broad-except
+                logger.debug(f'Failed to read PVC {pvc_name} in namespace '
+                             f'{namespace} in context {context}: {e}')
+                failed_volume_names.add(vol_config.name)
+                continue
+            volume_errors[vol_config.name] = _get_pvc_error(
+                context, namespace, pvc)
+            observed[vol_config.name] = _observed_volume_state(pvc)
+
+    return volume_errors, observed, failed_volume_names
+
+
+def _check_storage_class_volume_binding_mode(context: Optional[str],
+                                             pvc: Any) -> Optional[str]:
+    """Check the volumeBindingMode of the storage class for the PVC.
+
+    Args:
+        context: Kubernetes context
+        pvc: V1PersistentVolumeClaim object
+
+    Returns:
+        volumeBindingMode of the storage class for the PVC,
+        None if failed to read the storage class.
+    """
+    storage_class_name = pvc.spec.storage_class_name
+    if not storage_class_name:
+        return None
+    try:
+        storage_class = kubernetes.storage_api(context).read_storage_class(
+            name=storage_class_name, _request_timeout=kubernetes.API_TIMEOUT)
+        return storage_class.volume_binding_mode
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f'Failed to read storage class {storage_class_name}: {e}')
+        return None
+
+
+def _check_pvc_access_mode_error(context: Optional[str],
+                                 pvc: Any) -> Optional[str]:
+    """Check if a pending PVC has an access mode mismatch.
+
+    Args:
+        context: Kubernetes context
+        pvc: V1PersistentVolumeClaim object
+
+    Returns:
+        Error message if there's an access mode mismatch, None otherwise.
+    """
+    pvc_access_modes = pvc.spec.access_modes or []
+    if not pvc_access_modes:
+        return None
+
+    pvc_access_mode = pvc_access_modes[0]
+    storage_class_name = pvc.spec.storage_class_name
+
+    # Try to find available PVs and check their access modes
+    try:
+        pvs = kubernetes.core_api(context).list_persistent_volume(
+            _request_timeout=kubernetes.API_TIMEOUT)
+    except Exception as e:  # pylint: disable=broad-except
+        logger.debug(f'Failed to list PVs: {e}')
+        return None
+
+    # Filter PVs that match the storage class and are available
+    available_pvs = []
+    for pv in pvs.items:
+        # Check if PV matches storage class
+        pv_storage_class = pv.spec.storage_class_name
+        if storage_class_name and pv_storage_class != storage_class_name:
+            continue
+        # Check if PV is available
+        if pv.status.phase == 'Available':
+            available_pvs.append(pv)
+
+    if not available_pvs:
+        return None
+
+    # Check if any available PV has a compatible access mode
+    for pv in available_pvs:
+        pv_access_modes = pv.spec.access_modes or []
+        if pvc_access_mode in pv_access_modes:
+            # Found a compatible PV, so access mode is not the issue
+            return None
+
+    # No compatible PV found - access mode mismatch
+    pv_access_modes_str = ', '.join(
+        sorted(
+            set(mode for pv in available_pvs
+                for mode in (pv.spec.access_modes or []))))
+    pvc_name = pvc.metadata.name
+    namespace = pvc.metadata.namespace
+    return (f'PVC access mode mismatch: PVC requests {pvc_access_mode}, but '
+            f'available PersistentVolumes support: {pv_access_modes_str}. '
+            f'Update the volume with the correct access_mode '
+            f'(e.g., {pv_access_modes_str}) and recreate it. To debug, run: '
+            f'kubectl describe pvc {pvc_name} -n {namespace}')
+
+
+def _pvc_capacity(pvc_obj: Any) -> Optional[str]:
+    """Returns the capacity the PVC's bound volume actually has, if any.
+
+    ``status.capacity`` is the real size of the underlying volume, while
+    ``spec.resources.requests`` is only what was asked for: a request can be
+    rounded up by the provisioner, expanded later, or not yet fulfilled. A
+    claim that is not bound reports nothing here.
+    """
+    capacity = getattr(getattr(pvc_obj, 'status', None), 'capacity', None)
+    if isinstance(capacity, dict):
+        return capacity.get('storage')
+    return None
+
+
+def _parse_pvc_size(size_quantity: Optional[str],
+                    pvc_name: str) -> Optional[str]:
+    """Normalizes a Kubernetes storage quantity to a volume size in GiB.
+
+    Shared by the create and refresh paths so the two cannot record the same
+    PVC differently.
+
+    Parsed by the Kubernetes client rather than `resources_utils`, which reads
+    a quantity by SkyPilot's rules rather than Kubernetes': a bare number is
+    bytes to Kubernetes and gigabytes to SkyPilot, and the decimal suffixes a
+    claim can perfectly well be written with (`2G`, `500M`) are not units it
+    knows at all. A claim SkyPilot did not create -- which is every
+    `use_existing` volume -- is written however its author wrote it.
+
+    Rounds to the nearest GiB, since that is the only unit a volume's size is
+    recorded in: a claim written `2G` is 1.86GiB, and reporting 1Gi for it
+    would look like half the volume went missing.
+    """
+    if not size_quantity:
+        return None
+    try:
+        size_bytes = kubernetes.parse_quantity(size_quantity)
+        size = int(
+            decimal.Decimal(size_bytes / _BYTES_PER_GIB).quantize(
+                decimal.Decimal('1'), rounding=decimal.ROUND_HALF_UP))
+    except Exception as e:  # pylint: disable=broad-except
+        # Just log the error since it is not critical: a volume whose size
+        # cannot be read keeps the one already recorded.
+        logger.warning(f'Failed to parse PVC size {size_quantity!r} '
+                       f'for PVC {pvc_name}: {e}')
+        return None
+    if size <= 0:
+        # Under half a gibibyte. Volume creation rejects '0' as a size, so
+        # recording it here would put a value in the database that the same
+        # volume could not have been created with.
+        logger.warning(f'Ignoring PVC size {size_quantity!r} for PVC '
+                       f'{pvc_name}: rounds to less than 1Gi.')
+        return None
+    return str(size)
+
+
+def _true_resize_conditions(status: Any) -> Dict[str, Optional[str]]:
+    """The claim's resize conditions that currently hold, and what they say."""
+    conditions = getattr(status, 'conditions', None)
+    held: Dict[str, Optional[str]] = {}
+    for condition in conditions if isinstance(conditions, list) else []:
+        if getattr(condition, 'status', None) != 'True':
+            continue
+        condition_type = getattr(condition, 'type', None)
+        if condition_type is not None:
+            held[condition_type] = getattr(condition, 'message', None)
+    return held
+
+
+def _pvc_resize_state(
+    pvc_obj: Any, pvc_name: str
+) -> Tuple[Optional[models.VolumeResizeStatus], Optional[str], Optional[str]]:
+    """Returns how far a resize of this claim has got, what it is heading for,
+    and how the claim explains itself.
+
+    All three are None when no resize is in flight, which is the normal case.
+
+    A claim's capacity only moves once the new space exists, so an expansion
+    that is still running -- or that is waiting to be mounted before the
+    filesystem can grow -- looks like nothing happened at all.
+
+    Read from the conditions rather than `status.allocatedResourceStatuses`,
+    even though the latter is the purpose-built field: the state and the words
+    describing it then come from the same place and cannot disagree, and every
+    cluster has conditions while only recent ones have that field. What it
+    would add -- telling a controller-stage resize from a node-stage one -- is
+    collapsed by VolumeResizeStatus anyway.
+    """
+    status = getattr(pvc_obj, 'status', None)
+    conditions = _true_resize_conditions(status)
+    resize_status = None
+    message = None
+    for condition_type, mapped in _RESIZE_CONDITIONS:
+        if condition_type in conditions:
+            resize_status = mapped
+            message = conditions[condition_type]
+            break
+    if resize_status is None:
+        return None, None, None
+
+    # What the resize is heading for: the capacity being allocated, or, before
+    # the backend has acknowledged anything, the request itself.
+    allocated = getattr(status, 'allocated_resources', None)
+    target = allocated.get('storage') if isinstance(allocated, dict) else None
+    if target is None:
+        requests = getattr(getattr(pvc_obj.spec, 'resources', None), 'requests',
+                           None)
+        if isinstance(requests, dict):
+            target = requests.get('storage')
+    return resize_status, _parse_pvc_size(target, pvc_name), message
+
+
+def _observed_volume_state(pvc_obj: Any) -> models.ObservedVolumeState:
+    """Reads the fields of a PVC that the cluster, not our config, owns.
+
+    Only reports what the PVC actually says, so that a caller merging this into
+    a recorded config never clears a value it cannot see.
+    """
+    pvc_name = pvc_obj.metadata.name
+    resize_status, resize_target_size, resize_message = _pvc_resize_state(
+        pvc_obj, pvc_name)
+    return models.ObservedVolumeState(
+        size=_parse_pvc_size(_pvc_capacity(pvc_obj), pvc_name),
+        # An empty storageClassName is the Kubernetes way of opting out of
+        # dynamic provisioning, not a class name to record.
+        storage_class_name=(getattr(pvc_obj.spec, 'storage_class_name', None) or
+                            None),
+        resize_status=resize_status,
+        resize_target_size=resize_target_size,
+        resize_message=resize_message,
+    )
+
+
+def _populate_config_from_pvc(config: models.VolumeConfig,
+                              pvc_obj: Any) -> None:
+    """Populate missing fields in config from a PVC object.
+
+    Args:
+        config: VolumeConfig to populate
+        pvc_obj: V1PersistentVolumeClaim object from kubernetes client
+    """
+    if pvc_obj is None:
+        return
+    pvc_name = pvc_obj.metadata.name
+
+    # Populate storageClassName if not set
+    if config.config.get('storage_class_name') is None:
+        pvc_storage_class = getattr(pvc_obj.spec, 'storage_class_name', None)
+        if pvc_storage_class:
+            config.config['storage_class_name'] = pvc_storage_class
+
+    # Populate access_mode from PVC (immutable, so PVC is source of truth)
+    pvc_access_modes = getattr(pvc_obj.spec, 'access_modes', None)
+    if pvc_access_modes:
+        pvc_access_mode = pvc_access_modes[0]
+        current_access_mode = config.config.get('access_mode')
+        if current_access_mode != pvc_access_mode:
+            if current_access_mode is not None:
+                logger.debug(
+                    f'PVC {pvc_name} has access mode {pvc_access_mode} '
+                    f'but config access_mode is {current_access_mode}, '
+                    f'overriding with the PVC access mode.')
+            config.config['access_mode'] = pvc_access_mode
+
+    # Populate size if not set (prefer bound capacity, fallback to requested)
+    size_quantity = _pvc_capacity(pvc_obj)
+    # Fallback to spec.resources.requests (dict) - requested size
+    if size_quantity is None:
+        requests = getattr(getattr(pvc_obj.spec, 'resources', None), 'requests',
+                           None)
+        if isinstance(requests, dict):
+            size_quantity = requests.get('storage')
+    pvc_size = _parse_pvc_size(size_quantity, pvc_name)
+    if pvc_size is not None:
+        if config.size is not None and config.size != pvc_size:
+            logger.warning(f'PVC {pvc_name} has size {pvc_size} but config '
+                           f'size is {config.size}, overriding the config size'
+                           f' with the PVC size.')
+        config.size = pvc_size
+
+
+def _find_pvc_by_name_or_label(context: Optional[str], namespace: str,
+                               volume_name: str) -> Optional[Any]:
+    """Find PVC by name or skypilot-name label.
+
+    This function searches for a PVC in two ways:
+    1. First, by exact PVC name matching volume_name (backward compatibility)
+    2. Then, by skypilot-name label matching volume_name
+
+    Args:
+        context: Kubernetes context
+        namespace: Kubernetes namespace
+        volume_name: User-specified volume name (config.name)
+
+    Returns:
+        PVC object if found, None otherwise
+    """
+    # Try by exact PVC name first (backward compatibility for user-created PVCs)
+    try:
+        pvc = kubernetes.core_api(
+            context).read_namespaced_persistent_volume_claim(
+                name=volume_name,
+                namespace=namespace,
+                _request_timeout=kubernetes.API_TIMEOUT)
+        return pvc
+    except kubernetes.api_exception() as e:
+        if e.status != 404:
+            raise
+
+    # Try by skypilot-name label (for PVCs created by SkyPilot with UUID suffix)
+    try:
+        pvcs = kubernetes.core_api(
+            context).list_namespaced_persistent_volume_claim(
+                namespace=namespace,
+                label_selector=f'skypilot-name={volume_name}',
+                _request_timeout=kubernetes.API_TIMEOUT)
+        if pvcs.items:
+            if len(pvcs.items) > 1:
+                pvc_names = [p.metadata.name for p in pvcs.items]
+                raise ValueError(
+                    f'Multiple PVCs found with label skypilot-name='
+                    f'{volume_name}: {pvc_names}. Please delete the duplicate'
+                    f' PVCs or specify the exact PVC name.')
+            return pvcs.items[0]
+    except kubernetes.api_exception() as e:
+        logger.debug(f'Failed to list PVCs by label: {e}')
+
+    return None
+
+
+def create_persistent_volume_claim(
+    namespace: str,
+    context: Optional[str],
+    pvc_spec: Dict[str, Any],
+    config: Optional[models.VolumeConfig] = None,
+) -> None:
+    """Creates a persistent volume claim for SkyServe controller."""
+    pvc_name = pvc_spec['metadata']['name']
+    use_existing = config is not None and config.config.get('use_existing')
+
+    # When use_existing, search by both name and label
+    if use_existing:
+        assert config is not None  # Guaranteed by use_existing check above
+        volume_name = config.name  # User-specified name
+        try:
+            pvc = _find_pvc_by_name_or_label(context, namespace, volume_name)
+        except kubernetes.api_exception() as e:
+            raise ValueError(f'Failed to search for PVC with name or label '
+                             f'skypilot-name={volume_name}: {e}') from e
+        if pvc is not None:
+            # Update config.name_on_cloud to the actual PVC name
+            config.name_on_cloud = pvc.metadata.name
+            _populate_config_from_pvc(config, pvc)
+            logger.debug(f'Found existing PVC {pvc.metadata.name} for volume '
+                         f'{volume_name}')
+            return
+        # Name the context and namespace searched. When the volume config
+        # carried no context of its own, `_resolve_context_for_new_volume`
+        # chose one, and "does not exist" on its own reads as "your PVC is
+        # gone" when the truth may be that it lives on a context
+        # `allowed_contexts` excludes.
+        raise ValueError(
+            f'PVC with name or label skypilot-name={volume_name} does not '
+            f'exist in namespace {namespace!r} on context {context!r} while '
+            f'use_existing is True. If the PVC lives on another cluster, '
+            f'name it explicitly with `--infra k8s/<context>`.')
+
+    # Try to read PVC by name_on_cloud (for non-use_existing case)
+    try:
+        pvc = kubernetes.core_api(
+            context).read_namespaced_persistent_volume_claim(
+                name=pvc_name,
+                namespace=namespace,
+                _request_timeout=kubernetes.API_TIMEOUT)
+        if config is not None:
+            _populate_config_from_pvc(config, pvc)
+        logger.debug(f'PVC {pvc_name} already exists')
+        return
+    except kubernetes.api_exception() as e:
+        if e.status != 404:  # Not found
+            raise
+
+    # Create new PVC
+    pvc = kubernetes.core_api(
+        context).create_namespaced_persistent_volume_claim(
+            namespace=namespace,
+            body=pvc_spec,
+            _request_timeout=kubernetes.API_TIMEOUT)
+    logger.info(f'Created PVC {pvc_name} in namespace {namespace}')
+    if config is not None:
+        _populate_config_from_pvc(config, pvc)
+
+
+def _get_pvc_spec(namespace: str,
+                  config: models.VolumeConfig) -> Dict[str, Any]:
+    """Gets the PVC spec for the given storage config."""
+    access_mode = config.config.get('access_mode')
+    size = config.size
+    # The previous code assumes that the access_mode and size are always set.
+    assert access_mode is not None, f'access_mode is None for volume ' \
+                                    f'{config.name_on_cloud}'
+    pvc_spec: Dict[str, Any] = {
+        'metadata': {
+            'name': config.name_on_cloud,
+            'namespace': namespace,
+            'labels': {
+                'parent': 'skypilot',
+                'skypilot-name': config.name,
+            }
+        },
+        'spec': {
+            'accessModes': [access_mode],
+        }
+    }
+    if size is not None:
+        pvc_spec['spec']['resources'] = {'requests': {'storage': f'{size}Gi'}}
+    if config.labels:
+        pvc_spec['metadata']['labels'].update(config.labels)
+    storage_class = config.config.get('storage_class_name')
+    if storage_class is not None:
+        pvc_spec['spec']['storageClassName'] = storage_class
+    return pvc_spec

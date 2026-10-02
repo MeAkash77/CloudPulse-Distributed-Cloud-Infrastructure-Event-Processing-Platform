@@ -1,0 +1,48 @@
+resources:
+    cpus: 4+
+    memory: 8+
+
+workdir: .
+
+setup: |
+  set -e
+  sudo apt update
+  # On images where SkyPilot activates a writable user venv (e.g. the default
+  # Kubernetes images, where the system Python is read-only for the non-root
+  # user), `uv pip install` targets that venv. On images with no active venv
+  # (bare cloud VMs), create one: `uv pip install` aborts with "No virtual
+  # environment found", and `--system` is rejected on images whose system
+  # Python is externally managed (PEP 668, e.g. Ubuntu 24.04) and is not
+  # writable by the non-root user anyway.
+  if [ -z "${VIRTUAL_ENV:-}" ]; then
+    uv venv --seed ~/apiserver-test-venv
+    source ~/apiserver-test-venv/bin/activate
+  fi
+  uv pip install --prerelease allow "azure-cli<2.87.0"
+  uv pip install -e '.[all]'
+
+run: |
+  # Activate the venv created in setup (if any) before `set -u`, since
+  # activate scripts may reference unset variables.
+  if [ -z "${VIRTUAL_ENV:-}" ] && [ -f ~/apiserver-test-venv/bin/activate ]; then
+    source ~/apiserver-test-venv/bin/activate
+  fi
+  set -euo pipefail
+  set -x
+  for i in {1..20}; do
+    sky api start &
+    sky api stop &
+    sky api start &
+    sky api stop &
+    wait
+    # We now either in a clean stopped state or in a clean running state
+    sky api start
+    # Thus the following command should always succeed
+    sky api status -l none
+    if sky api status -l none | grep -q "PENDING"; then
+      echo "Found request pending"
+      exit 1
+    fi
+    sky launch --dryrun -y
+    sky api stop
+  done

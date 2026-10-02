@@ -1,0 +1,912 @@
+"""Unit tests for CloudVmRayBackend task configuration redaction and locking."""
+
+import multiprocessing
+import socket
+import time
+from unittest.mock import MagicMock
+from unittest.mock import patch
+
+import pytest
+
+from sky import clouds
+from sky import exceptions
+from sky import resources
+from sky import task
+from sky.backends import backend_utils
+from sky.backends import cloud_vm_ray_backend
+from sky.backends.cloud_vm_ray_backend import CloudVmRayResourceHandle
+from sky.backends.cloud_vm_ray_backend import SSHTunnelInfo
+from sky.utils import locks
+from sky.utils import status_lib
+
+
+def test_command_length_local_shell_limit():
+    # The local-shell check, still used by generated code that runs on the
+    # cluster. Per-transport limits live on CommandRunner instead; see
+    # tests/unit_tests/test_sky/utils/test_command_runner.py.
+    command = "a'b" * 5000
+    assert not backend_utils.is_command_length_over_limit(command)
+    assert backend_utils.is_command_length_over_limit(command, quote_levels=4)
+
+
+def test_non_slurm_cpu_demand_uses_ray_default():
+    handle = MagicMock()
+    handle.launched_resources = resources.Resources(cloud=clouds.Kubernetes())
+    test_task = task.Task(resources=resources.Resources(cpus=1.5))
+
+    demands = (cloud_vm_ray_backend.CloudVmRayBackend._get_task_demands_dict(
+        handle, test_task))
+
+    assert demands['CPU'] == backend_utils.DEFAULT_TASK_CPU_DEMAND
+
+
+def test_slurm_controller_cpu_demand_uses_controller_default():
+    handle = MagicMock()
+    handle.launched_resources = resources.Resources(cloud=clouds.Slurm())
+    test_task = task.Task(resources=resources.Resources(cpus=4))
+    test_task.service_name = 'service'
+
+    demands = (cloud_vm_ray_backend.CloudVmRayBackend._get_task_demands_dict(
+        handle, test_task))
+
+    assert (
+        demands['CPU'] == backend_utils.constants.CONTROLLER_PROCESS_CPU_DEMAND)
+
+
+def test_slurm_cpu_demand_uses_allocated_cpus():
+    allocated = resources.Resources(cloud=clouds.Slurm(),
+                                    instance_type='2CPU--2GB')
+    handle = MagicMock()
+    handle.launched_resources = allocated
+    test_task = task.Task(resources=resources.Resources(cpus=0.25))
+    test_task.best_resources = allocated
+
+    demands = (cloud_vm_ray_backend.CloudVmRayBackend._get_task_demands_dict(
+        handle, test_task))
+
+    assert demands['CPU'] == 2.0
+
+
+def test_slurm_gpu_cpu_demand_uses_allocated_cpus():
+    allocated = resources.Resources(cloud=clouds.Slurm(),
+                                    instance_type='4CPU--16GB--H200:1')
+    handle = MagicMock()
+    handle.launched_resources = allocated
+    test_task = task.Task(resources=resources.Resources(
+        accelerators={'H200': 1}))
+    test_task.best_resources = allocated
+
+    demands = (cloud_vm_ray_backend.CloudVmRayBackend._get_task_demands_dict(
+        handle, test_task))
+
+    assert demands['CPU'] == 4.0
+
+
+def test_slurm_exec_cpu_demand_uses_cluster_allocation():
+    handle = MagicMock()
+    handle.launched_resources = resources.Resources(cloud=clouds.Slurm(),
+                                                    instance_type='8CPU--32GB')
+    test_task = task.Task(resources=resources.Resources())
+
+    demands = (cloud_vm_ray_backend.CloudVmRayBackend._get_task_demands_dict(
+        handle, test_task))
+
+    assert demands['CPU'] == 8.0
+
+
+class TestCloudVmRayBackendTaskRedaction:
+    """Tests for CloudVmRayBackend usage of redacted task configs."""
+
+    def test_cloud_vm_ray_backend_redaction_usage_pattern(self):
+        """Test the exact usage pattern from the CloudVmRayBackend code."""
+        # Create a task with sensitive secret variables and regular environment variables
+        test_task = task.Task(run='echo hello',
+                              envs={
+                                  'DEBUG': 'true',
+                                  'PORT': '8080'
+                              },
+                              secrets={
+                                  'API_KEY': 'sk-very-secret-key-123',
+                                  'DATABASE_PASSWORD': 'super-secret-password',
+                                  'JWT_SECRET': 'jwt-signing-secret-456'
+                              })
+
+        # Test the exact call pattern used in cloud_vm_ray_backend.py
+        task_config = test_task.to_yaml_config(use_user_specified_yaml=True)
+
+        # Verify that environment variables are NOT redacted
+        assert 'envs' in task_config
+        assert task_config['envs']['DEBUG'] == 'true'
+        assert task_config['envs']['PORT'] == '8080'
+
+        # Verify that secrets ARE redacted
+        assert 'secrets' in task_config
+        assert task_config['secrets']['API_KEY'] == '<redacted>'
+        assert task_config['secrets']['DATABASE_PASSWORD'] == '<redacted>'
+        assert task_config['secrets']['JWT_SECRET'] == '<redacted>'
+
+        # Verify other task fields are preserved
+        assert task_config['run'] == 'echo hello'
+
+    def test_backend_task_config_without_secrets(self):
+        """Test task config generation when no secrets are present."""
+        test_task = task.Task(run='python train.py',
+                              envs={'PYTHONPATH': '/app'})
+
+        task_config = test_task.to_yaml_config(use_user_specified_yaml=True)
+
+        # Environment variables should be preserved
+        assert task_config['envs']['PYTHONPATH'] == '/app'
+
+        # No secrets field should be present
+        assert 'secrets' not in task_config or not task_config.get('secrets')
+
+    def test_backend_task_config_empty_secrets(self):
+        """Test task config generation with empty secrets dict."""
+        test_task = task.Task(run='python train.py',
+                              envs={'PYTHONPATH': '/app'},
+                              secrets={})
+
+        task_config = test_task.to_yaml_config(use_user_specified_yaml=True)
+
+        # Environment variables should be preserved
+        assert task_config['envs']['PYTHONPATH'] == '/app'
+
+        # Empty secrets should not appear in config
+        assert 'secrets' not in task_config
+
+    def test_backend_redaction_redacts_all_values(self):
+        """Test that all secret values (including non-string) are redacted."""
+        test_task = task.Task(run='echo hello',
+                              secrets={
+                                  'STRING_SECRET': 'actual-secret',
+                                  'NUMERIC_PORT': 5432,
+                                  'BOOLEAN_FLAG': True,
+                                  'NULL_VALUE': None
+                              })
+
+        task_config = test_task.to_yaml_config(use_user_specified_yaml=True)
+
+        # String values should be redacted
+        assert task_config['secrets']['STRING_SECRET'] == '<redacted>'
+
+        # All values should be redacted (including non-string values)
+        assert task_config['secrets']['NUMERIC_PORT'] == '<redacted>'
+        assert task_config['secrets']['BOOLEAN_FLAG'] == '<redacted>'
+        assert task_config['secrets']['NULL_VALUE'] == '<redacted>'
+
+    def test_backend_supports_both_redaction_modes(self):
+        """Test that backend can use both redacted and non-redacted configs."""
+        test_task = task.Task(run='echo hello',
+                              secrets={'API_KEY': 'secret-key-123'})
+
+        # Test redacted mode (for logging/display)
+        redacted_config = test_task.to_yaml_config(use_user_specified_yaml=True)
+        assert redacted_config['secrets']['API_KEY'] == '<redacted>'
+
+        # Test non-redacted mode (for execution)
+        full_config = test_task.to_yaml_config(use_user_specified_yaml=False)
+        assert full_config['secrets']['API_KEY'] == 'secret-key-123'
+
+    def test_backend_mixed_envs_and_secrets(self):
+        """Test backend behavior with both envs and secrets containing sensitive data."""
+        test_task = task.Task(
+            run='echo hello',
+            envs={
+                'PUBLIC_API_URL': 'https://api.example.com',
+                'DEBUG_MODE': 'true',
+                'ENVIRONMENT': 'production'
+            },
+            secrets={
+                'PRIVATE_API_KEY': 'sk-secret-key-123',
+                'DATABASE_URL': 'postgresql://user:pass@host:5432/db',
+                'OAUTH_CLIENT_SECRET': 'oauth-secret-456'
+            })
+
+        task_config = test_task.to_yaml_config(use_user_specified_yaml=True)
+
+        # All environment variables should remain visible
+        assert task_config['envs'][
+            'PUBLIC_API_URL'] == 'https://api.example.com'
+        assert task_config['envs']['DEBUG_MODE'] == 'true'
+        assert task_config['envs']['ENVIRONMENT'] == 'production'
+
+        # All secrets should be redacted
+        assert task_config['secrets']['PRIVATE_API_KEY'] == '<redacted>'
+        assert task_config['secrets']['DATABASE_URL'] == '<redacted>'
+        assert task_config['secrets']['OAUTH_CLIENT_SECRET'] == '<redacted>'
+
+    def test_backend_config_serialization_safety(self):
+        """Test that redacted configs are safe for serialization/logging."""
+        import json
+
+        import yaml
+
+        test_task = task.Task(
+            run='echo hello',
+            envs={'PUBLIC_VAR': 'public-value'},
+            secrets={'PRIVATE_KEY': 'very-sensitive-key-data'})
+
+        redacted_config = test_task.to_yaml_config(use_user_specified_yaml=True)
+
+        # Should be serializable to JSON
+        json_str = json.dumps(redacted_config)
+        assert 'very-sensitive-key-data' not in json_str
+        assert '<redacted>' in json_str
+
+        # Should be serializable to YAML
+        yaml_str = yaml.dump(redacted_config)
+        assert 'very-sensitive-key-data' not in yaml_str
+        assert '<redacted>' in yaml_str
+
+        # Public values should still be present
+        assert 'public-value' in yaml_str
+
+    def test_redacted_config_contains_no_sensitive_data(self):
+        """Test that redacted task config doesn't contain sensitive secret data."""
+        # Create a task with sensitive secret variables and regular environment variables
+        test_task = task.Task(run='echo hello',
+                              envs={
+                                  'DEBUG': 'true',
+                                  'PORT': 8080,
+                                  'PUBLIC_VAR': 'public-value'
+                              },
+                              secrets={
+                                  'API_KEY': 'secret-api-key-123',
+                                  'DATABASE_PASSWORD': 'super-secret-password',
+                                  'AWS_SECRET_ACCESS_KEY': 'aws-secret-key',
+                                  'STRIPE_SECRET_KEY': 'sk_live_sensitive_key',
+                                  'JWT_SECRET': 'jwt-signing-secret',
+                              })
+
+        # Get the redacted config as the backend would
+        redacted_config = test_task.to_yaml_config(use_user_specified_yaml=True)
+
+        # Verify sensitive string values in secrets are redacted
+        assert redacted_config['secrets']['API_KEY'] == '<redacted>'
+        assert redacted_config['secrets']['DATABASE_PASSWORD'] == '<redacted>'
+        assert redacted_config['secrets'][
+            'AWS_SECRET_ACCESS_KEY'] == '<redacted>'
+        assert redacted_config['secrets']['STRIPE_SECRET_KEY'] == '<redacted>'
+        assert redacted_config['secrets']['JWT_SECRET'] == '<redacted>'
+
+        # Verify envs are NOT redacted (preserved as-is)
+        assert redacted_config['envs']['DEBUG'] == 'true'
+        assert redacted_config['envs']['PORT'] == 8080
+        assert redacted_config['envs']['PUBLIC_VAR'] == 'public-value'
+
+        # Ensure no sensitive data appears anywhere in the config
+        config_str = str(redacted_config)
+        assert 'secret-api-key-123' not in config_str
+        assert 'super-secret-password' not in config_str
+        assert 'aws-secret-key' not in config_str
+        assert 'sk_live_sensitive_key' not in config_str
+        assert 'jwt-signing-secret' not in config_str
+
+        # But public values should still be present
+        assert 'public-value' in config_str
+
+    def test_non_redacted_config_contains_actual_values(self):
+        """Test that non-redacted config contains actual secret values."""
+        # Create a task with environment variables and secrets
+        test_task = task.Task(run='echo hello',
+                              envs={
+                                  'DEBUG': 'true',
+                                  'PORT': 8080
+                              },
+                              secrets={
+                                  'API_KEY': 'actual-api-key',
+                                  'JWT_SECRET': 'actual-jwt-secret'
+                              })
+
+        # Get the non-redacted config
+        non_redacted_config = test_task.to_yaml_config(
+            use_user_specified_yaml=False)
+
+        # Verify actual values are present in both envs and secrets
+        assert non_redacted_config['envs']['DEBUG'] == 'true'
+        assert non_redacted_config['envs']['PORT'] == 8080
+        assert non_redacted_config['secrets']['API_KEY'] == 'actual-api-key'
+        assert non_redacted_config['secrets'][
+            'JWT_SECRET'] == 'actual-jwt-secret'
+
+        # Also test default behavior (should NOT redact secrets by default)
+        default_config = test_task.to_yaml_config()
+        assert default_config['envs'] == non_redacted_config[
+            'envs']  # envs same
+        assert default_config['secrets'][
+            'API_KEY'] == 'actual-api-key'  # secrets not redacted by default
+
+    def test_backend_redaction_with_no_secrets(self):
+        """Test backend behavior when task has no secret variables."""
+        # Create a task with only environment variables, no secrets
+        test_task = task.Task(run='echo hello', envs={'DEBUG': 'true'})
+
+        # Get redacted config
+        redacted_config = test_task.to_yaml_config(use_user_specified_yaml=True)
+
+        # Should not have secrets key at all
+        assert 'secrets' not in redacted_config
+
+        # Should have envs key with actual values (not redacted)
+        assert 'envs' in redacted_config
+        assert redacted_config['envs']['DEBUG'] == 'true'
+
+        # Should still have other task properties
+        assert redacted_config['run'] == 'echo hello'
+
+    def test_backend_redaction_preserves_task_structure(self):
+        """Test that redaction preserves all non-secret task configuration."""
+        from sky import resources
+
+        # Create a comprehensive task
+        test_task = task.Task(run='python train.py',
+                              envs={
+                                  'DEBUG': 'true',
+                                  'PORT': 8080
+                              },
+                              secrets={
+                                  'API_KEY': 'secret-value',
+                                  'DB_PASSWORD': 'secret-password'
+                              },
+                              workdir='/app',
+                              name='training-task')
+        # Set resources using the proper method
+        test_task.set_resources(resources.Resources(cpus=4, memory=8))
+
+        # Get both configs
+        original_config = test_task.to_yaml_config(
+            use_user_specified_yaml=False)
+        redacted_config = test_task.to_yaml_config(use_user_specified_yaml=True)
+
+        # All non-secret fields should be identical
+        for key in original_config:
+            if key != 'secrets':
+                assert original_config[key] == redacted_config[key]
+
+        # Envs should be identical (not redacted)
+        assert original_config['envs'] == redacted_config['envs']
+        assert redacted_config['envs']['DEBUG'] == 'true'
+        assert redacted_config['envs']['PORT'] == 8080
+
+        # Secret handling should be different
+        assert original_config['secrets']['API_KEY'] == 'secret-value'
+        assert redacted_config['secrets']['API_KEY'] == '<redacted>'
+        assert original_config['secrets']['DB_PASSWORD'] == 'secret-password'
+        assert redacted_config['secrets']['DB_PASSWORD'] == '<redacted>'
+
+
+class TestCloudVmRayBackendGetGrpcChannel:
+    """Tests for CloudVmRayBackend get_grpc_channel."""
+    MOCK_HANDLE_KWARGS = {
+        'cluster_name': 'test-cluster',
+        'cluster_name_on_cloud': 'test-cluster-abc',
+        'cluster_yaml': None,
+        'launched_nodes': 1,
+        'launched_resources': MagicMock(),
+    }
+
+    INITIAL_TUNNEL_PORT = 10000
+    INITIAL_TUNNEL_PID = 12345
+    PROCESS_JOIN_TIMEOUT_SECONDS = 30
+
+    def _simulate_process_get_grpc_channel(self, queue, tunnel_creation_count,
+                                           tunnel_port, tunnel_pid,
+                                           socket_connect_side_effect):
+        """Simulate a process calling get_grpc_channel.
+
+        This test mocks:
+        - _get_skylet_ssh_tunnel: To avoid making an actual DB query
+        - _open_and_update_skylet_tunnel: To avoid actually opening an SSH tunnel
+        - grpc.insecure_channel: To just return the address instead of a Channel object
+        - socket.socket.connect: To avoid actually connecting to the tunnel
+
+        This test does not mock:
+        - lock.acquire
+        """
+        try:
+            # Different processes have different handle instances.
+            handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+
+            def mock_get_tunnel_side_effect():
+                # Return None if the tunnel is not created yet.
+                if tunnel_port.value == -1 or tunnel_pid.value == -1:
+                    return None
+                return SSHTunnelInfo(port=tunnel_port.value,
+                                     pid=tunnel_pid.value)
+
+            def mock_open_tunnel():
+                # Simulate time taken to create tunnel.
+                time.sleep(2)
+                with tunnel_creation_count.get_lock():
+                    tunnel_creation_count.value += 1
+                    created = tunnel_creation_count.value
+                with tunnel_port.get_lock(), tunnel_pid.get_lock():
+                    # First creation -> 10000/12345; second -> 10001/12346; and so on.
+                    tunnel_port.value = self.INITIAL_TUNNEL_PORT + (created - 1)
+                    tunnel_pid.value = self.INITIAL_TUNNEL_PID + (created - 1)
+                    return SSHTunnelInfo(port=tunnel_port.value,
+                                         pid=tunnel_pid.value)
+
+            with patch.object(handle, '_get_skylet_ssh_tunnel', side_effect=mock_get_tunnel_side_effect), \
+                patch.object(handle, '_open_and_update_skylet_tunnel', side_effect=mock_open_tunnel), \
+                patch('grpc.insecure_channel', side_effect=lambda addr, options: addr), \
+                patch('socket.socket') as mock_socket:
+
+                mock_socket.return_value.__enter__.return_value.connect.side_effect = socket_connect_side_effect
+
+                res = handle.get_grpc_channel()
+                assert res is not None
+                queue.put(res)
+
+        except Exception as e:
+            import traceback
+            error_msg = f"Error: {e}\nTraceback: {traceback.format_exc()}"
+            queue.put(error_msg)
+
+    def _socket_connect_side_effect(self, addr):
+        _, port = addr
+        # Force an error on the original port to test the retry logic.
+        if port == self.INITIAL_TUNNEL_PORT:
+            raise socket.error("Connection error")
+        return None
+
+    @pytest.mark.parametrize('has_stale_tunnel', [False, True])
+    @pytest.mark.parametrize('concurrent_tunnel_created', [False, True])
+    def test_get_grpc_channel_rechecks_tunnel_after_acquiring_lock(
+            self, has_stale_tunnel, concurrent_tunnel_created):
+        """Reuse a tunnel created after the initial read but before locking."""
+        handle = CloudVmRayResourceHandle(**self.MOCK_HANDLE_KWARGS)
+        stale_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT,
+                                     pid=self.INITIAL_TUNNEL_PID)
+        healthy_tunnel = SSHTunnelInfo(port=self.INITIAL_TUNNEL_PORT + 1,
+                                       pid=self.INITIAL_TUNNEL_PID + 1)
+        tunnel_state = {'tunnel': stale_tunnel if has_stale_tunnel else None}
+
+        def acquire_lock():
+            # Another process finishes opening a tunnel just before this
+            # process acquires the exclusive lock.
+            if concurrent_tunnel_created:
+                tunnel_state['tunnel'] = healthy_tunnel
+
+        exclusive_lock = MagicMock()
+        exclusive_lock.acquire.return_value.__enter__.side_effect = acquire_lock
+        with patch.object(handle, '_get_skylet_ssh_tunnel',
+                          side_effect=lambda: tunnel_state['tunnel']), \
+                patch.object(handle, '_open_and_update_skylet_tunnel',
+                             return_value=healthy_tunnel) as open_tunnel, \
+                patch.object(locks, 'get_lock', return_value=exclusive_lock), \
+                patch('grpc.insecure_channel') as channel, \
+                patch('socket.socket') as mock_socket:
+            mock_socket.return_value.__enter__.return_value.connect.side_effect = (
+                self._socket_connect_side_effect)
+
+            assert handle.get_grpc_channel() == channel.return_value
+            assert channel.call_args.args[
+                0] == f'localhost:{healthy_tunnel.port}'
+            if concurrent_tunnel_created:
+                open_tunnel.assert_not_called()
+            else:
+                open_tunnel.assert_called_once_with()
+
+    def test_get_grpc_channel_multiprocess_race_condition(self):
+        """Test get_grpc_channel with multiple processes racing for tunnel creation."""
+        tunnel_creation_count = multiprocessing.Value('i', 0)
+        tunnel_port = multiprocessing.Value('i', -1)
+        tunnel_pid = multiprocessing.Value('i', -1)
+
+        num_processes = 5
+        processes = []
+        queue = multiprocessing.Queue()
+        for _ in range(num_processes):
+            p = multiprocessing.Process(
+                target=self._simulate_process_get_grpc_channel,
+                args=(queue, tunnel_creation_count, tunnel_port, tunnel_pid,
+                      None))
+            processes.append(p)
+            p.start()
+
+        for p in processes:
+            p.join(timeout=self.PROCESS_JOIN_TIMEOUT_SECONDS)
+            if p.is_alive():
+                p.terminate()
+                p.join()
+
+        results = []
+        while not queue.empty():
+            results.append(queue.get())
+        assert len(
+            results
+        ) == num_processes, f"Expected {num_processes} results, got {len(results)}"
+        # All processes should get the same channel (localhost:10000).
+        for item in results:
+            assert item == f'localhost:{self.INITIAL_TUNNEL_PORT}', f"Failed: {item}"
+
+        assert tunnel_creation_count.value == 1, f"Expected tunnel to be created exactly once, but was created {tunnel_creation_count.value} times"
+
+        # Try again, this tests the case where the tunnel is already created.
+        # This time, tunnel.port will be 10000, but the check should fail,
+        # as our _socket_connect_side_effect will raise an error. So we
+        # should invoke _open_and_update_skylet_tunnel again,
+        # this time returning another port.
+        for _ in range(num_processes):
+            p = multiprocessing.Process(
+                target=self._simulate_process_get_grpc_channel,
+                args=(queue, tunnel_creation_count, tunnel_port, tunnel_pid,
+                      self._socket_connect_side_effect))
+            processes.append(p)
+            p.start()
+
+        for p in processes:
+            p.join(timeout=self.PROCESS_JOIN_TIMEOUT_SECONDS)
+            if p.is_alive():
+                p.terminate()
+                p.join()
+
+        results = []
+        while not queue.empty():
+            results.append(queue.get())
+        assert len(
+            results
+        ) == num_processes, f"Expected {num_processes} results, got {len(results)}"
+
+        # All processes should get the same channel (localhost:10001).
+        for i in range(num_processes):
+            assert results[
+                i] == f'localhost:{self.INITIAL_TUNNEL_PORT + 1}', f"Process {i} failed: {results[i]}"
+
+        assert tunnel_creation_count.value == 2, f"Expected tunnel to be created exactly once, but was created {tunnel_creation_count.value} times"
+
+    def test_setup_num_gpus(self, monkeypatch):
+        """Test setup num GPUs."""
+        test_task = task.Task(resources=resources.Resources(
+            accelerators={'A100': 8}))
+        monkeypatch.setattr(CloudVmRayResourceHandle, '__init__',
+                            lambda self, *args, **kwargs: None)
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        assert backend._get_num_gpus(test_task) == 8
+
+
+class TestIsMessageTooLong:
+    """Tests for _is_message_too_long function."""
+
+    @pytest.mark.parametrize(
+        'returncode,message,expected',
+        [
+            # Valid matches with correct returncode
+            (255, 'too long', True),
+            (255, 'Argument list too long', True),
+            (1, 'request-uri too large', True),
+            (1, '414 Request-URI Too Large', True),
+            (1, 'request header fields too large', True),
+            (1, '431 Request Header Fields Too Large', True),
+            # CloudFlare 400 Bad Request patterns
+            (1, '400 bad request', True),
+            (1, '400 Bad request', True),
+            (1, '400 Bad Request', True),
+            (1,
+             'error: unable to upgrade connection: <html><body><h1>400 Bad request</h1>',
+             True),
+            # Signatures are matched as bare substrings against the whole
+            # setup log, which is user output, so generic network-failure text
+            # must not be in the table: a user script printing it and exiting 1
+            # would have its setup re-run from the top.
+            (1, 'read tcp 10.0.0.1:443: connection reset by peer', False),
+            (1, 'gzip: unexpected EOF', False),
+            (1, 'Error from server: ', False),
+            # Case insensitivity
+            (255, 'TOO LONG', True),
+            (1, 'REQUEST HEADER FIELDS TOO LARGE', True),
+            (1, '400 BAD REQUEST', True),
+            # Wrong returncode
+            (1, 'too long', False),
+            (255, 'request-uri too large', False),
+            (127, 'too long', False),
+            (255, '400 bad request', False),
+            # Wrong message
+            (255, 'command not found', False),
+            (1, 'some other error', False),
+            (1, 'unable to upgrade connection', False),
+            # Empty output
+            (255, '', False),
+        ])
+    def test_detection_with_output(self, returncode, message, expected):
+        """Test message detection with various returncode/message combinations."""
+        assert cloud_vm_ray_backend._is_message_too_long(
+            returncode, output=message) == expected
+
+    def test_detection_with_file_path(self, tmp_path):
+        """Test detection when reading from file."""
+        log_file = tmp_path / "test.log"
+        log_file.write_text("Error: command too long")
+        assert cloud_vm_ray_backend._is_message_too_long(
+            255, file_path=str(log_file))
+
+        log_file.write_text("431 Request Header Fields Too Large")
+        assert cloud_vm_ray_backend._is_message_too_long(
+            1, file_path=str(log_file))
+
+    def test_file_read_error_returns_true(self, tmp_path):
+        """Test that file read errors return True for safety."""
+        # Non-existent file
+        assert cloud_vm_ray_backend._is_message_too_long(
+            255, file_path="/nonexistent/file.log")
+
+        # Unreadable file
+        log_file = tmp_path / "unreadable.log"
+        log_file.write_text("content")
+        log_file.chmod(0o000)
+        try:
+            assert cloud_vm_ray_backend._is_message_too_long(
+                255, file_path=str(log_file))
+        finally:
+            log_file.chmod(0o644)
+
+    def test_requires_either_output_or_file_path(self):
+        """Test that function requires either output or file_path."""
+        with pytest.raises(AssertionError):
+            cloud_vm_ray_backend._is_message_too_long(255)
+        with pytest.raises(AssertionError):
+            cloud_vm_ray_backend._is_message_too_long(255,
+                                                      output="test",
+                                                      file_path="/tmp/test")
+
+    def test_partial_match_in_long_output(self):
+        """Test that partial matches in longer messages are detected."""
+        long_output = """Error executing command on remote server:
+        bash: /usr/bin/ssh: Argument list too long
+        Failed to run setup script"""
+        assert cloud_vm_ray_backend._is_message_too_long(255,
+                                                         output=long_output)
+
+        http_error = "<html><h1>414 Request-URI Too Large</h1></html>"
+        assert cloud_vm_ray_backend._is_message_too_long(1, output=http_error)
+
+    def test_multiple_patterns_match_by_returncode(self):
+        """Test that returncode determines which pattern to match."""
+        mixed = "too long and request-uri too large"
+        assert cloud_vm_ray_backend._is_message_too_long(255, output=mixed)
+        assert cloud_vm_ray_backend._is_message_too_long(1, output=mixed)
+
+
+class TestCloudVmRayBackendTeardownNoLock:
+    """Tests for CloudVmRayBackend.teardown_no_lock() guards."""
+
+    @staticmethod
+    def _make_handle(cluster_name: str, cluster_yaml: str, has_ray: bool):
+
+        class _FakeLaunchedResources:
+
+            def __init__(self, cloud_obj):
+                self.cloud = cloud_obj
+
+            def assert_launchable(self):
+                return self
+
+        cloud = MagicMock()
+        cloud.PROVISIONER_VERSION = (
+            cloud_vm_ray_backend.clouds.ProvisionerVersion.SKYPILOT)
+        launched_resources = _FakeLaunchedResources(cloud)
+
+        handle = CloudVmRayResourceHandle(
+            cluster_name=cluster_name,
+            cluster_name_on_cloud=f'{cluster_name}-on-cloud',
+            cluster_yaml=cluster_yaml,
+            launched_nodes=1,
+            launched_resources=launched_resources,
+        )
+        handle.provision_runtime_metadata = (
+            cloud_vm_ray_backend.provision_common.ProvisionRuntimeMetadata(
+                has_ray=has_ray))
+        handle.close_skylet_ssh_tunnel = MagicMock()
+        return handle
+
+    def test_uses_refreshed_handle_to_avoid_stale_metadata(self):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        stale_handle = self._make_handle('test-cluster',
+                                         '/tmp/stale.yaml',
+                                         has_ray=True)
+        refreshed_handle = self._make_handle('test-cluster',
+                                             '/tmp/refreshed.yaml',
+                                             has_ray=False)
+
+        with patch(
+                'sky.backends.cloud_vm_ray_backend.requests_lib.'
+                'kill_cluster_requests'), patch(
+                    'sky.backends.cloud_vm_ray_backend.backend_utils.'
+                    'refresh_cluster_status_handle',
+                    return_value=(
+                        status_lib.ClusterStatus.UP, refreshed_handle)), patch(
+                            'sky.backends.cloud_vm_ray_backend.'
+                            'global_user_state.'
+                            'get_cluster_yaml_dict',
+                            return_value={'provider': {
+                            }}) as (mock_get_yaml), patch(
+                                'sky.backends.cloud_vm_ray_backend'
+                                '.provisioner.teardown_cluster'), patch.object(
+                                    backend,
+                                    'post_teardown_cleanup'), patch.object(
+                                        backend,
+                                        'run_on_head') as mock_run_on_head:
+            backend.teardown_no_lock(stale_handle,
+                                     terminate=True,
+                                     refresh_cluster_status=True)
+
+        mock_run_on_head.assert_not_called()
+        mock_get_yaml.assert_called_once_with(refreshed_handle.cluster_yaml)
+
+
+class TestNewHandleRuntimeMetadata:
+    """Runtime metadata a freshly constructed handle starts with."""
+
+    def test_new_handle_has_no_runtime_established(self):
+        """A new handle is created before provisioning, so it claims no Ray.
+
+        Otherwise teardown of a cluster that crashed or recovered during
+        provisioning attempts ``ray stop`` on a runtime that was never set
+        up.
+        """
+        handle = CloudVmRayResourceHandle(
+            cluster_name='test-cluster',
+            cluster_name_on_cloud='test-cluster-abc',
+            cluster_yaml=None,
+            launched_nodes=1,
+            launched_resources=MagicMock(),
+        )
+        metadata = handle.provision_runtime_metadata
+        assert (metadata.has_ray, metadata.has_skylet, metadata.has_job_queue,
+                metadata.ssh_available) == (False, False, False, False)
+
+
+class TestProvisionClusterLockParking:
+    """_provision on lock contention: park as WAITING only in request ctx."""
+
+    def _run_provision(self,
+                       monkeypatch,
+                       in_request_context,
+                       locked_provision_mock,
+                       is_launched_by_jobs_controller=False):
+        backend = cloud_vm_ray_backend.CloudVmRayBackend()
+        backend._is_launched_by_jobs_controller = (
+            is_launched_by_jobs_controller)
+        monkeypatch.setattr('sky.backends.backend_utils.check_rsync_installed',
+                            lambda: None)
+        monkeypatch.setattr('sky.backends.backend_utils.check_owner_identity',
+                            lambda cluster_name: None)
+        monkeypatch.setattr('sky.utils.common_utils.is_in_request_context',
+                            lambda: in_request_context)
+        monkeypatch.setattr('sky.utils.rich_utils.force_update_status',
+                            lambda msg: None)
+        monkeypatch.setattr(backend, '_locked_provision', locked_provision_mock)
+        return backend._provision(MagicMock(),
+                                  None,
+                                  dryrun=False,
+                                  stream_logs=False,
+                                  cluster_name='test-cluster')
+
+    def test_parks_on_lock_contention_in_request_context(self, monkeypatch):
+        locked_provision = MagicMock(side_effect=locks.LockTimeout('locked'))
+        with pytest.raises(exceptions.ExecutionPausedError) as exc_info:
+            self._run_provision(monkeypatch,
+                                in_request_context=True,
+                                locked_provision_mock=locked_provision)
+        assert 'test-cluster' in str(exc_info.value)
+        assert (exc_info.value.retry_wait_seconds ==
+                cloud_vm_ray_backend._CLUSTER_LOCK_RETRY_GAP_SECONDS)
+        condition = exc_info.value.continue_condition
+        assert isinstance(condition, locks.LockAcquirableCondition)
+        assert condition._lock_id == 'test-cluster_status'
+        assert locked_provision.call_count == 1
+
+    def test_blocks_on_lock_contention_outside_request_context(
+            self, monkeypatch):
+        sentinel = (MagicMock(), False)
+        locked_provision = MagicMock(
+            side_effect=[locks.LockTimeout('locked'), sentinel])
+        result = self._run_provision(monkeypatch,
+                                     in_request_context=False,
+                                     locked_provision_mock=locked_provision)
+        assert result is sentinel
+        assert locked_provision.call_count == 2
+
+    def test_parks_for_jobs_controller_launch_in_request_context(
+            self, monkeypatch):
+        # A jobs-controller launch running as a scheduler-managed request
+        # (consolidation mode submits launches via the SDK like any other
+        # request) must park like any other request: blocking instead would
+        # pin one executor worker per lock contender (e.g. duplicate launch
+        # requests for the same cluster after controller retries), starving
+        # the worker pool at scale.
+        locked_provision = MagicMock(side_effect=locks.LockTimeout('locked'))
+        with pytest.raises(exceptions.ExecutionPausedError) as exc_info:
+            self._run_provision(monkeypatch,
+                                in_request_context=True,
+                                locked_provision_mock=locked_provision,
+                                is_launched_by_jobs_controller=True)
+        condition = exc_info.value.continue_condition
+        assert isinstance(condition, locks.LockAcquirableCondition)
+        assert locked_provision.call_count == 1
+
+    def test_blocks_for_jobs_controller_launch_outside_request_context(
+            self, monkeypatch):
+        # Without a request context there is no scheduler to park/resume the
+        # request, so the blocking behavior is kept regardless of the
+        # jobs-controller flag.
+        sentinel = (MagicMock(), False)
+        locked_provision = MagicMock(
+            side_effect=[locks.LockTimeout('locked'), sentinel])
+        result = self._run_provision(monkeypatch,
+                                     in_request_context=False,
+                                     locked_provision_mock=locked_provision,
+                                     is_launched_by_jobs_controller=True)
+        assert result is sentinel
+        assert locked_provision.call_count == 2
+
+
+class TestSlurmContainerImageBackfill:
+    """Backfilling provider.container_image for pre-upgrade Slurm clusters."""
+
+    @staticmethod
+    def _handle(cloud, image):
+        launched = MagicMock()
+        launched.cloud = MagicMock(spec=cloud)
+        launched.extract_docker_image.return_value = image
+        return CloudVmRayResourceHandle(
+            cluster_name='test-cluster',
+            cluster_name_on_cloud='test-cluster-abc',
+            cluster_yaml='test-cluster.yml',
+            launched_nodes=1,
+            launched_resources=launched,
+        )
+
+    def test_backfills_legacy_container_cluster(self):
+        handle = self._handle(clouds.Slurm, 'ubuntu:24.04')
+        with patch('sky.global_user_state.get_cluster_yaml_dict',
+                   return_value={'provider': {'cluster': 'c'}}), \
+             patch('sky.global_user_state.set_cluster_yaml') as mock_set:
+            handle._maybe_backfill_slurm_container_image()
+        mock_set.assert_called_once()
+        name, written = mock_set.call_args.args
+        assert name == 'test-cluster'
+        from sky.utils import yaml_utils
+        assert (yaml_utils.safe_load(written)['provider']['container_image'] ==
+                'ubuntu:24.04')
+
+    def test_noop_when_already_present(self):
+        handle = self._handle(clouds.Slurm, 'ubuntu:24.04')
+        with patch('sky.global_user_state.get_cluster_yaml_dict',
+                   return_value={'provider': {
+                       'container_image': 'ubuntu:24.04'
+                   }}), \
+             patch('sky.global_user_state.set_cluster_yaml') as mock_set:
+            handle._maybe_backfill_slurm_container_image()
+        mock_set.assert_not_called()
+
+    def test_reconciles_stale_value(self):
+        handle = self._handle(clouds.Slurm, 'ubuntu:24.04')
+        with patch('sky.global_user_state.get_cluster_yaml_dict',
+                   return_value={'provider': {
+                       'container_image': 'old:1'
+                   }}), \
+             patch('sky.global_user_state.set_cluster_yaml') as mock_set:
+            handle._maybe_backfill_slurm_container_image()
+        _, written = mock_set.call_args.args
+        from sky.utils import yaml_utils
+        assert (yaml_utils.safe_load(written)['provider']['container_image'] ==
+                'ubuntu:24.04')
+
+    def test_noop_for_non_container_slurm(self):
+        handle = self._handle(clouds.Slurm, None)
+        with patch('sky.global_user_state.get_cluster_yaml_dict') as mock_get, \
+             patch('sky.global_user_state.set_cluster_yaml') as mock_set:
+            handle._maybe_backfill_slurm_container_image()
+        mock_get.assert_not_called()
+        mock_set.assert_not_called()
+
+    def test_noop_for_non_slurm_cloud(self):
+        handle = self._handle(clouds.AWS, 'ubuntu:24.04')
+        with patch('sky.global_user_state.get_cluster_yaml_dict') as mock_get, \
+             patch('sky.global_user_state.set_cluster_yaml') as mock_set:
+            handle._maybe_backfill_slurm_container_image()
+        mock_get.assert_not_called()
+        mock_set.assert_not_called()

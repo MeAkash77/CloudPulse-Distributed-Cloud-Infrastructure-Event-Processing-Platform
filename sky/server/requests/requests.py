@@ -1,0 +1,1899 @@
+"""Utilities for REST API."""
+import asyncio
+import atexit
+import contextlib
+import dataclasses
+import enum
+import functools
+import os
+import pathlib
+import shutil
+import signal
+import sqlite3
+import stat
+import threading
+import time
+import traceback
+from typing import (Any, Callable, Dict, Generator, List, NamedTuple, NoReturn,
+                    Optional, Set, Tuple)
+import uuid
+
+import anyio
+import colorama
+import filelock
+import orjson
+
+from sky import exceptions
+from sky import global_user_state
+from sky import sky_logging
+from sky import skypilot_config
+from sky.metrics import utils as metrics_lib
+from sky.server import common as server_common
+from sky.server import constants as server_constants
+from sky.server import daemons
+from sky.server import versions
+from sky.server.blob import blob_storage as bs
+from sky.server.requests import payloads
+from sky.server.requests import storage as request_storage
+from sky.server.requests.serializers import decoders
+from sky.server.requests.serializers import encoders
+from sky.server.requests.serializers import return_value_serializers
+from sky.skylet import constants as skylet_constants
+from sky.utils import asyncio_utils
+from sky.utils import common_utils
+from sky.utils import ux_utils
+from sky.utils.db import db_utils
+
+logger = sky_logging.init_logger(__name__)
+
+
+def _unresolved_entrypoint(*args: Any, **kwargs: Any) -> NoReturn:
+    """Placeholder for a request entrypoint that could not be unpickled.
+
+    Used by ``Request.decode`` when the encoded entrypoint references a symbol
+    this (older) client does not have. The entrypoint is never invoked on the
+    client; this only guards the unlikely case of someone calling it.
+    """
+    raise RuntimeError(
+        'This request entrypoint could not be resolved on the client, likely '
+        'due to a client/server version mismatch. Upgrade the SkyPilot client '
+        'to match the API server version.')
+
+
+# Tables in task.db.
+REQUEST_TABLE = 'requests'
+COL_CLUSTER_NAME = 'cluster_name'
+COL_USER_ID = 'user_id'
+COL_STATUS_MSG = 'status_msg'
+COL_SHOULD_RETRY = 'should_retry'
+COL_FINISHED_AT = 'finished_at'
+COL_FILE_MOUNTS_BLOB_ID = 'file_mounts_blob_id'
+# Legacy path for backward compatibility - GC will clean up logs from both
+# the new and legacy paths to handle server upgrades gracefully.
+LEGACY_REQUEST_LOG_PATH_PREFIX = '~/sky_logs/api_server/requests'
+
+DEFAULT_REQUESTS_RETENTION_HOURS = 24  # 1 day
+# Interval between two runs of the requests GC daemon.
+_REQUESTS_GC_INTERVAL_SECONDS = 3600  # 1 hour
+
+# TODO(zhwu): For scalability, there are several TODOs:
+# [x] Have a way to queue requests.
+# [ ] Move logs to persistent place.
+# [ ] Deploy API server in a autoscaling fashion.
+
+
+class RequestStatus(enum.Enum):
+    """The status of a request."""
+
+    PENDING = 'PENDING'
+    WAITING = 'WAITING'
+    RUNNING = 'RUNNING'
+    SUCCEEDED = 'SUCCEEDED'
+    FAILED = 'FAILED'
+    CANCELLED = 'CANCELLED'
+
+    def __gt__(self, other):
+        return (list(RequestStatus).index(self) >
+                list(RequestStatus).index(other))
+
+    def colored_str(self):
+        color = _STATUS_TO_COLOR[self]
+        return f'{color}{self.value}{colorama.Style.RESET_ALL}'
+
+    @classmethod
+    def finished_status(cls) -> List['RequestStatus']:
+        return [cls.SUCCEEDED, cls.FAILED, cls.CANCELLED]
+
+    @classmethod
+    def active_statuses(cls) -> List['RequestStatus']:
+        """Statuses of requests that are not finished yet."""
+        return [cls.PENDING, cls.WAITING, cls.RUNNING]
+
+    @classmethod
+    def executable_statuses(cls) -> List['RequestStatus']:
+        """Statuses from which a dequeued request may start executing.
+
+        A request is enqueued as PENDING. It may also be re-enqueued while in
+        WAITING -- the state it is parked in while waiting to resume (e.g. a
+        retry backoff or an external continue-condition). In both cases the
+        worker should pick it up and run it. Any other status (RUNNING, a
+        finished status, or CANCELLED) means the request must not be executed.
+        """
+        return [cls.PENDING, cls.WAITING]
+
+
+_STATUS_TO_COLOR = {
+    RequestStatus.PENDING: colorama.Fore.BLUE,
+    RequestStatus.WAITING: colorama.Fore.YELLOW,
+    RequestStatus.RUNNING: colorama.Fore.GREEN,
+    RequestStatus.SUCCEEDED: colorama.Fore.GREEN,
+    RequestStatus.FAILED: colorama.Fore.RED,
+    RequestStatus.CANCELLED: colorama.Fore.WHITE,
+}
+
+
+def _status_value_for_client(status_value: str) -> str:
+    """Map WAITING to RUNNING for clients that predate the WAITING status.
+
+    Older clients parse the status string straight into the RequestStatus enum
+    and crash on an unknown value, so downgrade it to the closest status they
+    understand on the wire.
+    """
+    remote_api_version = versions.get_remote_api_version()
+    if (status_value == RequestStatus.WAITING.value and
+            remote_api_version is not None and remote_api_version <
+            server_constants.MIN_WAITING_STATUS_API_VERSION):
+        return RequestStatus.RUNNING.value
+    return status_value
+
+
+REQUEST_COLUMNS = [
+    'request_id',
+    'name',
+    'entrypoint',
+    'request_body',
+    'status',
+    'return_value',
+    'error',
+    'pid',
+    'created_at',
+    COL_CLUSTER_NAME,
+    'schedule_type',
+    COL_USER_ID,
+    COL_STATUS_MSG,
+    COL_SHOULD_RETRY,
+    COL_FINISHED_AT,
+    COL_FILE_MOUNTS_BLOB_ID,
+]
+
+
+def _request_body_for_display(body: 'payloads.RequestBody', owner_user_id: str,
+                              caller_user_id: Optional[str]) -> str:
+    """Serialize a request body for a listing, scoped to the caller.
+
+    Returns the full body to the owner (and when ``caller_user_id`` is
+    ``None``); any other caller gets no body (``null``), so one user's body is
+    never exposed to another. The owner can still fetch the full body via
+    ``/api/get`` (``Request.encode()``).
+    """
+    if caller_user_id is None or owner_user_id == caller_user_id:
+        return body.model_dump_json()
+    return orjson.dumps(None).decode('utf-8')
+
+
+def validate_fields(fields: Optional[List[str]]) -> None:
+    """Validates a caller-supplied column list for a request query.
+
+    `fields` reaches the SQL SELECT list by string interpolation (the column
+    list cannot be a bound parameter), and some callers pass it straight from
+    a client query param. Anything not an exact known column name is rejected
+    so the interpolation can only ever emit column names.
+
+    Raises:
+        ValueError: if any field is not a known request column.
+    """
+    if not fields:
+        return
+    unknown = [field for field in fields if field not in REQUEST_COLUMNS]
+    if unknown:
+        raise ValueError(f'Unknown request field(s): {unknown}. '
+                         f'Valid fields: {REQUEST_COLUMNS}')
+
+
+def _columns_str(fields: Optional[List[str]]) -> str:
+    """Returns the validated SELECT column list for a request query.
+
+    Raises:
+        ValueError: if any field is not a known request column.
+    """
+    if not fields:
+        return ', '.join(REQUEST_COLUMNS)
+    validate_fields(fields)
+    return ', '.join(fields)
+
+
+class ScheduleType(enum.Enum):
+    """The schedule type for the requests."""
+    LONG = 'long'
+    # Queue for requests that should be executed quickly for a quick response.
+    SHORT = 'short'
+
+
+@dataclasses.dataclass
+class Request:
+    """A SkyPilot API request."""
+
+    request_id: str
+    name: str
+    entrypoint: Callable
+    request_body: payloads.RequestBody
+    status: RequestStatus
+    created_at: float
+    user_id: str
+    return_value: Any = None
+    error: Optional[Dict[str, Any]] = None
+    # The pid of the request worker that is(was) running this request.
+    pid: Optional[int] = None
+    schedule_type: ScheduleType = ScheduleType.LONG
+    # Resources the request operates on.
+    cluster_name: Optional[str] = None
+    # Status message of the request, indicates the reason of current status.
+    status_msg: Optional[str] = None
+    # Whether the request should be retried.
+    should_retry: bool = False
+    # When the request finished.
+    finished_at: Optional[float] = None
+    # Blob ID of uploaded file mounts
+    file_mounts_blob_id: Optional[str] = None
+
+    @property
+    def log_path(self) -> pathlib.Path:
+        log_path_prefix = pathlib.Path(
+            server_constants.REQUEST_LOG_PATH_PREFIX).expanduser().absolute()
+        log_path_prefix.mkdir(parents=True, exist_ok=True)
+        log_path = (log_path_prefix / self.request_id).with_suffix('.log')
+        return log_path
+
+    def set_error(self, error: BaseException) -> None:
+        """Set the error."""
+        # TODO(zhwu): pickle.dump does not work well with custom exceptions if
+        # it has more than 1 arguments.
+        serialized = exceptions.serialize_exception(error)
+        self.error = {
+            'object': encoders.pickle_and_encode(serialized),
+            'type': type(error).__name__,
+            'message': str(error),
+        }
+
+    def get_error(self) -> Optional[Dict[str, Any]]:
+        """Get the error."""
+        if self.error is None:
+            return None
+        unpickled = decoders.decode_and_unpickle(self.error['object'])
+        deserialized = exceptions.deserialize_exception(unpickled)
+        return {
+            'object': deserialized,
+            'type': self.error['type'],
+            'message': self.error['message'],
+        }
+
+    def set_return_value(self, return_value: Any) -> None:
+        """Set the encoded return value.
+
+        On encoder failure, drop to None. An exception here would escape the
+        wrapper's else-block (outside its try/except) and leave the row stuck
+        in RUNNING with the worker pid populated — enabling the
+        SIGTERM-to-idle-worker pool break. All return-value serializers
+        already guard `if return_value is not None`, so None persists as JSON
+        `null`.
+        """
+        encoder = encoders.get_encoder(self.name)
+        try:
+            self.return_value = encoder(return_value)
+        except Exception as e:  # pylint: disable=broad-except
+            logger.warning(
+                f'Encoder for request {self.request_id} ({self.name}) '
+                f'failed; storing None: {common_utils.format_exception(e)}')
+            self.return_value = None
+
+    def get_return_value(self) -> Any:
+        """Get the return value."""
+        return decoders.get_decoder(self.name)(self.return_value)
+
+    @classmethod
+    def from_row(cls, row: Tuple[Any, ...]) -> 'Request':
+        content = dict(zip(REQUEST_COLUMNS, row))
+        return cls.decode(payloads.RequestPayload(**content))
+
+    def to_row(self) -> Tuple[Any, ...]:
+        payload = self.encode()
+        # encode() may downgrade WAITING -> RUNNING for clients on an older API
+        # version; that is a wire-only concern. to_row() feeds the database, so
+        # always persist the true status regardless of the request context.
+        payload.status = self.status.value
+        row = []
+        for k in REQUEST_COLUMNS:
+            row.append(getattr(payload, k))
+        return tuple(row)
+
+    def readable_encode(
+            self,
+            caller_user_id: Optional[str] = None) -> payloads.RequestPayload:
+        """Serialize the SkyPilot API request for display purposes.
+
+        This function should be called on the server side to serialize the
+        request body into human readable format, e.g., the entrypoint should
+        be a string, and the pid, error, or return value are not needed.
+
+        The returned value will then be displayed on the client side in request
+        table.
+
+        We do not use `encode` for display to avoid a large amount of data being
+        sent to the client side, especially for the request table could include
+        all the requests.
+
+        ``caller_user_id`` scopes the request body; see
+        ``_request_body_for_display``.
+        """
+        assert isinstance(self.request_body,
+                          payloads.RequestBody), (self.name, self.request_body)
+        user = global_user_state.get_user(self.user_id)
+        user_name = user.name if user is not None else None
+        return payloads.RequestPayload(
+            request_id=self.request_id,
+            name=self.name,
+            entrypoint=self.entrypoint.__name__,
+            request_body=_request_body_for_display(self.request_body,
+                                                   self.user_id,
+                                                   caller_user_id),
+            status=_status_value_for_client(self.status.value),
+            return_value=orjson.dumps(None).decode('utf-8'),
+            error=orjson.dumps(None).decode('utf-8'),
+            pid=None,
+            created_at=self.created_at,
+            schedule_type=self.schedule_type.value,
+            user_id=self.user_id,
+            user_name=user_name,
+            cluster_name=self.cluster_name,
+            status_msg=self.status_msg,
+            should_retry=self.should_retry,
+            finished_at=self.finished_at,
+            file_mounts_blob_id=self.file_mounts_blob_id,
+        )
+
+    def encode(self) -> payloads.RequestPayload:
+        """Serialize the SkyPilot API request."""
+        assert isinstance(self.request_body,
+                          payloads.RequestBody), (self.name, self.request_body)
+        try:
+            # Use version-aware serializer to handle backward compatibility
+            # for old clients that don't recognize new fields.
+            serializer = return_value_serializers.get_serializer(self.name)
+            return payloads.RequestPayload(
+                request_id=self.request_id,
+                name=self.name,
+                entrypoint=encoders.pickle_and_encode(self.entrypoint),
+                request_body=encoders.pickle_and_encode(self.request_body),
+                status=_status_value_for_client(self.status.value),
+                return_value=serializer(self.return_value),
+                error=orjson.dumps(self.error).decode('utf-8'),
+                pid=self.pid,
+                created_at=self.created_at,
+                schedule_type=self.schedule_type.value,
+                user_id=self.user_id,
+                cluster_name=self.cluster_name,
+                status_msg=self.status_msg,
+                should_retry=self.should_retry,
+                finished_at=self.finished_at,
+                file_mounts_blob_id=self.file_mounts_blob_id,
+            )
+        except (TypeError, ValueError) as e:
+            # The error is unexpected, so we don't suppress the stack trace.
+            logger.error(
+                f'Error encoding: {e}\n'
+                f'  {self.request_id}\n'
+                f'  {self.name}\n'
+                f'  {self.request_body}\n'
+                f'  {self.return_value}\n'
+                f'  {self.created_at}\n',
+                exc_info=e)
+            raise
+
+    @staticmethod
+    def _decode_entrypoint(encoded_entrypoint: str) -> Callable:
+        """Unpickle the entrypoint, tolerating an unresolvable reference.
+
+        The entrypoint is a server-side callable that is pickled by reference
+        (module + qualname). The client deserializes it for bookkeeping but
+        never invokes it. When the client is older than the server, the server
+        may reference a symbol this client does not have (e.g. a newly-added
+        ``sky.core`` function), which makes unpickling raise ``AttributeError``
+        /``ImportError``. Since the value is never called on the client, fall
+        back to a placeholder instead of failing the whole request.
+        """
+        try:
+            return decoders.decode_and_unpickle(encoded_entrypoint)
+        except (AttributeError, ImportError) as e:
+            logger.debug(
+                'Could not resolve the request entrypoint while decoding '
+                f'(likely a client/server version skew): {e}. The entrypoint '
+                'is not used on the client, so falling back to a placeholder.')
+            return _unresolved_entrypoint
+
+    @classmethod
+    def decode(cls, payload: payloads.RequestPayload) -> 'Request':
+        """Deserialize the SkyPilot API request."""
+        try:
+            return cls(
+                request_id=payload.request_id,
+                name=payload.name,
+                entrypoint=cls._decode_entrypoint(payload.entrypoint),
+                request_body=decoders.decode_and_unpickle(payload.request_body),
+                status=RequestStatus(payload.status),
+                return_value=orjson.loads(payload.return_value),
+                error=orjson.loads(payload.error),
+                pid=payload.pid,
+                created_at=payload.created_at,
+                schedule_type=ScheduleType(payload.schedule_type),
+                user_id=payload.user_id,
+                cluster_name=payload.cluster_name,
+                status_msg=payload.status_msg,
+                should_retry=payload.should_retry,
+                finished_at=payload.finished_at,
+                file_mounts_blob_id=payload.file_mounts_blob_id,
+            )
+        except (TypeError, ValueError) as e:
+            logger.error(
+                f'Error decoding: {e}\n'
+                f'  {payload.request_id}\n'
+                f'  {payload.name}\n'
+                f'  {payload.entrypoint}\n'
+                f'  {payload.request_body}\n'
+                f'  {payload.created_at}\n',
+                exc_info=e)
+            # The error is unexpected, so we don't suppress the stack trace.
+            raise
+
+
+def get_new_request_id() -> str:
+    """Get a new request ID."""
+    return str(uuid.uuid4())
+
+
+def encode_requests(
+        requests: List[Request],
+        caller_user_id: Optional[str] = None) -> List[payloads.RequestPayload]:
+    """Serialize the SkyPilot API request for display purposes.
+
+        This function should be called on the server side to serialize the
+        request body into human readable format, e.g., the entrypoint should
+        be a string, and the pid, error, or return value are not needed.
+
+        The returned value will then be displayed on the client side in request
+        table.
+
+        We do not use `encode` for display to avoid a large amount of data being
+        sent to the client side, especially for the request table could include
+        all the requests.
+        """
+    encoded_requests = []
+    all_users = global_user_state.get_all_users()
+    all_users_map = {user.id: user.name for user in all_users}
+    for request in requests:
+        if request.request_body is not None:
+            assert isinstance(request.request_body,
+                              payloads.RequestBody), (request.name,
+                                                      request.request_body)
+        user_name = all_users_map.get(request.user_id)
+        payload = payloads.RequestPayload(
+            request_id=request.request_id,
+            name=request.name,
+            entrypoint=request.entrypoint.__name__
+            if request.entrypoint is not None else '',
+            request_body=_request_body_for_display(
+                request.request_body, request.user_id, caller_user_id)
+            if request.request_body is not None else
+            orjson.dumps(None).decode('utf-8'),
+            status=_status_value_for_client(request.status.value),
+            return_value=orjson.dumps(None).decode('utf-8'),
+            error=orjson.dumps(None).decode('utf-8'),
+            pid=None,
+            created_at=request.created_at,
+            schedule_type=request.schedule_type.value,
+            user_id=request.user_id,
+            user_name=user_name,
+            cluster_name=request.cluster_name,
+            status_msg=request.status_msg,
+            should_retry=request.should_retry,
+            finished_at=request.finished_at,
+        )
+        encoded_requests.append(payload)
+    return encoded_requests
+
+
+def _update_request_row_fields(
+        row: Tuple[Any, ...],
+        fields: Optional[List[str]] = None) -> Tuple[Any, ...]:
+    """Update the request row fields."""
+    if not fields:
+        return row
+
+    # Convert tuple to dictionary for easier manipulation
+    content = dict(zip(fields, row))
+
+    # Required fields in RequestPayload
+    if 'request_id' not in fields:
+        content['request_id'] = ''
+    if 'name' not in fields:
+        content['name'] = ''
+    if 'entrypoint' not in fields:
+        content['entrypoint'] = server_constants.EMPTY_PICKLED_VALUE
+    if 'request_body' not in fields:
+        content['request_body'] = server_constants.EMPTY_PICKLED_VALUE
+    if 'status' not in fields:
+        content['status'] = RequestStatus.PENDING.value
+    if 'created_at' not in fields:
+        content['created_at'] = 0
+    if 'user_id' not in fields:
+        content['user_id'] = ''
+    if 'return_value' not in fields:
+        content['return_value'] = orjson.dumps(None).decode('utf-8')
+    if 'error' not in fields:
+        content['error'] = orjson.dumps(None).decode('utf-8')
+    if 'schedule_type' not in fields:
+        content['schedule_type'] = ScheduleType.SHORT.value
+    # Optional fields in RequestPayload
+    if 'pid' not in fields:
+        content['pid'] = None
+    if 'cluster_name' not in fields:
+        content['cluster_name'] = None
+    if 'status_msg' not in fields:
+        content['status_msg'] = None
+    if 'should_retry' not in fields:
+        content['should_retry'] = False
+    if 'finished_at' not in fields:
+        content['finished_at'] = None
+    if COL_FILE_MOUNTS_BLOB_ID not in fields:
+        content[COL_FILE_MOUNTS_BLOB_ID] = None
+
+    # Convert back to tuple in the same order as REQUEST_COLUMNS
+    return tuple(content[col] for col in REQUEST_COLUMNS)
+
+
+def create_table(cursor, conn):
+    # Enable WAL mode to avoid locking issues.
+    # See: issue #1441 and PR #1509
+    # https://github.com/microsoft/WSL/issues/2395
+    # TODO(romilb): We do not enable WAL for WSL because of known issue in WSL.
+    #  This may cause the database locked problem from WSL issue #1441.
+    if not common_utils.is_wsl():
+        try:
+            cursor.execute('PRAGMA journal_mode=WAL')
+        except sqlite3.OperationalError as e:
+            if 'database is locked' not in str(e):
+                raise
+            # If the database is locked, it is OK to continue, as the WAL mode
+            # is not critical and is likely to be enabled by other processes.
+
+    # Table for Requests
+    cursor.execute(f"""\
+        CREATE TABLE IF NOT EXISTS {REQUEST_TABLE} (
+        request_id TEXT PRIMARY KEY,
+        name TEXT,
+        entrypoint TEXT,
+        request_body TEXT,
+        status TEXT,
+        created_at REAL,
+        return_value TEXT,
+        error BLOB,
+        pid INTEGER,
+        {COL_CLUSTER_NAME} TEXT,
+        schedule_type TEXT,
+        {COL_USER_ID} TEXT,
+        {COL_STATUS_MSG} TEXT,
+        {COL_SHOULD_RETRY} INTEGER,
+        {COL_FINISHED_AT} REAL
+        )""")
+
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE, COL_STATUS_MSG,
+                                 'TEXT')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE, COL_SHOULD_RETRY,
+                                 'INTEGER')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE, COL_FINISHED_AT,
+                                 'REAL')
+    db_utils.add_column_to_table(cursor, conn, REQUEST_TABLE,
+                                 COL_FILE_MOUNTS_BLOB_ID, 'TEXT')
+
+    # Add an index on (status, name) to speed up queries
+    # that filter on these columns.
+    cursor.execute(f"""\
+        CREATE INDEX IF NOT EXISTS status_name_idx ON {REQUEST_TABLE} (status, name) WHERE status IN ('PENDING', 'WAITING', 'RUNNING');
+    """)
+    # Add an index on cluster_name to speed up queries
+    # that filter on this column.
+    cursor.execute(f"""\
+        CREATE INDEX IF NOT EXISTS cluster_name_idx ON {REQUEST_TABLE} ({COL_CLUSTER_NAME}) WHERE status IN ('PENDING', 'WAITING', 'RUNNING');
+    """)
+    # Add an index on created_at to speed up queries that sort on this column.
+    cursor.execute(f"""\
+        CREATE INDEX IF NOT EXISTS created_at_idx ON {REQUEST_TABLE} (created_at);
+    """)
+
+
+_DB = None
+_init_db_lock = threading.Lock()
+
+
+def _init_db_within_lock():
+    global _DB
+    if _DB is None:
+        db_path = os.path.expanduser(
+            server_constants.API_SERVER_REQUEST_DB_PATH)
+        pathlib.Path(db_path).parents[0].mkdir(parents=True, exist_ok=True)
+        _DB = db_utils.SQLiteConn(db_path, create_table)
+
+
+def _ensure_db_initialized():
+    """Ensure the database is initialized.
+
+    Standalone function for use in context managers where the @init_db
+    decorator cannot be applied.
+    """
+    if _DB is not None:
+        return
+    with _init_db_lock:
+        _init_db_within_lock()
+
+
+def init_db(func):
+    """Initialize the database."""
+
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if _DB is not None:
+            return func(*args, **kwargs)
+        with _init_db_lock:
+            _init_db_within_lock()
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+def init_db_async(func):
+    """Async version of init_db."""
+
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        if _DB is not None:
+            return await func(*args, **kwargs)
+        # If _DB is not initialized, init_db_async will be blocked if there
+        # is a thread initializing _DB, this is fine since it occurs on process
+        # startup.
+        with _init_db_lock:
+            _init_db_within_lock()
+        return await func(*args, **kwargs)
+
+    return wrapper
+
+
+def request_log_dirs() -> Tuple[pathlib.Path, ...]:
+    """Local directories holding per-request log files."""
+    return (pathlib.Path(server_constants.REQUEST_LOG_PATH_PREFIX).expanduser(),
+            pathlib.Path(sky_logging.DEBUG_LOG_DIR))
+
+
+def reset_db_and_logs():
+    """Clear local state and re-initialize the request storage backend."""
+    logger.debug('clearing local API server database')
+    server_common.clear_local_api_server_database()
+    for log_dir in request_log_dirs():
+        logger.debug(f'clearing API server logs directory at {log_dir}')
+        shutil.rmtree(log_dir, ignore_errors=True)
+    # Also clear legacy path for backward compatibility cleanup
+    logger.debug('clearing legacy API server logs directory at '
+                 f'{LEGACY_REQUEST_LOG_PATH_PREFIX}')
+    shutil.rmtree(pathlib.Path(LEGACY_REQUEST_LOG_PATH_PREFIX).expanduser(),
+                  ignore_errors=True)
+    bs.get_blob_storage().reset_on_startup()
+    request_storage.get_request_backend().reset_on_startup()
+
+
+def request_lock_path(request_id: str) -> str:
+    lock_path = os.path.expanduser(server_constants.REQUEST_LOG_PATH_PREFIX)
+    os.makedirs(lock_path, exist_ok=True)
+    return os.path.join(lock_path, f'.{request_id}.lock')
+
+
+def kill_cluster_requests(cluster_name: str, exclude_request_name: str):
+    """Kill all pending and running requests for a cluster.
+
+    Args:
+        cluster_name: the name of the cluster.
+        exclude_request_names: exclude requests with these names. This is to
+            prevent killing the caller request.
+    """
+    storage = request_storage.get_request_backend()
+    request_ids = [
+        request_task.request_id
+        for request_task in storage.query_requests(req_filter=RequestTaskFilter(
+            status=RequestStatus.active_statuses(),
+            exclude_request_names=[exclude_request_name],
+            cluster_names=[cluster_name],
+            fields=['request_id']))
+    ]
+    _kill_requests(request_ids)
+
+
+def kill_requests(request_ids: Optional[List[str]] = None,
+                  user_id: Optional[str] = None) -> List[str]:
+    """Kill requests with a given request ID prefix."""
+    expanded_request_ids: Optional[List[str]] = None
+    if request_ids is not None:
+        expanded_request_ids = []
+        for request_id in request_ids:
+            request_tasks = get_requests_with_prefix(request_id,
+                                                     fields=['request_id'])
+            if request_tasks is None or len(request_tasks) == 0:
+                continue
+            if len(request_tasks) > 1:
+                raise ValueError(f'Multiple requests found for '
+                                 f'request ID prefix: {request_id}')
+            expanded_request_ids.append(request_tasks[0].request_id)
+    return _kill_requests(request_ids=expanded_request_ids, user_id=user_id)
+
+
+# needed for backward compatibility. Remove by v0.10.7 or v0.12.0
+# and rename kill_requests to kill_requests_with_prefix.
+kill_requests_with_prefix = kill_requests
+
+
+def _should_kill_request(request_id: str,
+                         request_record: Optional[Request]) -> bool:
+    if request_record is None:
+        logger.debug(f'No request ID {request_id}')
+        return False
+    # Skip internal requests. The internal requests are scheduled with
+    # request_id in range(len(INTERNAL_REQUEST_EVENTS)).
+    if request_record.request_id in set(
+            event.id for event in daemons.INTERNAL_REQUEST_DAEMONS):
+        return False
+    if request_record.status > RequestStatus.RUNNING:
+        logger.debug(f'Request {request_id} already finished')
+        return False
+    return True
+
+
+def _kill_requests(request_ids: Optional[List[str]] = None,
+                   user_id: Optional[str] = None) -> List[str]:
+    """Kill SkyPilot API requests and set their status to cancelled.
+
+    Delegates to the registered request backend, which handles local
+    process killing and (for multi-replica backends) cross-replica
+    cancellation.
+    """
+    return request_storage.get_request_backend().kill_requests(
+        request_ids=request_ids, user_id=user_id)
+
+
+@asyncio_utils.shield
+async def kill_request_async(request_id: str) -> bool:
+    """Kill a SkyPilot API request and set its status to cancelled.
+
+    Returns:
+        True if the request was killed, False otherwise.
+    """
+    return await request_storage.get_request_backend().kill_request_async(
+        request_id)
+
+
+@contextlib.contextmanager
+@metrics_lib.time_me
+def update_request(request_id: str) -> Generator[Optional[Request], None, None]:
+    """Get and update a SkyPilot API request."""
+    with request_storage.get_request_backend().update_request(
+            request_id) as request:
+        yield request
+
+
+@metrics_lib.time_me_async
+@asyncio_utils.shield
+async def update_status_async(request_id: str, status: RequestStatus) -> None:
+    """Update the status of a request"""
+    await request_storage.get_request_backend().update_status_async(
+        request_id, status)
+
+
+@metrics_lib.time_me_async
+@asyncio_utils.shield
+async def update_status_msg_async(request_id: str, status_msg: str) -> None:
+    """Update the status message of a request"""
+    await request_storage.get_request_backend().update_status_msg_async(
+        request_id, status_msg)
+
+
+# UUID request ids are exactly 36 characters (8-4-4-4-12 with dashes). A
+# caller passing a string this long is looking up a full id, not a prefix.
+_FULL_REQUEST_ID_LEN = 36
+
+
+def _request_id_where(request_id: str) -> Tuple[str, Tuple[str, ...]]:
+    """WHERE fragment + params to look up a request by full id or by prefix.
+
+    Both branches use the ``request_id`` primary-key index instead of a full
+    table scan (SQLite's default case-insensitive ``LIKE`` cannot use the
+    BINARY-collated primary-key index -- verified with EXPLAIN QUERY PLAN:
+    ``LIKE`` -> ``SCAN``, ``=``/range -> ``SEARCH ... USING INDEX``), which is
+    what made every request lookup O(table size).
+
+    - A full-length id (the common ``/api/get`` status-poll case) uses an exact
+      ``request_id = ?`` match -- the most direct index lookup, mirroring the
+      Postgres request backend's ``_id_where``.
+    - A shorter (non-empty) string is a request-id prefix (CLI short-id / shell
+      completion), expressed as an indexed range ``request_id >= ? AND
+      request_id < ?`` rather than ``LIKE prefix || '%'``. Request ids are
+      lowercase UUIDs, so this case-sensitive match is equivalent to the old
+      ``LIKE`` and also matches the Postgres backend.
+
+    Raises ``ValueError`` on an empty ``request_id``: it is never a valid
+    lookup key, and matching all rows would silently turn a caller bug into a
+    full table scan. Callers that legitimately want "all requests" (e.g.
+    empty-input shell completion) must not go through this helper.
+    """
+    if not request_id:
+        raise ValueError('request_id must not be empty')
+    if len(request_id) >= _FULL_REQUEST_ID_LEN:
+        return 'request_id = ?', (request_id,)
+    last = request_id[-1]
+    if ord(last) >= 0x10FFFF:
+        # Can't form an upper bound past the maximum code point; fall back to a
+        # scan. Real request ids are ASCII UUIDs, so this only guards against
+        # malformed input rather than crashing on chr(0x110000).
+        return 'request_id LIKE ?', (request_id + '%',)
+    # Smallest string strictly greater than every string starting with prefix.
+    upper = request_id[:-1] + chr(ord(last) + 1)
+    return 'request_id >= ? AND request_id < ?', (request_id, upper)
+
+
+def _request_id_prefix_clause(prefix: str) -> Tuple[str, Tuple[str, ...]]:
+    """A ``WHERE`` clause (or '') + params for a request-id prefix listing.
+
+    Unlike :func:`_request_id_where` (an exact/prefix match that rejects an
+    empty id), the ``*_with_prefix`` listings and empty-input shell completion
+    treat an empty prefix as "all requests", so this returns an empty clause
+    (no filter) for an empty prefix and an index-friendly ``WHERE`` clause
+    otherwise.
+    """
+    if not prefix:
+        return '', ()
+    where, params = _request_id_where(prefix)
+    return f'WHERE {where}', params
+
+
+def _get_request_no_lock(
+        request_id: str,
+        fields: Optional[List[str]] = None) -> Optional[Request]:
+    """Get a SkyPilot API request."""
+    assert _DB is not None
+    columns_str = _columns_str(fields)
+    where, params = _request_id_where(request_id)
+    with _DB.conn:
+        cursor = _DB.conn.cursor()
+        cursor.execute(
+            f'SELECT {columns_str} FROM {REQUEST_TABLE} WHERE {where}', params)
+        row = cursor.fetchone()
+        if row is None:
+            return None
+    if fields:
+        row = _update_request_row_fields(row, fields)
+    return Request.from_row(row)
+
+
+async def _get_request_no_lock_async(
+        request_id: str,
+        fields: Optional[List[str]] = None) -> Optional[Request]:
+    """Async version of _get_request_no_lock."""
+    assert _DB is not None
+    columns_str = _columns_str(fields)
+    where, params = _request_id_where(request_id)
+    async with _DB.execute_fetchall_async(
+            f'SELECT {columns_str} FROM {REQUEST_TABLE} WHERE {where}',
+            params) as rows:
+        row = rows[0] if rows else None
+        if row is None:
+            return None
+    if fields:
+        row = _update_request_row_fields(row, fields)
+    return Request.from_row(row)
+
+
+@metrics_lib.time_me_async
+async def get_latest_request_id_async() -> Optional[str]:
+    """Get the latest request ID."""
+    return await request_storage.get_request_backend(
+    ).get_latest_request_id_async()
+
+
+@metrics_lib.time_me
+def get_request(request_id: str,
+                fields: Optional[List[str]] = None) -> Optional[Request]:
+    """Get a SkyPilot API request."""
+    return request_storage.get_request_backend().get_request(request_id, fields)
+
+
+@metrics_lib.time_me_async
+@asyncio_utils.shield
+async def get_request_async(
+        request_id: str,
+        fields: Optional[List[str]] = None) -> Optional[Request]:
+    """Async version of get_request."""
+    return await request_storage.get_request_backend().get_request_async(
+        request_id, fields)
+
+
+@metrics_lib.time_me
+def get_requests_with_prefix(
+        request_id_prefix: str,
+        fields: Optional[List[str]] = None) -> Optional[List[Request]]:
+    """Get requests with a given request ID prefix."""
+    return request_storage.get_request_backend().get_requests_with_prefix(
+        request_id_prefix, fields)
+
+
+@metrics_lib.time_me_async
+@asyncio_utils.shield
+async def get_requests_async_with_prefix(
+        request_id_prefix: str,
+        fields: Optional[List[str]] = None) -> Optional[List[Request]]:
+    """Async version of get_request_with_prefix."""
+    return await request_storage.get_request_backend(
+    ).get_requests_async_with_prefix(request_id_prefix, fields)
+
+
+class StatusWithMsg(NamedTuple):
+    status: RequestStatus
+    status_msg: Optional[str] = None
+
+
+@metrics_lib.time_me_async
+async def get_request_status_async(
+    request_id: str,
+    include_msg: bool = False,
+) -> Optional[StatusWithMsg]:
+    """Get the status of a request.
+
+    Args:
+        request_id: The ID of the request.
+        include_msg: Whether to include the status message.
+
+    Returns:
+        The status of the request. If the request is not found, returns
+        None.
+    """
+    return await request_storage.get_request_backend().get_request_status_async(
+        request_id, include_msg)
+
+
+@metrics_lib.time_me_async
+@asyncio_utils.shield
+async def create_if_not_exists_async(request: Request) -> bool:
+    """Create a request if it does not exist, otherwise do nothing.
+
+    Returns:
+        True if a new request is created, False if the request already exists.
+    """
+    return await request_storage.get_request_backend(
+    ).create_if_not_exists_async(request)
+
+
+def build_internal_daemon_request(
+        daemon: 'daemons.InternalRequestDaemon') -> Request:
+    """Build a fresh `Request` for an internal daemon.
+
+    Captures the current process's `os.environ` via `payloads.RequestBody()`.
+    Status starts at PENDING with no `pid`. The returned object is not yet
+    persisted.
+    """
+    body = payloads.RequestBody()
+    return Request(
+        request_id=daemon.id,
+        name=server_constants.REQUEST_NAME_PREFIX + daemon.name,
+        entrypoint=daemon.run_event,
+        request_body=body,
+        status=RequestStatus.PENDING,
+        created_at=time.time(),
+        schedule_type=ScheduleType.SHORT,
+        user_id=skylet_constants.SKYPILOT_SYSTEM_USER_ID,
+    )
+
+
+async def create_or_refresh_internal_daemon_async(request: Request) -> bool:
+    """Insert or refresh an internal daemon's row.
+
+    Thin module-level wrapper. See
+    `RequestBackend.create_or_refresh_internal_daemon_async` for the
+    contract.
+    """
+    return await request_storage.get_request_backend(
+    ).create_or_refresh_internal_daemon_async(request)
+
+
+async def delete_orphan_internal_daemons_async(
+    internal_daemons: List['daemons.InternalRequestDaemon'],) -> None:
+    """Delete persisted daemon rows whose id is not in `internal_daemons`.
+
+    Thin module-level wrapper. See
+    `RequestBackend.delete_orphan_internal_daemons_async` for the
+    contract.
+    """
+    return await request_storage.get_request_backend(
+    ).delete_orphan_internal_daemons_async(internal_daemons)
+
+
+@dataclasses.dataclass
+class RequestTaskFilter:
+    """Filter for requests.
+
+    Args:
+        status: a list of statuses of the requests to filter on.
+        request_ids: a list of request IDs to filter requests on. An empty
+            list matches nothing.
+        cluster_names: a list of cluster names to filter requests on.
+        exclude_request_names: a list of request names to exclude from results.
+            Mutually exclusive with include_request_names.
+        user_id: the user ID to filter requests on.
+            If None, all users are included.
+        include_request_names: a list of request names to filter on.
+            Mutually exclusive with exclude_request_names.
+        finished_before: if provided, only include requests finished before this
+            timestamp.
+        finished_after: if provided, only include requests finished at or after
+            this timestamp. Requests still in progress (finished_at IS NULL)
+            are always included.
+        limit: the number of requests to show. If None, show all requests.
+
+    Raises:
+        ValueError: If both exclude_request_names and include_request_names are
+            provided.
+    """
+    status: Optional[List[RequestStatus]] = None
+    request_ids: Optional[List[str]] = None
+    cluster_names: Optional[List[str]] = None
+    user_id: Optional[str] = None
+    exclude_request_names: Optional[List[str]] = None
+    include_request_names: Optional[List[str]] = None
+    finished_before: Optional[float] = None
+    finished_after: Optional[float] = None
+    limit: Optional[int] = None
+    fields: Optional[List[str]] = None
+    sort: bool = False
+
+    def __post_init__(self):
+        if (self.exclude_request_names is not None and
+                self.include_request_names is not None):
+            raise ValueError(
+                'Only one of exclude_request_names or include_request_names '
+                'can be provided, not both.')
+        # `fields` becomes the SELECT list by interpolation, and some callers
+        # pass it through from a client query param. Validate here so every
+        # caller of this filter is covered, not just the ones that remember to.
+        validate_fields(self.fields)
+
+    def build_query(self) -> Tuple[str, List[Any]]:
+        """Build the SQL query and filter parameters.
+
+        Returns:
+            A tuple of (SQL, SQL parameters).
+        """
+        filters = []
+        filter_params: List[Any] = []
+        if self.status is not None:
+            status_placeholders = ','.join(['?'] * len(self.status))
+            filters.append(f'status IN ({status_placeholders})')
+            filter_params.extend(status.value for status in self.status)
+        if self.request_ids is not None:
+            if len(self.request_ids) == 0:
+                # Empty IN () is invalid SQL in PostgreSQL.
+                # An empty list means "match nothing".
+                filters.append('1=0')
+            else:
+                id_placeholders = ','.join(['?'] * len(self.request_ids))
+                filters.append(f'request_id IN ({id_placeholders})')
+                filter_params.extend(self.request_ids)
+        if self.include_request_names is not None:
+            name_placeholders = ','.join(['?'] *
+                                         len(self.include_request_names))
+            filters.append(f'name IN ({name_placeholders})')
+            filter_params.extend(self.include_request_names)
+        if self.exclude_request_names is not None:
+            exclude_placeholders = ','.join(['?'] *
+                                            len(self.exclude_request_names))
+            filters.append(f'name NOT IN ({exclude_placeholders})')
+            filter_params.extend(self.exclude_request_names)
+        if self.cluster_names is not None:
+            if len(self.cluster_names) == 0:
+                # Empty IN () is invalid SQL in PostgreSQL.
+                # An empty list means "match nothing".
+                filters.append('1=0')
+            else:
+                cluster_placeholders = ','.join(['?'] * len(self.cluster_names))
+                filters.append(
+                    f'{COL_CLUSTER_NAME} IN ({cluster_placeholders})')
+                filter_params.extend(self.cluster_names)
+        if self.user_id is not None:
+            filters.append(f'{COL_USER_ID} = ?')
+            filter_params.append(self.user_id)
+        if self.finished_before is not None:
+            filters.append('finished_at < ?')
+            filter_params.append(self.finished_before)
+        if self.finished_after is not None:
+            filters.append('(finished_at >= ? OR finished_at IS NULL)')
+            filter_params.append(self.finished_after)
+        filter_str = ' AND '.join(filters)
+        if filter_str:
+            filter_str = f' WHERE {filter_str}'
+        columns_str = ', '.join(REQUEST_COLUMNS)
+        if self.fields:
+            columns_str = ', '.join(self.fields)
+        sort_str = ''
+        if self.sort:
+            sort_str = ' ORDER BY created_at DESC'
+        query_str = (f'SELECT {columns_str} FROM {REQUEST_TABLE}{filter_str}'
+                     f'{sort_str}')
+        if self.limit is not None:
+            query_str += f' LIMIT {self.limit}'
+        return query_str, filter_params
+
+
+@metrics_lib.time_me
+def get_request_tasks(req_filter: RequestTaskFilter) -> List[Request]:
+    """Get a list of requests that match the given filters.
+
+    Args:
+        req_filter: the filter to apply to the requests. Refer to
+            RequestTaskFilter for the details.
+    """
+    return request_storage.get_request_backend().query_requests(req_filter)
+
+
+@metrics_lib.time_me_async
+async def get_request_tasks_async(
+        req_filter: RequestTaskFilter) -> List[Request]:
+    """Async version of get_request_tasks."""
+    return await request_storage.get_request_backend().query_requests_async(
+        req_filter)
+
+
+@metrics_lib.time_me_async
+async def get_api_request_ids_start_with(incomplete: str) -> List[str]:
+    """Get a list of API request ids for shell completion."""
+    return await request_storage.get_request_backend(
+    ).get_api_request_ids_start_with(incomplete)
+
+
+def get_active_file_mounts_blob_ids() -> set:
+    """Get file_mounts_blob_ids referenced by active requests."""
+    return request_storage.get_request_backend(
+    ).get_active_file_mounts_blob_ids()
+
+
+_add_or_update_request_sql = (f'INSERT OR REPLACE INTO {REQUEST_TABLE} '
+                              f'({", ".join(REQUEST_COLUMNS)}) VALUES '
+                              f'({", ".join(["?"] * len(REQUEST_COLUMNS))})')
+
+
+def _add_or_update_request_no_lock(request: Request):
+    """Add or update a REST request into the database."""
+    assert _DB is not None
+    if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+        logger.debug(f'Start adding or updating request {request.request_id}')
+    try:
+        with _DB.conn:
+            cursor = _DB.conn.cursor()
+            cursor.execute(_add_or_update_request_sql, request.to_row())
+    finally:
+        if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+            logger.debug(f'End adding or updating request {request.request_id}')
+
+
+async def _add_or_update_request_no_lock_async(request: Request):
+    """Async version of _add_or_update_request_no_lock."""
+    assert _DB is not None
+    await _DB.execute_and_commit_async(_add_or_update_request_sql,
+                                       request.to_row())
+
+
+def set_exception_stacktrace(e: BaseException) -> None:
+    with ux_utils.enable_traceback():
+        stacktrace = traceback.format_exc()
+    setattr(e, 'stacktrace', stacktrace)
+
+
+def set_request_failed(request_id: str, e: BaseException) -> None:
+    """Set a request to failed and populate the error message."""
+    set_exception_stacktrace(e)
+    with update_request(request_id) as request_task:
+        assert request_task is not None, request_id
+        request_task.status = RequestStatus.FAILED
+        request_task.finished_at = time.time()
+        request_task.set_error(e)
+
+
+@metrics_lib.time_me_async
+@asyncio_utils.shield
+async def set_request_failed_async(request_id: str, e: BaseException) -> None:
+    """Set a request to failed and populate the error message."""
+    set_exception_stacktrace(e)
+    storage = request_storage.get_request_backend()
+    async with storage.update_request_async(request_id) as request_task:
+        assert request_task is not None, request_id
+        request_task.status = RequestStatus.FAILED
+        request_task.finished_at = time.time()
+        request_task.set_error(e)
+
+
+@metrics_lib.time_me_async
+@asyncio_utils.shield
+async def set_request_failed_if_pending_async(request_id: str,
+                                              e: BaseException) -> bool:
+    """Set a request to failed only while it is still PENDING.
+
+    PENDING is the only status a request can be in while its initial enqueue
+    is in flight: any other status means a worker already claimed the request
+    (the put actually committed) and the owner's outcome stands -- including
+    WAITING, which is only ever set after a claimed run parks for a retry.
+
+    Returns:
+        True if the request was transitioned to FAILED.
+    """
+    set_exception_stacktrace(e)
+    storage = request_storage.get_request_backend()
+    async with storage.update_request_async(request_id) as request_task:
+        assert request_task is not None, request_id
+        if request_task.status != RequestStatus.PENDING:
+            return False
+        request_task.status = RequestStatus.FAILED
+        request_task.finished_at = time.time()
+        request_task.set_error(e)
+        return True
+
+
+def set_request_succeeded(request_id: str, result: Optional[Any]) -> None:
+    """Set a request to succeeded and populate the result."""
+    with update_request(request_id) as request_task:
+        assert request_task is not None, request_id
+        request_task.status = RequestStatus.SUCCEEDED
+        request_task.finished_at = time.time()
+        if result is not None:
+            request_task.set_return_value(result)
+
+
+@metrics_lib.time_me_async
+@asyncio_utils.shield
+async def set_request_succeeded_async(request_id: str,
+                                      result: Optional[Any]) -> None:
+    """Set a request to succeeded and populate the result."""
+    storage = request_storage.get_request_backend()
+    async with storage.update_request_async(request_id) as request_task:
+        assert request_task is not None, request_id
+        request_task.status = RequestStatus.SUCCEEDED
+        request_task.finished_at = time.time()
+        if result is not None:
+            request_task.set_return_value(result)
+
+
+@metrics_lib.time_me_async
+@asyncio_utils.shield
+async def set_request_cancelled_async(request_id: str) -> None:
+    """Set a pending or running request to cancelled."""
+    storage = request_storage.get_request_backend()
+    async with storage.update_request_async(request_id) as request_task:
+        assert request_task is not None, request_id
+        # Already finished or cancelled.
+        if request_task.status > RequestStatus.RUNNING:
+            return
+        request_task.finished_at = time.time()
+        request_task.status = RequestStatus.CANCELLED
+
+
+@metrics_lib.time_me_async
+async def _delete_requests(request_ids: List[str]):
+    """Clean up requests by their IDs."""
+    await request_storage.get_request_backend().delete_requests(request_ids)
+
+
+# TODO Remove this function on or after v0.15.0
+def _get_legacy_log_path(request_id: str) -> pathlib.Path:
+    """Get the legacy log path for a request (for backward compatibility).
+
+    This is used during GC to clean up log files from the old location
+    (~/sky_logs/api_server/requests/) after server upgrades.
+    """
+    legacy_path_prefix = pathlib.Path(
+        LEGACY_REQUEST_LOG_PATH_PREFIX).expanduser().absolute()
+    return (legacy_path_prefix / request_id).with_suffix('.log')
+
+
+# TODO Remove this function on or after v0.15.0
+async def _cleanup_legacy_directory_if_empty():
+    """Remove legacy request log directory if empty.
+
+    This helps clean up the legacy directory once all old logs have been
+    garbage collected after a server upgrade.
+    """
+    legacy_path = pathlib.Path(LEGACY_REQUEST_LOG_PATH_PREFIX).expanduser()
+    if not legacy_path.exists():
+        return
+    try:
+        # Check if directory is empty (no .log or .lock files)
+        if not any(legacy_path.iterdir()):
+            logger.info(f'Removing empty legacy log directory: {legacy_path}')
+            legacy_path.rmdir()
+    except Exception as e:  # pylint: disable=broad-except
+        # Don't fail GC if cleanup fails
+        logger.debug(f'Failed to cleanup legacy directory: {e}')
+
+
+# Number of request IDs per `request_id IN (...)` existence query, to stay
+# under SQLite's 999-parameter cap.
+_ORPHAN_LOG_QUERY_CHUNK_SIZE = 500
+
+
+def _list_stale_log_files(log_dir: pathlib.Path,
+                          cutoff: float) -> List[Tuple[str, str, int]]:
+    """List (request_id, path, size) of logs written before cutoff."""
+    if not log_dir.is_dir():
+        return []
+    stale = []
+    with os.scandir(log_dir) as entries:
+        for entry in entries:
+            if not entry.name.endswith('.log'):
+                continue
+            request_id = entry.name[:-len('.log')]
+            # A live daemon holds its log file open for the lifetime of the
+            # server process; never unlink it.
+            if daemons.is_daemon_request_id(request_id):
+                continue
+            try:
+                # os.stat, not DirEntry.stat: see _prune_sky_logs in
+                # sky/server/server.py for why.
+                st = os.stat(entry.path, follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_mtime >= cutoff:
+                continue
+            stale.append((request_id, entry.path, st.st_size))
+    return stale
+
+
+def _unlink_log_files(files: List[Tuple[str, int]]) -> Tuple[int, int]:
+    """Unlink (path, size) pairs; returns (files removed, bytes removed)."""
+    removed_files = 0
+    removed_bytes = 0
+    for path, size in files:
+        try:
+            os.unlink(path)
+        except OSError:
+            continue
+        removed_files += 1
+        removed_bytes += size
+    return removed_files, removed_bytes
+
+
+async def _clean_orphan_request_logs() -> None:
+    """Delete request log files whose request row is already gone.
+
+    When the API server runs with more than one replica, the replicas share
+    one database but each writes its request logs to local disk, so the
+    row-driven cleanup above only reaches the files that sit on the replica
+    running it. A file left behind on another replica outlives the row that
+    names it, after which nothing on the database side can enumerate it.
+
+    A file with no row is already garbage — it cannot be read back through
+    the API — so the age cutoff is a grace period against reading a
+    directory while a request is being recorded, not a retention period.
+    """
+    cutoff = time.time() - bs.GC_GRACE_SECONDS
+    listings = await asyncio.gather(*[
+        asyncio.to_thread(_list_stale_log_files, log_dir, cutoff)
+        for log_dir in request_log_dirs()
+    ])
+    # A request writes one file per log directory, so group by request ID to
+    # ask the database about each one once.
+    stale: Dict[str, List[Tuple[str, int]]] = {}
+    for listing in listings:
+        for request_id, path, size in listing:
+            stale.setdefault(request_id, []).append((path, size))
+
+    request_ids = list(stale)
+    removed_files = 0
+    removed_bytes = 0
+    for start in range(0, len(request_ids), _ORPHAN_LOG_QUERY_CHUNK_SIZE):
+        batch = request_ids[start:start + _ORPHAN_LOG_QUERY_CHUNK_SIZE]
+        live = {
+            req.request_id for req in await get_request_tasks_async(
+                req_filter=RequestTaskFilter(request_ids=batch,
+                                             fields=['request_id']))
+        }
+        orphans = [
+            log_file for request_id in batch if request_id not in live
+            for log_file in stale[request_id]
+        ]
+        if not orphans:
+            continue
+        batch_files, batch_bytes = await asyncio.to_thread(
+            _unlink_log_files, orphans)
+        removed_files += batch_files
+        removed_bytes += batch_bytes
+    if removed_files:
+        logger.info(f'Cleaned up {removed_files} orphan request log file(s), '
+                    f'{removed_bytes} bytes freed')
+
+
+async def clean_finished_requests_with_retention(retention_seconds: int,
+                                                 batch_size: int = 1000):
+    """Clean up finished requests older than the retention period.
+
+    This function removes old finished requests (SUCCEEDED, FAILED, CANCELLED)
+    from the database and cleans up their associated log files. It then sweeps
+    the log directories for files that no longer have a request row at all.
+
+    For backward compatibility, it also cleans up log files from the legacy
+    path (~/sky_logs/api_server/requests/) to handle server upgrades.
+
+    Args:
+        retention_seconds: Requests older than this many seconds will be
+            deleted.
+        batch_size: batch delete 'batch_size' requests at a time to
+            avoid using too much memory and once and to let each
+            db query complete in a reasonable time. All stale
+            requests older than the retention period will be deleted
+            regardless of the batch size.
+    """
+    debug_log_dir = pathlib.Path(sky_logging.DEBUG_LOG_DIR)
+    total_deleted = 0
+    while True:
+        reqs = await get_request_tasks_async(
+            req_filter=RequestTaskFilter(status=RequestStatus.finished_status(),
+                                         finished_before=time.time() -
+                                         retention_seconds,
+                                         limit=batch_size,
+                                         fields=['request_id']))
+        if len(reqs) == 0:
+            break
+        futs = []
+        for req in reqs:
+            # req.log_path is derived from request_id,
+            # so it's ok to just grab the request_id in the above query.
+            # Delete from current path
+            futs.append(
+                asyncio.create_task(
+                    anyio.Path(
+                        req.log_path.absolute()).unlink(missing_ok=True)))
+            # Also delete from legacy path for backward compatibility
+            # TODO Remove this on or after v0.15.0
+            legacy_log_path = _get_legacy_log_path(req.request_id)
+            futs.append(
+                asyncio.create_task(
+                    anyio.Path(legacy_log_path).unlink(missing_ok=True)))
+            # Delete debug log if it exists
+            debug_log_path = (debug_log_dir /
+                              req.request_id).with_suffix('.log')
+            futs.append(
+                asyncio.create_task(
+                    anyio.Path(debug_log_path).unlink(missing_ok=True)))
+        await asyncio.gather(*futs)
+
+        await _delete_requests([req.request_id for req in reqs])
+        total_deleted += len(reqs)
+        if len(reqs) < batch_size:
+            break
+
+    # Try to clean up the legacy directory if it's empty
+    # TODO Remove this on or after v0.15.0
+    await _cleanup_legacy_directory_if_empty()
+
+    # To avoid leakage of the log file, logs must be deleted before the
+    # request task in the database.
+    logger.info(f'Cleaned up {total_deleted} finished requests '
+                f'older than {retention_seconds} seconds')
+
+    await _clean_orphan_request_logs()
+
+
+async def requests_gc_daemon():
+    """Garbage collect finished requests periodically."""
+    await asyncio_utils.sleep_startup_jitter('requests GC daemon')
+    while True:
+        logger.info('Running requests GC daemon...')
+        # Use the latest config.
+        skypilot_config.reload_config()
+        retention_seconds = skypilot_config.get_nested(
+            ('api_server', 'requests_retention_hours'),
+            DEFAULT_REQUESTS_RETENTION_HOURS) * 3600
+        try:
+            # Negative value disables the requests GC
+            if retention_seconds >= 0:
+                await clean_finished_requests_with_retention(retention_seconds)
+        except asyncio.CancelledError:
+            logger.info('Requests GC daemon cancelled')
+            break
+        except Exception as e:  # pylint: disable=broad-except
+            logger.error(f'Error running requests GC daemon: {e}'
+                         f'traceback: {traceback.format_exc()}')
+        # Fixed, and deliberately independent of the retention window: the
+        # interval controls how much accumulates between passes, not how long
+        # anything is kept.
+        await asyncio.sleep(_REQUESTS_GC_INTERVAL_SECONDS)
+
+
+def _cleanup():
+    if _DB is not None:
+        asyncio.run(_DB.close())
+
+
+atexit.register(_cleanup)
+
+
+class SqliteRequestBackend(request_storage.RequestBackend):
+    """SQLite-based request backend."""
+
+    @init_db
+    def get_request(self,
+                    request_id: str,
+                    fields: Optional[List[str]] = None) -> Optional[Request]:
+        with filelock.FileLock(request_lock_path(request_id)):
+            return _get_request_no_lock(request_id, fields)
+
+    @init_db_async
+    @asyncio_utils.shield
+    async def get_request_async(
+            self,
+            request_id: str,
+            fields: Optional[List[str]] = None) -> Optional[Request]:
+        async with filelock.AsyncFileLock(request_lock_path(request_id)):
+            return await _get_request_no_lock_async(request_id, fields)
+
+    @contextlib.contextmanager
+    def update_request(
+            self, request_id: str) -> Generator[Optional[Request], None, None]:
+        _ensure_db_initialized()
+        with filelock.FileLock(request_lock_path(request_id)):
+            request = _get_request_no_lock(request_id)
+            yield request
+            if request is not None:
+                _add_or_update_request_no_lock(request)
+
+    @contextlib.asynccontextmanager
+    async def update_request_async(self, request_id: str):
+        _ensure_db_initialized()
+        async with filelock.AsyncFileLock(request_lock_path(request_id)):
+            request = await _get_request_no_lock_async(request_id)
+            yield request
+            if request is not None:
+                await _add_or_update_request_no_lock_async(request)
+
+    @init_db_async
+    @asyncio_utils.shield
+    async def create_if_not_exists_async(self, request: Request) -> bool:
+        assert _DB is not None
+        request_columns = ', '.join(REQUEST_COLUMNS)
+        values_str = ', '.join(['?'] * len(REQUEST_COLUMNS))
+        sql_statement = (f'INSERT INTO {REQUEST_TABLE} '
+                         f'({request_columns}) VALUES '
+                         f'({values_str}) ON CONFLICT(request_id) DO NOTHING '
+                         f'RETURNING ROWID')
+        request_row = request.to_row()
+        if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+            logger.debug(f'Start creating request {request.request_id}')
+        try:
+            row = await _DB.execute_get_returning_value_async(
+                sql_statement, request_row)
+        finally:
+            if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+                logger.debug(f'End creating request {request.request_id}')
+        return True if row else False
+
+    @init_db_async
+    @asyncio_utils.shield
+    async def create_or_refresh_internal_daemon_async(self,
+                                                      request: Request) -> bool:
+        assert _DB is not None
+        # Try insert first (the dedup primitive: only one concurrent
+        # caller wins the conflict).
+        inserted = await self.create_if_not_exists_async(request)
+        if inserted:
+            return True
+        # Lost the insert race: an existing row remains. UPDATE the
+        # env-bearing columns so the persisted row reflects this
+        # process's `os.environ` (and the matching `name` /
+        # `schedule_type` from the current code). Concurrent UPDATEs
+        # from sibling uvicorn workers in the same process write the
+        # same values; cross-pod UPDATEs from a newer generation win
+        # by virtue of happening last.
+        encoded_body = encoders.pickle_and_encode(request.request_body)
+        await _DB.execute_and_commit_async(
+            f'UPDATE {REQUEST_TABLE} '
+            f'SET request_body=?, name=?, schedule_type=? '
+            f'WHERE request_id=?',
+            (encoded_body, request.name, request.schedule_type.value,
+             request.request_id))
+        return False
+
+    @init_db_async
+    @asyncio_utils.shield
+    async def delete_orphan_internal_daemons_async(
+        self,
+        internal_daemons: List['daemons.InternalRequestDaemon'],
+    ) -> None:
+        assert _DB is not None
+        keep_ids = {d.id for d in internal_daemons}
+        # SQLite has no `is_daemon` column; use the `*-daemon` naming
+        # convention (verified against sky/server/daemons.py).
+        # TODO(cooperc): replace LIKE with a dedicated marker column if
+        # a non-daemon request_id ever ends in `-daemon`.
+        async with _DB.execute_fetchall_async(
+            f'SELECT request_id FROM {REQUEST_TABLE} '
+            f'WHERE request_id LIKE \'%-daemon\'') as rows:
+            existing = [r[0] for r in rows if r[0].endswith('-daemon')]
+        stale_ids = [rid for rid in existing if rid not in keep_ids]
+        if not stale_ids:
+            return
+        placeholders = ','.join(['?'] * len(stale_ids))
+        await _DB.execute_and_commit_async(
+            f'DELETE FROM {REQUEST_TABLE} '
+            f'WHERE request_id IN ({placeholders})', tuple(stale_ids))
+        logger.info(f'Deleted orphan internal daemon rows: {stale_ids}')
+
+    @init_db
+    def query_requests(self, req_filter: RequestTaskFilter) -> List[Request]:
+        assert _DB is not None
+        with _DB.conn:
+            cursor = _DB.conn.cursor()
+            cursor.execute(*req_filter.build_query())
+            rows = cursor.fetchall()
+            if rows is None:
+                return []
+        if req_filter.fields:
+            rows = [
+                _update_request_row_fields(row, req_filter.fields)
+                for row in rows
+            ]
+        return [Request.from_row(row) for row in rows]
+
+    @init_db_async
+    async def query_requests_async(
+            self, req_filter: RequestTaskFilter) -> List[Request]:
+        assert _DB is not None
+        async with _DB.execute_fetchall_async(
+                *req_filter.build_query()) as rows:
+            if not rows:
+                return []
+        if req_filter.fields:
+            rows = [
+                _update_request_row_fields(row, req_filter.fields)
+                for row in rows
+            ]
+        return [Request.from_row(row) for row in rows]
+
+    @init_db_async
+    @init_db_async
+    async def delete_requests(self, request_ids: List[str]) -> None:
+        if not request_ids:
+            return
+        assert _DB is not None
+        placeholders = ','.join(['?'] * len(request_ids))
+        if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+            logger.debug(f'Start deleting requests {request_ids}')
+        try:
+            await _DB.execute_and_commit_async(
+                f'DELETE FROM {REQUEST_TABLE} '
+                f'WHERE request_id IN ({placeholders})', tuple(request_ids))
+        finally:
+            if sky_logging.logging_enabled(logger, sky_logging.DEBUG):
+                logger.debug(f'End deleting requests {request_ids}')
+
+    # --- Status updates ---
+
+    @init_db_async
+    @asyncio_utils.shield
+    async def update_status_async(self, request_id: str,
+                                  status: RequestStatus) -> None:
+        async with filelock.AsyncFileLock(request_lock_path(request_id)):
+            request = await _get_request_no_lock_async(request_id)
+            if request is not None:
+                request.status = status
+                await _add_or_update_request_no_lock_async(request)
+
+    @init_db_async
+    @asyncio_utils.shield
+    async def update_status_msg_async(self, request_id: str,
+                                      status_msg: str) -> None:
+        async with filelock.AsyncFileLock(request_lock_path(request_id)):
+            request = await _get_request_no_lock_async(request_id)
+            if request is not None:
+                request.status_msg = status_msg
+                await _add_or_update_request_no_lock_async(request)
+
+    @init_db
+    def kill_requests(self,
+                      request_ids: Optional[List[str]] = None,
+                      user_id: Optional[str] = None) -> List[str]:
+        if request_ids is None:
+            request_ids = [
+                r.request_id
+                for r in self.query_requests(req_filter=RequestTaskFilter(
+                    status=RequestStatus.active_statuses(),
+                    exclude_request_names=['sky.api_cancel'],
+                    user_id=user_id,
+                    fields=['request_id']))
+            ]
+        cancelled = []
+        for request_id in request_ids:
+            with self.update_request(request_id) as request_record:
+                if not _should_kill_request(request_id, request_record):
+                    continue
+                assert request_record is not None
+                # When a user_id scope is given, only cancel requests owned by
+                # that user. Without this, an explicit request_ids list would
+                # bypass the scope entirely and let a caller cancel another
+                # user's request.
+                if (user_id is not None and request_record.user_id != user_id):
+                    continue
+                if request_record.pid is not None:
+                    logger.debug(
+                        f'Killing request process {request_record.pid}')
+                    os.kill(request_record.pid, signal.SIGTERM)
+                request_record.status = RequestStatus.CANCELLED
+                request_record.finished_at = time.time()
+                cancelled.append(request_id)
+        return cancelled
+
+    @init_db_async
+    @asyncio_utils.shield
+    async def kill_request_async(self, request_id: str) -> bool:
+        async with filelock.AsyncFileLock(request_lock_path(request_id)):
+            request = await _get_request_no_lock_async(request_id)
+            if not _should_kill_request(request_id, request):
+                return False
+            assert request is not None
+            if request.pid is not None:
+                logger.debug(f'Killing request process {request.pid}')
+                os.kill(request.pid, signal.SIGTERM)
+            request.status = RequestStatus.CANCELLED
+            request.finished_at = time.time()
+            await _add_or_update_request_no_lock_async(request)
+        return True
+
+    # --- Specialized queries ---
+
+    @init_db_async
+    async def get_latest_request_id_async(self) -> Optional[str]:
+        assert _DB is not None
+        async with _DB.execute_fetchall_async(
+            (f'SELECT request_id FROM {REQUEST_TABLE} '
+             'ORDER BY created_at DESC LIMIT 1')) as rows:
+            return rows[0][0] if rows else None
+
+    @init_db
+    def get_requests_with_prefix(
+            self,
+            request_id_prefix: str,
+            fields: Optional[List[str]] = None) -> Optional[List[Request]]:
+        assert _DB is not None
+        columns_str = _columns_str(fields)
+        clause, params = _request_id_prefix_clause(request_id_prefix)
+        with _DB.conn:
+            cursor = _DB.conn.cursor()
+            cursor.execute(
+                f'SELECT {columns_str} FROM {REQUEST_TABLE} {clause}', params)
+            rows = cursor.fetchall()
+            if not rows:
+                return None
+            if fields:
+                rows = [_update_request_row_fields(row, fields) for row in rows]
+            return [Request.from_row(row) for row in rows]
+
+    @init_db_async
+    @asyncio_utils.shield
+    async def get_requests_async_with_prefix(
+            self,
+            request_id_prefix: str,
+            fields: Optional[List[str]] = None) -> Optional[List[Request]]:
+        assert _DB is not None
+        columns_str = _columns_str(fields)
+        clause, params = _request_id_prefix_clause(request_id_prefix)
+        async with _DB.execute_fetchall_async(
+                f'SELECT {columns_str} FROM {REQUEST_TABLE} {clause}',
+                params) as rows:
+            if not rows:
+                return None
+            if fields:
+                rows = [_update_request_row_fields(row, fields) for row in rows]
+            return [Request.from_row(row) for row in rows]
+
+    @init_db_async
+    async def get_request_status_async(
+            self,
+            request_id: str,
+            include_msg: bool = False) -> Optional[StatusWithMsg]:
+        assert _DB is not None
+        columns = 'status'
+        if include_msg:
+            columns += ', status_msg'
+        where, params = _request_id_where(request_id)
+        sql = f'SELECT {columns} FROM {REQUEST_TABLE} WHERE {where}'
+        async with _DB.execute_fetchall_async(sql, params) as rows:
+            if rows is None or len(rows) == 0:
+                return None
+            status = RequestStatus(rows[0][0])
+            status_msg = rows[0][1] if include_msg else None
+            return StatusWithMsg(status, status_msg)
+
+    @init_db_async
+    async def get_api_request_ids_start_with(self,
+                                             incomplete: str) -> List[str]:
+        assert _DB is not None
+        # Empty input lists recent request ids for completion (match all).
+        clause, params = _request_id_prefix_clause(incomplete)
+        async with _DB.execute_fetchall_async(
+                f"""SELECT request_id FROM {REQUEST_TABLE}
+                    {clause}
+                    ORDER BY
+                        CASE
+                            WHEN status IN ('PENDING', 'RUNNING') THEN 0
+                            ELSE 1
+                        END,
+                        created_at DESC
+                    LIMIT 1000""", params) as rows:
+            if not rows:
+                return []
+        return [row[0] for row in rows]
+
+    @init_db
+    def get_active_file_mounts_blob_ids(self) -> Set[str]:
+        assert _DB is not None
+        with _DB.conn:
+            cursor = _DB.conn.cursor()
+            active_values = [s.value for s in RequestStatus.active_statuses()]
+            placeholders = ', '.join('?' * len(active_values))
+            cursor.execute(
+                f'SELECT DISTINCT {COL_FILE_MOUNTS_BLOB_ID} '
+                f'FROM {REQUEST_TABLE} '
+                f'WHERE status IN ({placeholders}) '
+                f'AND {COL_FILE_MOUNTS_BLOB_ID} IS NOT NULL', active_values)
+            return {row[0] for row in cursor.fetchall()}
+
+    def get_shutdown_active_requests(self) -> List[Tuple[str, str]]:
+        """Get (request_id, name) pairs to wait for during graceful shutdown."""
+
+        tasks = self.query_requests(
+            RequestTaskFilter(
+                status=[
+                    RequestStatus.PENDING,
+                    RequestStatus.RUNNING,
+                ],
+                fields=['request_id', 'name'],
+            ))
+        return [(t.request_id, t.name) for t in tasks]
+
+    # --- Lifecycle ---
+
+    def reset_on_startup(self) -> None:
+        with _init_db_lock:
+            _init_db_within_lock()
+        assert _DB is not None
+        with _DB.conn:
+            cursor = _DB.conn.cursor()
+            cursor.execute('SELECT sqlite_version()')
+            row = cursor.fetchone()
+            if row is None:
+                raise RuntimeError('Failed to get SQLite version')
+            version_str = row[0]
+            version_parts = version_str.split('.')
+            assert len(version_parts) >= 2, \
+                f'Invalid version string: {version_str}'
+            major, minor = int(version_parts[0]), int(version_parts[1])
+            if not ((major > 3) or (major == 3 and minor >= 35)):
+                raise RuntimeError(
+                    f'SQLite version {version_str} is not supported. '
+                    'Please upgrade to SQLite 3.35.0 or later.')

@@ -1,0 +1,8 @@
+name: min
+
+setup: |
+  echo "running setup"
+
+run: |
+  pip list
+  echo "task run finish"

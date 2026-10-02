@@ -1,0 +1,3151 @@
+"""This module contains schemas used to validate objects.
+
+Schemas conform to the JSON Schema specification as defined at
+https://json-schema.org/
+"""
+import enum
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
+from sky.skylet import autostop_lib
+from sky.skylet import constants
+from sky.utils import kubernetes_enums
+
+# Valid values for the `scope` field of a dashboard.external_links entry:
+# the dashboard pages a link may appear on. 'cluster' is the cluster detail
+# page; 'jobs' covers job detail pages (both cluster jobs and managed jobs).
+# Keep in sync with EXTERNAL_LINK_SCOPES in
+# sky/dashboard/src/utils/externalLinks.js.
+DASHBOARD_EXTERNAL_LINK_SCOPES = ('cluster', 'jobs')
+
+# Registry for plugin-provided job_recovery schema properties.
+# Plugins call register_job_recovery_property() to add strategy-specific
+# config fields. On the server, once plugins have loaded, their properties
+# are registered so additionalProperties is False. On the client (or
+# before plugins load), additionalProperties is True to let plugin
+# config pass through for server-side validation.
+_extra_job_recovery_properties: Dict[str, Any] = {}
+
+
+def register_job_recovery_property(name: str, schema: Dict[str, Any]) -> None:
+    """Register an additional property for the job_recovery schema.
+
+    This allows plugins to extend the job_recovery dict schema with
+    strategy-specific configuration fields. The property is merged into
+    the schema's properties dict, so it passes JSON schema validation
+    even with additionalProperties: False.
+
+    Args:
+        name: The property name.
+        schema: The JSON Schema for the property
+            (e.g., {'type': 'integer'}).
+    """
+    _extra_job_recovery_properties[name] = schema
+
+
+_extra_jobs_properties: Dict[str, Any] = {}
+
+_extra_kubernetes_properties: Dict[str, Any] = {}
+
+_extra_slurm_properties: Dict[str, Any] = {}
+
+# Registry for plugin-provided properties under the top-level
+# `plugins:` config section. Keyed by plugin name.
+_extra_plugin_properties: Dict[str, Any] = {}
+
+
+def register_plugin_property(name: str, schema: Dict[str, Any]) -> None:
+    """Register a sub-property of the top-level `plugins:` config section."""
+    if name in _extra_plugin_properties:
+        raise ValueError(f'Plugin property {name!r} is already registered.')
+    _extra_plugin_properties[name] = schema
+
+
+def _allow_additional_properties() -> bool:
+    """Return True if schemas should allow additional properties.
+
+    On the client (ENV_VAR_IS_SKYPILOT_SERVER not set), always allow
+    additional properties so they pass through for server-side validation.
+    On the server, allow additional properties only until plugins have
+    been loaded — after that, enforce strict validation.
+    """
+    if os.environ.get(constants.ENV_VAR_IS_SKYPILOT_SERVER) is None:
+        return True
+    # Import here to avoid circular imports (plugins imports from sky.utils).
+    from sky.server import plugins  # pylint: disable=import-outside-toplevel
+    return not plugins.plugins_loaded()
+
+
+def register_jobs_property(name: str, schema: Dict[str, Any]) -> None:
+    """Register an additional property for the jobs controller schema.
+
+    This allows plugins to extend the ``jobs`` config section with
+    custom configuration fields.  The property is merged into the
+    schema's properties dict, so it passes JSON schema validation
+    even with additionalProperties: False.
+
+    Args:
+        name: The property name.
+        schema: The JSON Schema for the property
+            (e.g., {'type': 'boolean'}).
+    """
+    if name in _extra_jobs_properties:
+        raise ValueError(f'Jobs property {name!r} is already registered.')
+    _extra_jobs_properties[name] = schema
+
+
+def register_kubernetes_property(name: str, schema: Dict[str, Any]) -> None:
+    """Register an additional property for the kubernetes schema.
+
+    This allows plugins to extend the kubernetes dict schema with
+    kubernetes-specific configuration fields. The property is merged into
+    the schema's properties dict, so it passes JSON schema validation
+    even with additionalProperties: False.
+
+    Args:
+        name: The property name.
+        schema: The JSON Schema for the property
+            (e.g., {'type': 'string'}).
+    """
+    _extra_kubernetes_properties[name] = schema
+
+
+def register_slurm_property(name: str, schema: Dict[str, Any]) -> None:
+    """Register an additional property for the slurm schema.
+
+    This allows plugins to extend the slurm dict schema with slurm-specific
+    configuration fields. The property is merged into the schema's properties
+    dict (both at the top level and under each per-cluster ``cluster_configs``
+    entry), so it passes JSON schema validation even with
+    additionalProperties: False.
+
+    Args:
+        name: The property name.
+        schema: The JSON Schema for the property
+            (e.g., {'type': 'string'}).
+    """
+    _extra_slurm_properties[name] = schema
+
+
+def _check_not_both_fields_present(field1: str, field2: str):
+    return {
+        'oneOf': [{
+            'required': [field1],
+            'not': {
+                'required': [field2]
+            }
+        }, {
+            'required': [field2],
+            'not': {
+                'required': [field1]
+            }
+        }, {
+            'not': {
+                'anyOf': [{
+                    'required': [field1]
+                }, {
+                    'required': [field2]
+                }]
+            }
+        }]
+    }
+
+
+_AUTOSTOP_SCHEMA = {
+    'anyOf': [
+        {
+            # Use boolean to disable autostop completely, e.g.
+            #   autostop: false
+            'type': 'boolean',
+        },
+        {
+            # Shorthand to set idle_minutes by directly specifying, e.g.
+            #   autostop: 5
+            'anyOf': [{
+                'type': 'string',
+                'pattern': constants.TIME_PATTERN,
+                'minimum': 0,
+            }, {
+                'type': 'integer',
+            }]
+        },
+        {
+            'type': 'object',
+            'required': [],
+            'additionalProperties': False,
+            'properties': {
+                # TODO(luca): update field to use time units as well.
+                'idle_minutes': {
+                    'type': 'integer',
+                    'minimum': 0,
+                },
+                'down': {
+                    'type': 'boolean',
+                },
+                'wait_for': {
+                    'type': 'string',
+                    'case_insensitive_enum':
+                        autostop_lib.AutostopWaitFor.supported_modes(),
+                },
+                # TODO(zpoint): remove after v0.15.0 — routed into
+                # top-level resources.hooks for backward compatibility.
+                'hook': {
+                    'type': 'string',
+                },
+                'hook_timeout': {
+                    'type': 'integer',
+                    'minimum': 1,
+                }
+            },
+        },
+    ],
+}
+
+# Supported events in config.hooks[*].events.
+_HOOK_EVENTS = ['stop', 'preemption', 'down']
+
+_HOOKS_SCHEMA = {
+    'type': 'array',
+    # Bound the array so the SetAutostop request payload can't grow
+    # past gRPC's default max_receive_message_length (4 MB). 32 entries
+    # × 16 KiB per `run` plus event/timeout overhead leaves comfortable
+    # headroom.
+    'maxItems': 32,
+    'items': {
+        'type': 'object',
+        'required': ['run'],
+        'additionalProperties': False,
+        'properties': {
+            'run': {
+                'type': 'string',
+                'minLength': 1,
+                # 16 KiB cap. Matches typical shell-script size limits
+                # and keeps gRPC payloads tractable. Users with large
+                # bodies should put the script under workdir/ and call
+                # it from `run:` instead.
+                'maxLength': 16 * 1024,
+            },
+            # `events` is optional. When absent, Resources fills the
+            # default list (all three events) at load time.
+            'events': {
+                'type': 'array',
+                'minItems': 1,
+                'uniqueItems': True,
+                'items': {
+                    'type': 'string',
+                    'enum': _HOOK_EVENTS,
+                },
+            },
+            'timeout': {
+                'type': 'integer',
+                'minimum': 1,
+            },
+        },
+    },
+}
+
+
+# Note: This is similar to _get_infra_pattern()
+# but without the wildcard patterns.
+def _get_volume_infra_pattern():
+    # Building the regex pattern for the infra field
+    # Format: cloud[/region[/zone]] or wildcards or kubernetes context
+    # Match any cloud name (case insensitive)
+    all_clouds = list(constants.ALL_CLOUDS)
+    all_clouds.remove('kubernetes')
+    cloud_pattern = f'(?i:({"|".join(all_clouds)}))'
+
+    # Optional /region followed by optional /zone
+    # /[^/]+ matches a slash followed by any characters except slash (region or
+    # zone name)
+    # The outer (?:...)? makes the entire region/zone part optional
+    region_zone_pattern = '(?:/[^/]+(?:/[^/]+)?)?'
+
+    # Kubernetes specific pattern - matches:
+    # 1. Just the word "kubernetes" or "k8s" by itself
+    # 2. "k8s/" or "kubernetes/" followed by any context name (which may contain
+    # slashes)
+    kubernetes_pattern = '(?i:kubernetes|k8s)(?:/.+)?'
+
+    # Combine all patterns with alternation (|)
+    # ^ marks start of string, $ marks end of string
+    infra_pattern = (f'^(?:{cloud_pattern}{region_zone_pattern}|'
+                     f'{kubernetes_pattern})$')
+    return infra_pattern
+
+
+def _get_infra_pattern():
+    # Building the regex pattern for the infra field
+    # Format: cloud[/region[/zone]] or wildcards or kubernetes context
+    # Match any cloud name (case insensitive)
+    all_clouds = list(constants.ALL_CLOUDS)
+    all_clouds.remove('kubernetes')
+    cloud_pattern = f'(?i:({"|".join(all_clouds)}))'
+
+    # Optional /region followed by optional /zone
+    # /[^/]+ matches a slash followed by any characters except slash (region or
+    # zone name)
+    # The outer (?:...)? makes the entire region/zone part optional
+    region_zone_pattern = '(?:/[^/]+(?:/[^/]+)?)?'
+
+    # Wildcard patterns:
+    # 1. * - any cloud
+    # 2. */region - any cloud with specific region
+    # 3. */*/zone - any cloud, any region, specific zone
+    wildcard_cloud = '\\*'  # Wildcard for cloud
+    wildcard_with_region = '(?:/[^/]+(?:/[^/]+)?)?'
+
+    # Kubernetes specific pattern - matches:
+    # 1. Just the word "kubernetes" or "k8s" by itself
+    # 2. "k8s/" or "kubernetes/" followed by any context name (which may contain
+    # slashes)
+    kubernetes_pattern = '(?i:kubernetes|k8s)(?:/.+)?'
+
+    # Combine all patterns with alternation (|)
+    # ^ marks start of string, $ marks end of string
+    infra_pattern = (f'^(?:{cloud_pattern}{region_zone_pattern}|'
+                     f'{wildcard_cloud}{wildcard_with_region}|'
+                     f'{kubernetes_pattern})$')
+    return infra_pattern
+
+
+def _get_single_resources_schema():
+    """Schema for a single resource in a resources list."""
+    return {
+        '$schema': 'https://json-schema.org/draft/2020-12/schema',
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'cloud': {
+                'type': 'string',
+                'case_insensitive_enum': list(constants.ALL_CLOUDS)
+            },
+            'region': {
+                'type': 'string',
+            },
+            'zone': {
+                'type': 'string',
+            },
+            'infra': {
+                'type': 'string',
+                'description':
+                    ('Infrastructure specification in format: '
+                     'cloud[/region[/zone]]. Use "*" as a wildcard.'),
+                # Pattern validates:
+                # 1. cloud[/region[/zone]] - e.g. "aws", "aws/us-east-1",
+                #    "aws/us-east-1/us-east-1a"
+                # 2. Wildcard patterns - e.g. "*", "*/us-east-1",
+                #    "*/*/us-east-1a", "aws/*/us-east-1a"
+                # 3. Kubernetes patterns - e.g. "kubernetes/my-context",
+                #    "k8s/context-name",
+                #    "k8s/aws:eks:us-east-1:123456789012:cluster/my-cluster"
+                'pattern': _get_infra_pattern(),
+            },
+            'cpus': {
+                'anyOf': [{
+                    'type': 'string',
+                }, {
+                    'type': 'number',
+                }],
+            },
+            'memory': {
+                'anyOf': [{
+                    'type': 'string',
+                }, {
+                    'type': 'number',
+                }],
+            },
+            'accelerators': {
+                'anyOf': [{
+                    'type': 'string',
+                }, {
+                    'type': 'object',
+                    'required': [],
+                    'maxProperties': 1,
+                    'additionalProperties': {
+                        'type': 'number'
+                    }
+                }]
+            },
+            'instance_type': {
+                'type': 'string',
+            },
+            'use_spot': {
+                'type': 'boolean',
+            },
+            'job_recovery': {
+                # Either a string or a dict.
+                'anyOf': [
+                    {
+                        'type': 'string',
+                    },
+                    {
+                        'type': 'object',
+                        'required': [],
+                        # On the server, plugins have registered
+                        # their properties via
+                        # register_job_recovery_property(), so we
+                        # can be strict. On the client we allow
+                        # unknown properties to pass through for
+                        # server-side validation.
+                        'additionalProperties': _allow_additional_properties(),
+                        'properties': {
+                            'strategy': {
+                                'anyOf': [{
+                                    'type': 'string',
+                                }, {
+                                    'type': 'null',
+                                }],
+                            },
+                            'max_restarts_on_errors': {
+                                'type': 'integer',
+                                'minimum': 0,
+                            },
+                            'recover_on_exit_codes': {
+                                'anyOf': [
+                                    {
+                                        # Single exit code
+                                        'type': 'integer',
+                                        'minimum': 0,
+                                        'maximum': 255,
+                                    },
+                                    {
+                                        # List of exit codes
+                                        'type': 'array',
+                                        'items': {
+                                            'type': 'integer',
+                                            'minimum': 0,
+                                            'maximum': 255,
+                                        },
+                                        'uniqueItems': True,
+                                    },
+                                ],
+                            },
+                            # Plugin-registered strategy-specific
+                            # properties (validated on server side
+                            # where plugins are loaded).
+                            **_extra_job_recovery_properties,
+                        }
+                    }
+                ],
+            },
+            'volumes': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'properties': {
+                        'disk_size': {
+                            'anyOf': [{
+                                'type': 'string',
+                                'pattern': constants.MEMORY_SIZE_PATTERN,
+                            }, {
+                                'type': 'integer',
+                            }],
+                        },
+                        'disk_tier': {
+                            'type': 'string',
+                        },
+                        'path': {
+                            'type': 'string',
+                        },
+                        'auto_delete': {
+                            'type': 'boolean',
+                        },
+                        'storage_type': {
+                            'type': 'string',
+                        },
+                        'name': {
+                            'type': 'string',
+                        },
+                        'attach_mode': {
+                            'type': 'string',
+                        },
+                    },
+                },
+            },
+            'disk_size': {
+                'anyOf': [{
+                    'type': 'string',
+                    'pattern': constants.MEMORY_SIZE_PATTERN,
+                }, {
+                    'type': 'integer',
+                }],
+            },
+            # Deprecated: use disk_size instead. Kept for backward
+            # compatibility with configs written by older versions.
+            # TODO (kyuds): remove v0.14.0.
+            'ephemeral_storage': {
+                'anyOf': [{
+                    'type': 'string',
+                    'pattern': constants.MEMORY_SIZE_PATTERN,
+                }, {
+                    'type': 'integer',
+                }],
+            },
+            'disk_tier': {
+                'type': 'string',
+            },
+            'network_tier': {
+                'type': 'string',
+            },
+            'local_disk': {
+                'type': 'string',
+            },
+            'max_hourly_cost': {
+                'type': 'number',
+                'exclusiveMinimum': 0,
+            },
+            'ports': {
+                'anyOf': [{
+                    'type': 'string',
+                }, {
+                    'type': 'integer',
+                }, {
+                    'type': 'array',
+                    'items': {
+                        'anyOf': [{
+                            'type': 'string',
+                        }, {
+                            'type': 'integer',
+                        }]
+                    }
+                }, {
+                    'type': 'null',
+                }],
+            },
+            'labels': {
+                'type': 'object',
+                'additionalProperties': {
+                    'type': 'string'
+                }
+            },
+            'accelerator_args': {
+                'type': 'object',
+                'required': [],
+                'additionalProperties': False,
+                'properties': {
+                    'runtime_version': {
+                        'type': 'string',
+                    },
+                    'tpu_name': {
+                        'type': 'string',
+                    },
+                    'tpu_vm': {
+                        'type': 'boolean',
+                    },
+                    'gcp_queued_resource': {
+                        'type': 'boolean',
+                    },
+                }
+            },
+            '_no_missing_accel_warnings': {
+                'type': 'boolean'
+            },
+            'image_id': {
+                'anyOf': [{
+                    'type': 'string',
+                }, {
+                    'type': 'object',
+                    'required': [],
+                }, {
+                    'type': 'null',
+                }]
+            },
+            'autostop': _AUTOSTOP_SCHEMA,
+            'priority': {
+                'type': 'integer',
+                'minimum': constants.MIN_PRIORITY,
+                'maximum': constants.MAX_PRIORITY,
+            },
+            'priority_class': {
+                'type': 'string',
+            },
+            # The following fields are for internal use only. Should not be
+            # specified in the task config.
+            '_docker_login_config': {
+                'type': 'object',
+                'required': ['username', 'password', 'server'],
+                'additionalProperties': False,
+                'properties': {
+                    'username': {
+                        'type': 'string',
+                    },
+                    'password': {
+                        'type': 'string',
+                    },
+                    'server': {
+                        'type': 'string',
+                    }
+                }
+            },
+            '_is_image_managed': {
+                'type': 'boolean',
+            },
+            '_requires_fuse': {
+                'type': 'boolean',
+            },
+            '_cluster_config_overrides': {
+                'type': 'object',
+            },
+        }
+    }
+
+
+def _get_multi_resources_schema():
+    multi_resources_schema = {
+        k: v
+        for k, v in _get_single_resources_schema().items()
+        # Validation may fail if $schema is included.
+        if k != '$schema'
+    }
+    return multi_resources_schema
+
+
+def get_resources_schema():
+    """Resource schema in task config."""
+    single_resources_schema = _get_single_resources_schema()['properties']
+    single_resources_schema.pop('accelerators')
+    multi_resources_schema = _get_multi_resources_schema()
+    return {
+        '$schema': 'http://json-schema.org/draft-07/schema#',
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            **single_resources_schema,
+            # We redefine the 'accelerators' field to allow one line list or
+            # a set of accelerators.
+            'accelerators': {
+                # {'V100:1', 'A100:1'} will be
+                # read as a string and converted to dict.
+                'anyOf': [{
+                    'type': 'string',
+                }, {
+                    'type': 'object',
+                    'required': [],
+                    'additionalProperties': {
+                        'anyOf': [{
+                            'type': 'null',
+                        }, {
+                            'type': 'number',
+                        }]
+                    }
+                }, {
+                    'type': 'array',
+                    'items': {
+                        'type': 'string',
+                    }
+                }]
+            },
+            'any_of': {
+                'type': 'array',
+                'items': multi_resources_schema,
+            },
+            'ordered': {
+                'type': 'array',
+                'items': multi_resources_schema,
+            }
+        },
+    }
+
+
+def get_volume_schema():
+    # pylint: disable=import-outside-toplevel
+    from sky.utils import volume
+
+    return {
+        '$schema': 'https://json-schema.org/draft/2020-12/schema',
+        'type': 'object',
+        'required': ['name', 'type'],
+        'additionalProperties': False,
+        'properties': {
+            'name': {
+                'type': 'string',
+            },
+            'type': {
+                'type': 'string',
+                'case_sensitive_enum': [
+                    type.value for type in volume.VolumeType
+                ],
+            },
+            'infra': {
+                'type': 'string',
+                'description': ('Infrastructure specification in format: '
+                                'cloud[/region[/zone]].'),
+                # Pattern validates:
+                # 1. cloud[/region[/zone]] - e.g. "aws", "aws/us-east-1",
+                #    "aws/us-east-1/us-east-1a"
+                # 2. Kubernetes patterns - e.g. "kubernetes/my-context",
+                #    "k8s/context-name",
+                #    "k8s/aws:eks:us-east-1:123456789012:cluster/my-cluster"
+                'pattern': _get_volume_infra_pattern(),
+            },
+            'size': {
+                'type': 'string',
+                'pattern': constants.MEMORY_SIZE_PATTERN,
+            },
+            'use_existing': {
+                'type': 'boolean',
+            },
+            'config': {
+                'type': 'object',
+                'required': [],
+                'properties': {
+                    'storage_class_name': {
+                        'type': 'string',
+                    },
+                    'access_mode': {
+                        'type': 'string',
+                        'case_sensitive_enum': [
+                            type.value for type in volume.VolumeAccessMode
+                        ],
+                    },
+                    'namespace': {
+                        'type': 'string',
+                    },
+                    'host_path': {
+                        'type': 'string',
+                    },
+                    'cleanup_on_deletion': {
+                        'type': 'boolean',
+                    },
+                },
+            },
+            **_LABELS_SCHEMA,
+        }
+    }
+
+
+def get_storage_schema():
+    # pylint: disable=import-outside-toplevel
+    from sky.data import storage
+
+    # Refer to https://rclone.org/docs/#options for more information
+    # on rclone-specific nomenclature.
+    rclone_memory_units = ('B', 'K', 'M', 'G', 'T', 'P')
+    rclone_memory_pattern = (
+        '^[0-9]+('
+        f'{"|".join([unit.lower() for unit in rclone_memory_units])}|'
+        f'{"|".join([unit.upper() for unit in rclone_memory_units])})?$')
+    rclone_duration_pattern = (
+        r'^(?:(?:[-+]?(?:\d+(?:\.\d+)?|\.\d+)'
+        r'(?:ms|[smhdwMy]))+|([-+]?(?:\d+(?:\.\d+)?|\.\d+)))$')
+
+    return {
+        '$schema': 'https://json-schema.org/draft/2020-12/schema',
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'name': {
+                'type': 'string',
+            },
+            'source': {
+                'anyOf': [{
+                    'type': 'string',
+                }, {
+                    'type': 'array',
+                    'minItems': 1,
+                    'items': {
+                        'type': 'string'
+                    }
+                }]
+            },
+            'store': {
+                'type': 'string',
+                'case_insensitive_enum': [
+                    type.value for type in storage.StoreType
+                ]
+            },
+            'persistent': {
+                'type': 'boolean',
+            },
+            'mode': {
+                'type': 'string',
+                'case_insensitive_enum': [
+                    mode.value for mode in storage.StorageMode
+                ]
+            },
+            'type': {
+                'type': 'string',
+                'case_insensitive_enum': [
+                    t.value for t in storage.FileMountType
+                ]
+            },
+            'config': {
+                'type': 'object',
+                'properties': {
+                    'disk_size': {
+                        'anyOf': [{
+                            'type': 'string',
+                            'pattern': constants.MEMORY_SIZE_PATTERN,
+                        }, {
+                            'type': 'integer',
+                        }],
+                    },
+                    'disk_tier': {
+                        'type': 'string',
+                    },
+                    'storage_type': {
+                        'type': 'string',
+                    },
+                    'attach_mode': {
+                        'type': 'string',
+                    },
+                    'mount_cached': {
+                        'type': 'object',
+                        'additionalProperties': False,
+                        'properties': {
+                            'transfers': {
+                                'type': 'integer',
+                                'minimum': 1,
+                            },
+                            'buffer_size': {
+                                'type': 'string',
+                                'pattern': rclone_memory_pattern,
+                            },
+                            'vfs_cache_max_size': {
+                                'type': 'string',
+                                'pattern': rclone_memory_pattern,
+                            },
+                            'vfs_cache_max_age': {
+                                'type': 'string',
+                                'pattern': rclone_duration_pattern,
+                            },
+                            'vfs_read_ahead': {
+                                'type': 'string',
+                                'pattern': rclone_memory_pattern,
+                            },
+                            'vfs_read_chunk_size': {
+                                'type': 'string',
+                                'pattern': rclone_memory_pattern,
+                            },
+                            'vfs_read_chunk_streams': {
+                                'type': 'integer',
+                                'minimum': 0,
+                            },
+                            'vfs_write_back': {
+                                'type': 'string',
+                                'pattern': rclone_duration_pattern,
+                            },
+                            'read_only': {
+                                'type': 'boolean',
+                            },
+                        },
+                    },
+                    'mount': {
+                        'type': 'object',
+                        'additionalProperties': False,
+                        'properties': {
+                            'read_only': {
+                                'type': 'boolean',
+                            },
+                            # Hugging Face stores only: extra ``hf-mount``
+                            # flags forwarded verbatim to the daemon. Each
+                            # element is one shell token.
+                            'hf_mount_args': {
+                                'type': 'array',
+                                'items': {
+                                    'type': 'string',
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            '_is_sky_managed': {
+                'type': 'boolean',
+            },
+            '_bucket_sub_path': {
+                'type': 'string',
+            },
+            '_force_delete': {
+                'type': 'boolean',
+            }
+        }
+    }
+
+
+def get_volume_mount_schema():
+    """Schema for volume mount object in task config (internal use only)."""
+    return {
+        '$schema': 'https://json-schema.org/draft/2020-12/schema',
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'path': {
+                'type': 'string',
+            },
+            'volume_name': {
+                'type': 'string',
+            },
+            'is_ephemeral': {
+                'type': 'boolean',
+            },
+            'sub_path': {
+                'type': 'string',
+                'pattern': constants.SUB_PATH_PATTERN,
+            },
+            'volume_config': {
+                'type': 'object',
+                'required': [],
+                'additionalProperties': True,
+                'properties': {
+                    'cloud': {
+                        'type': 'string',
+                        'case_insensitive_enum': list(constants.ALL_CLOUDS)
+                    },
+                    'region': {
+                        'anyOf': [{
+                            'type': 'string'
+                        }, {
+                            'type': 'null'
+                        }]
+                    },
+                    'zone': {
+                        'anyOf': [{
+                            'type': 'string'
+                        }, {
+                            'type': 'null'
+                        }]
+                    },
+                },
+            }
+        }
+    }
+
+
+def get_service_schema():
+    """Schema for top-level `service:` field (for SkyServe)."""
+    # To avoid circular imports, only import when needed.
+    # pylint: disable=import-outside-toplevel
+    from sky.serve import load_balancing_policies
+    from sky.serve import spot_placer
+    return {
+        '$schema': 'https://json-schema.org/draft/2020-12/schema',
+        'type': 'object',
+        'additionalProperties': False,
+        'properties': {
+            'readiness_probe': {
+                'anyOf': [{
+                    'type': 'string',
+                }, {
+                    'type': 'object',
+                    'required': ['path'],
+                    'additionalProperties': False,
+                    'properties': {
+                        'path': {
+                            'type': 'string',
+                        },
+                        'initial_delay_seconds': {
+                            'type': 'number',
+                        },
+                        'timeout_seconds': {
+                            'type': 'number',
+                        },
+                        'endpoint_probe_interval_seconds': {
+                            'type': 'number',
+                        },
+                        'consecutive_failure_threshold_timeout': {
+                            'type': 'number',
+                        },
+                        'post_data': {
+                            'anyOf': [{
+                                'type': 'string',
+                            }, {
+                                'type': 'object',
+                            }]
+                        },
+                        'headers': {
+                            'type': 'object',
+                            'additionalProperties': {
+                                'type': 'string'
+                            }
+                        },
+                    }
+                }]
+            },
+            'load_balancer': {
+                'type': 'object',
+                'required': [],
+                'additionalProperties': False,
+                'properties': {
+                    'stream_timeout_seconds': {
+                        'type': 'number',
+                    },
+                },
+            },
+            'pool': {
+                'type': 'object',
+                'required': [],
+                'additionalProperties': False,
+                'properties': {
+                    'workers': {
+                        'type': 'integer',
+                        'minimum': 0,
+                    },
+                    'min_workers': {
+                        'type': 'integer',
+                        'minimum': 0,
+                    },
+                    'queue_length_threshold': {
+                        'type': 'integer',
+                        'minimum': 1,
+                    },
+                    'max_workers': {
+                        'type': 'integer',
+                        'minimum': 0,
+                    },
+                    'upscale_delay_seconds': {
+                        'type': 'number',
+                        'minimum': 0,
+                    },
+                    'downscale_delay_seconds': {
+                        'type': 'number',
+                        'minimum': 0,
+                    },
+                },
+            },
+            'replica_policy': {
+                'type': 'object',
+                'required': ['min_replicas'],
+                'additionalProperties': False,
+                'properties': {
+                    'min_replicas': {
+                        'type': 'integer',
+                        'minimum': 0,
+                    },
+                    'max_replicas': {
+                        'type': 'integer',
+                        'minimum': 0,
+                    },
+                    'num_overprovision': {
+                        'type': 'integer',
+                        'minimum': 0,
+                    },
+                    'target_qps_per_replica': {
+                        'anyOf': [
+                            {
+                                'type': 'number',
+                                'minimum': 0,
+                            },
+                            {
+                                'type': 'object',
+                                'patternProperties': {
+                                    # Pattern for accelerator types like
+                                    # "H100:1", "A100:1", "H100", "A100"
+                                    '^[A-Z0-9]+(?::[0-9]+)?$': {
+                                        'type': 'number',
+                                        'minimum': 0,
+                                    }
+                                },
+                                'additionalProperties': False,
+                            }
+                        ]
+                    },
+                    'dynamic_ondemand_fallback': {
+                        'type': 'boolean',
+                    },
+                    'base_ondemand_fallback_replicas': {
+                        'type': 'integer',
+                        'minimum': 0,
+                    },
+                    'spot_placer': {
+                        'type': 'string',
+                        'case_insensitive_enum': list(
+                            spot_placer.SPOT_PLACERS.keys())
+                    },
+                    'upscale_delay_seconds': {
+                        'type': 'number',
+                    },
+                    'downscale_delay_seconds': {
+                        'type': 'number',
+                    },
+                }
+            },
+            'ports': {
+                'type': 'integer',
+            },
+            'replicas': {
+                'type': 'integer',
+            },
+            'workers': {
+                'type': 'integer',
+            },
+            'load_balancing_policy': {
+                'type': 'string',
+                'case_insensitive_enum': list(
+                    load_balancing_policies.LB_POLICIES.keys())
+            },
+            'tls': {
+                'type': 'object',
+                'required': ['keyfile', 'certfile'],
+                'additionalProperties': False,
+                'properties': {
+                    'keyfile': {
+                        'type': 'string',
+                    },
+                    'certfile': {
+                        'type': 'string',
+                    },
+                },
+            },
+        }
+    }
+
+
+def _filter_schema(schema: dict, keys_to_keep: List[Tuple[str, ...]]) -> dict:
+    """Recursively filter a schema to include only certain keys.
+
+    Args:
+        schema: The original schema dictionary.
+        keys_to_keep: List of tuples with the path of keys to retain.
+
+    Returns:
+        The filtered schema.
+    """
+    # Convert list of tuples to a dictionary for easier access
+    paths_dict: Dict[str, Any] = {}
+    for path in keys_to_keep:
+        current = paths_dict
+        for step in path:
+            if step not in current:
+                current[step] = {}
+            current = current[step]
+
+    def keep_keys(current_schema: dict, current_path_dict: dict,
+                  new_schema: dict) -> dict:
+        # Base case: if we reach a leaf in the path_dict, we stop.
+        if (not current_path_dict or not isinstance(current_schema, dict) or
+                not current_schema.get('properties')):
+            return current_schema
+
+        if 'properties' not in new_schema:
+            new_schema = {
+                key: current_schema[key]
+                for key in current_schema
+                # We do not support the handling of `oneOf`, `anyOf`, `allOf`,
+                # `required` for now.
+                if key not in
+                {'properties', 'oneOf', 'anyOf', 'allOf', 'required'}
+            }
+            new_schema['properties'] = {}
+        for key, sub_schema in current_schema['properties'].items():
+            if key in current_path_dict:
+                # Recursively keep keys if further path dict exists
+                new_schema['properties'][key] = {}
+                current_path_value = current_path_dict.pop(key)
+                new_schema['properties'][key] = keep_keys(
+                    sub_schema, current_path_value,
+                    new_schema['properties'][key])
+
+        return new_schema
+
+    # Start the recursive filtering
+    new_schema = keep_keys(schema, paths_dict, {})
+    assert not paths_dict, f'Unprocessed keys: {paths_dict}'
+    return new_schema
+
+
+def _task_config_schema():
+    """Schema for task-YAML's `config:` block.
+
+    Hand-merged from the global config schema (filtered to overrideable
+    keys) plus the task-only `hooks` property. `hooks` is intentionally
+    NOT exposed in the global ``~/.sky/config.yaml`` schema — lifecycle
+    hooks are task-scoped (preserving the original ``resources.hooks:``
+    placement).
+    """
+    overrideable = _filter_schema(
+        get_config_schema(),
+        constants.OVERRIDEABLE_CONFIG_KEYS_IN_TASK)['properties']
+    return {
+        'type': 'object',
+        # On the client, let unknown keys pass through so config keys
+        # registered as task-overrideable on the server (via
+        # skypilot_config.register_task_overrideable_config_key) are not
+        # rejected by a client that does not know about them — mirroring
+        # how the global config schema handles plugin-registered
+        # properties. The server enforces the full set.
+        'additionalProperties': _allow_additional_properties(),
+        'properties': {
+            **overrideable,
+            'hooks': _HOOKS_SCHEMA,
+        },
+    }
+
+
+def get_task_schema():
+    return {
+        '$schema': 'https://json-schema.org/draft/2020-12/schema',
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'name': {
+                'type': 'string',
+            },
+            'workdir': {
+                'anyOf': [{
+                    'type': 'string',
+                }, {
+                    'type': 'object',
+                    'required': ['url'],
+                    'additionalProperties': False,
+                    'properties': {
+                        'url': {
+                            'type': 'string',
+                        },
+                        'ref': {
+                            'type': 'string',
+                        },
+                    },
+                }],
+            },
+            'event_callback': {
+                'type': 'string',
+            },
+            'num_nodes': {
+                'type': 'integer',
+            },
+            # resources config is validated separately using RESOURCES_SCHEMA
+            'resources': {
+                'type': 'object',
+            },
+            # storage config is validated separately using STORAGE_SCHEMA
+            'file_mounts': {
+                'type': 'object',
+            },
+            # service config is validated separately using SERVICE_SCHEMA
+            'service': {
+                'type': 'object',
+            },
+            'pool': {
+                'type': 'object',
+            },
+            'setup': {
+                'type': 'string',
+            },
+            'run': {
+                'type': 'string',
+            },
+            'envs': {
+                'type': 'object',
+                'required': [],
+                'patternProperties': {
+                    # Checks env keys are valid env var names.
+                    '^[a-zA-Z_][a-zA-Z0-9_]*$': {
+                        'type': ['string', 'null']
+                    }
+                },
+                'additionalProperties': False,
+            },
+            'secrets': {
+                'oneOf': [
+                    {
+                        'type': 'object',
+                        # Dict form: inline secrets + managed refs
+                        'additionalProperties': {
+                            'type': ['string', 'null']
+                        },
+                    },
+                    {
+                        'type': 'array',
+                        # Array form: managed secret refs only
+                        'items': {
+                            'type': 'string'
+                        },
+                    },
+                ],
+            },
+            'managed_secrets': {
+                'type': 'array',
+                'items': {
+                    'oneOf': [
+                        {
+                            'type': 'string'
+                        },
+                        {
+                            'type': 'object',
+                            'maxProperties': 1,
+                            'additionalProperties': {
+                                'type': 'object',
+                                'properties': {
+                                    'mount_path': {
+                                        'type': 'string'
+                                    },
+                                },
+                                'additionalProperties': False,
+                            },
+                        },
+                    ],
+                },
+            },
+            # inputs and outputs are experimental
+            'inputs': {
+                'type': 'object',
+                'required': [],
+                'maxProperties': 1,
+                'additionalProperties': {
+                    'type': 'number'
+                }
+            },
+            'outputs': {
+                'type': 'object',
+                'required': [],
+                'maxProperties': 1,
+                'additionalProperties': {
+                    'type': 'number'
+                }
+            },
+            'file_mounts_mapping': {
+                'type': 'object',
+            },
+            # Per-task config block. Hand-merged so we can add a
+            # task-only `hooks:` key that is intentionally NOT part of
+            # the global `~/.sky/config.yaml` schema (lifecycle hooks
+            # are task-scoped, not workspace/operator-scoped).
+            'config': _task_config_schema(),
+            # volumes config is validated separately using get_volume_schema
+            'volumes': {
+                'type': 'object',
+            },
+            'volume_mounts': {
+                'type': 'array',
+                'items': get_volume_mount_schema(),
+            },
+            'api_server_access': {
+                'type': 'boolean',
+            },
+            '_metadata': {
+                'type': 'object',
+            },
+        }
+    }
+
+
+def get_cluster_schema():
+    return {
+        '$schema': 'https://json-schema.org/draft/2020-12/schema',
+        'type': 'object',
+        'required': ['cluster', 'auth'],
+        'additionalProperties': False,
+        'properties': {
+            'cluster': {
+                'type': 'object',
+                'required': ['ips', 'name'],
+                'additionalProperties': False,
+                'properties': {
+                    'ips': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'string',
+                        }
+                    },
+                    'name': {
+                        'type': 'string',
+                    },
+                }
+            },
+            'auth': {
+                'type': 'object',
+                'required': ['ssh_user', 'ssh_private_key'],
+                'additionalProperties': False,
+                'properties': {
+                    'ssh_user': {
+                        'type': 'string',
+                    },
+                    'ssh_private_key': {
+                        'type': 'string',
+                    },
+                }
+            },
+            'python': {
+                'type': 'string',
+            },
+        }
+    }
+
+
+_NETWORK_CONFIG_SCHEMA = {
+    'use_internal_ips': {
+        'type': 'boolean',
+    },
+    'ssh_proxy_command': {
+        'oneOf': [{
+            'type': 'string',
+        }, {
+            'type': 'null',
+        }, {
+            'type': 'object',
+            'required': [],
+            'additionalProperties': {
+                'anyOf': [
+                    {
+                        'type': 'string'
+                    },
+                    {
+                        'type': 'null'
+                    },
+                ]
+            }
+        }]
+    },
+}
+
+_LABELS_SCHEMA = {
+    'labels': {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': {
+            'type': 'string',
+        },
+    }
+}
+
+_PROPERTY_NAME_OR_CLUSTER_NAME_TO_PROPERTY = {
+    'oneOf': [
+        {
+            'type': 'string',
+            'minLength': 1,
+        },
+        {
+            # A list of single-element dict to pretain the
+            # order.
+            # Example:
+            #  property_name:
+            #    - my-cluster1-*: my-property-1
+            #    - my-cluster2-*: my-property-2
+            #    - "*"": my-property-3
+            'type': 'array',
+            'items': {
+                'type': 'object',
+                'additionalProperties': {
+                    'type': 'string',
+                    'minLength': 1,
+                },
+                'maxProperties': 1,
+                'minProperties': 1,
+            },
+        }
+    ]
+}
+
+
+class RemoteIdentityOptions(enum.Enum):
+    """Enum for remote identity types.
+
+    Some clouds (e.g., AWS, Kubernetes) also allow string values for remote
+    identity, which map to the service account/role to use. Those are not
+    included in this enum.
+    """
+    LOCAL_CREDENTIALS = 'LOCAL_CREDENTIALS'
+    SERVICE_ACCOUNT = 'SERVICE_ACCOUNT'
+    NO_UPLOAD = 'NO_UPLOAD'
+
+
+def get_default_remote_identity(cloud: str) -> str:
+    """Get the default remote identity for the specified cloud."""
+    if cloud in ('kubernetes', 'ssh'):
+        return RemoteIdentityOptions.SERVICE_ACCOUNT.value
+    return RemoteIdentityOptions.LOCAL_CREDENTIALS.value
+
+
+_CAPABILITIES_SCHEMA = {
+    'capabilities': {
+        'type': 'array',
+        'items': {
+            'type': 'string',
+            'case_insensitive_enum': ['compute', 'storage']
+        },
+    }
+}
+
+_REMOTE_IDENTITY_SCHEMA = {
+    'remote_identity': {
+        'type': 'string',
+        'case_insensitive_enum': [
+            option.value for option in RemoteIdentityOptions
+        ]
+    }
+}
+
+_REMOTE_IDENTITY_SCHEMA_KUBERNETES = {
+    'remote_identity': {
+        'anyOf': [{
+            'type': 'string'
+        }, {
+            'type': 'object',
+            'additionalProperties': {
+                'type': 'string'
+            }
+        }]
+    },
+}
+
+_SBATCH_OPTIONS_SCHEMA = {
+    'type': 'object',
+    'required': [],
+    'additionalProperties': {
+        'oneOf': [
+            {
+                'type': 'string',
+                # Disallow newlines to prevent script injection in
+                # #SBATCH directives.
+                'pattern': r'^[^\n]*$'
+            },
+            {
+                'type': 'number'
+            },
+            {
+                'type': 'boolean'
+            },
+            {
+                'type': 'null'
+            },
+        ]
+    },
+}
+
+# `quota.queue` names the QOS a job is submitted with (`sbatch --qos`) and
+# `quota.account` the account it is charged to (`sbatch --account`), mirroring
+# `kubernetes.quota.queue`. Permissive so external schedulers (registered via
+# plugins) can layer their own sub-fields under `quota`.
+_SLURM_QUOTA_SCHEMA = {
+    'type': 'object',
+    'required': [],
+    'additionalProperties': True,
+    'properties': {
+        # Non-empty: an empty value would still be emitted as a bare
+        # `--qos=` / `--account=` directive and be rejected by sbatch.
+        'queue': {
+            'type': 'string',
+            'minLength': 1,
+        },
+        'account': {
+            'type': 'string',
+            'minLength': 1,
+        },
+    },
+}
+
+_GPU_PARTITION_MAP_SCHEMA = {
+    'type': 'object',
+    'required': [],
+    'additionalProperties': {
+        'anyOf': [{
+            'type': 'string',
+        }, {
+            'type': 'array',
+            'items': {
+                'type': 'string',
+            },
+        }],
+    },
+}
+
+_CONTAINER_MOUNTS_SCHEMA = {
+    'type': 'object',
+    'required': [],
+    # Maps a container path to a host path string (read-only) or
+    # {host_path: ..., mode: ro|rw}.
+    'additionalProperties': {
+        'anyOf': [{
+            'type': 'string',
+        }, {
+            'type': 'object',
+            'required': ['host_path'],
+            'additionalProperties': False,
+            'properties': {
+                'host_path': {
+                    'type': 'string',
+                },
+                'mode': {
+                    'type': 'string',
+                    'enum': ['ro', 'rw'],
+                },
+            },
+        }],
+    },
+}
+
+_PRICING_SCHEMA = {
+    'type': 'object',
+    'required': [],
+    'additionalProperties': False,
+    'properties': {
+        'cpu': {
+            'type': 'number',
+            'minimum': 0
+        },
+        'memory': {
+            'type': 'number',
+            'minimum': 0
+        },
+        'accelerators': {
+            'type': 'object',
+            'required': [],
+            'additionalProperties': {
+                'type': 'number',
+                'minimum': 0
+            },
+        },
+    },
+}
+
+_CONTEXT_CONFIG_SCHEMA_MINIMAL = {
+    'pod_config': {
+        'type': 'object',
+        'required': [],
+        # Allow arbitrary keys since validating pod spec is hard
+        'additionalProperties': True,
+    },
+    'provision_timeout': {
+        'type': 'integer',
+    },
+    'max_inline_command_length': {
+        # Largest command, in bytes of request URL, that SkyPilot will inline
+        # into a `kubectl exec` instead of uploading as a file. Lower this if a
+        # proxy in front of the Kubernetes API rejects large requests; the only
+        # cost of a lower value is an extra file upload per job submission.
+        # Lives here rather than in the Kubernetes-only schema so SSH node
+        # pools, which run through the same runner, can set it too.
+        'type': 'integer',
+        'minimum': 1024,
+    },
+    'custom_metadata': {
+        'type': 'object',
+        'required': [],
+        # Allow arbitrary keys since validating metadata is hard
+        'additionalProperties': True,
+        # Disallow 'name' and 'namespace' keys in this dict
+        'not': {
+            'anyOf': [{
+                'required': ['name']
+            }, {
+                'required': ['namespace']
+            }]
+        },
+    },
+}
+
+_CONTEXT_CONFIG_SCHEMA_KUBERNETES = {
+    'allowed_nodes': {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'label_selector': {
+                # Each key-value pair is OR'd: a node matches if ANY
+                # label matches. This differs from K8s label selectors
+                # which are AND'd.
+                'type': 'object',
+                'additionalProperties': {
+                    'type': 'string'
+                },
+            },
+            'names': {
+                'type': 'array',
+                'items': {
+                    'type': 'string'
+                },
+            },
+            'ips': {
+                'type': 'array',
+                'items': {
+                    'type': 'string'
+                },
+            },
+        },
+    },
+    'rdma': {
+        # How RDMA NICs reach pods on this context. Unset preserves the
+        # historical behavior (RDMA-capable clusters imply host networking).
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'mode': {
+                'type': 'string',
+                'case_insensitive_enum': [
+                    mode.value for mode in kubernetes_enums.KubernetesRdmaMode
+                ],
+            },
+            # Extended resource advertised by the RDMA device plugin, e.g.
+            # nvidia.com/rdma-vf. Site-specific: the device plugin's config
+            # composes it from an operator-chosen prefix and name.
+            'resource': {
+                'type': 'string',
+            },
+            # Value for the Multus k8s.v1.cni.cncf.io/networks annotation --
+            # the NetworkAttachmentDefinition to attach, repeated once per
+            # requested VF.
+            'networks': {
+                'type': 'string',
+            },
+        },
+    },
+    # TODO(kevin): Remove 'networking' in v0.13.0.
+    'networking': {
+        'type': 'string',
+        'case_insensitive_enum': [
+            type.value for type in kubernetes_enums.KubernetesNetworkingMode
+        ],
+    },
+    'ports': {
+        'type': 'string',
+        'case_insensitive_enum': [
+            type.value for type in kubernetes_enums.KubernetesPortMode
+        ],
+    },
+    **_CONTEXT_CONFIG_SCHEMA_MINIMAL,
+    'namespace': {
+        'type': 'string',
+    },
+    'autoscaler': {
+        'type': 'string',
+        'case_insensitive_enum': [
+            type.value for type in kubernetes_enums.KubernetesAutoscalerType
+        ],
+    },
+    'high_availability': {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'storage_class_name': {
+                'type': 'string',
+            }
+        },
+    },
+    'kueue': {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'local_queue_name': {
+                'type': 'string',
+            },
+            # Seconds a launch may wait for queue admission (pods held by
+            # a scheduling gate) before failing; -1 waits indefinitely.
+            'admission_timeout': {
+                'type': 'integer',
+            },
+        },
+    },
+    # Alias of `kueue.local_queue_name`; `quota.queue` takes precedence
+    # when both are set. Permissive so external schedulers (registered
+    # via plugins) can layer their own sub-fields under `quota` without
+    # requiring per-key OSS schema updates; sub-field validation is the
+    # consumer's responsibility.
+    'quota': {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': True,
+        'properties': {
+            'queue': {
+                'type': 'string',
+            },
+        },
+    },
+    'dws': {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'enabled': {
+                'type': 'boolean',
+            },
+            # Only used when Kueue is enabled.
+            'max_run_duration': {
+                'anyOf': [{
+                    'type': 'string',
+                    'pattern': constants.TIME_PATTERN,
+                }, {
+                    'type': 'integer',
+                }]
+            },
+        },
+    },
+    'remote_identity': {
+        'type': 'string',
+    },
+    'post_provision_runcmd': {
+        'type': 'array',
+        'items': {
+            'type': 'string'
+        },
+    },
+    'apt_mirrors': {
+        # List of APT mirror hostnames (or empty list to disable fallback
+        # mirrors entirely) to try in order when installing packages on a
+        # provisioned pod. When unset, SkyPilot uses a built-in default list.
+        'type': 'array',
+        'items': {
+            'type': 'string',
+            'pattern': '^[a-zA-Z0-9.-]+$',
+        },
+    },
+    'set_pod_resource_limits': {
+        # Can be:
+        # - false: do not set limits (default)
+        # - true: set limits equal to requests (multiplier of 1)
+        # - number: set limits to requests * multiplier
+        'oneOf': [{
+            'type': 'boolean',
+        }, {
+            'type': 'number',
+            'minimum': 1,
+        }],
+    },
+    'pricing': _PRICING_SCHEMA,
+    'auto_mounts': {
+        'type': 'array',
+        'items': {
+            'type': 'object',
+            'required': ['volume_name', 'mount_paths'],
+            'additionalProperties': False,
+            'properties': {
+                'volume_name': {
+                    'type': 'string',
+                },
+                'mount_paths': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'string',
+                        'pattern': '^(/|~/|~$)',
+                    },
+                    'minItems': 1,
+                },
+                # Whose launches this auto-mount applies to, mirroring the
+                # personal/workspace/global scopes used by secrets:
+                # - personal: only launches by the volume's owner
+                # - workspace: only launches in the volume's workspace
+                # - global: every launch (default; original behavior)
+                # Values must match volume.AutoMountScope (not imported here
+                # to avoid a circular import).
+                'scope': {
+                    'type': 'string',
+                    'enum': ['personal', 'workspace', 'global'],
+                },
+            },
+        },
+    },
+    'enable_docker': {
+        'oneOf': [
+            # Simple form: enable_docker: true / false
+            {
+                'type': 'boolean'
+            },
+            # Simple form: enable_docker: "ALL" / "BUILD"
+            {
+                'type': 'string',
+                'enum': ['ALL', 'BUILD'],
+            },
+            # Detailed form with optional cache volume.
+            {
+                'type': 'object',
+                'required': ['mode'],
+                'additionalProperties': False,
+                'properties': {
+                    'mode': {
+                        'type': 'string',
+                        'enum': ['ALL', 'BUILD'],
+                    },
+                    # SkyPilot volume name for the Docker/BuildKit cache.
+                    # Omit to use an ephemeral emptyDir volume instead.
+                    'cache_volume': {
+                        'type': 'string',
+                    },
+                },
+            },
+        ],
+    },
+}
+
+_SLURM_USERNAME_MAP_SCHEMA = {
+    'type': 'object',
+    'propertyNames': {
+        'minLength': 1
+    },
+    'additionalProperties': {
+        'type': 'string',
+        'pattern': '^[a-z_][a-z0-9_.+-]*$'
+    }
+}
+
+
+def get_config_schema():
+    # pylint: disable=import-outside-toplevel
+    from sky.server import daemons
+
+    resources_schema = {
+        k: v
+        for k, v in get_resources_schema().items()
+        # Validation may fail if $schema is included.
+        if k != '$schema'
+    }
+    resources_schema['properties'].pop('ports')
+
+    def _get_controller_schema(extra_properties: Optional[Dict[str,
+                                                               Any]] = None,):
+        props: Dict[str, Any] = {
+            'controller': {
+                'type': 'object',
+                'required': [],
+                'additionalProperties': False,
+                'properties': {
+                    'resources': resources_schema,
+                    'high_availability': {
+                        'type': 'boolean',
+                        'default': False,
+                    },
+                    'autostop': _AUTOSTOP_SCHEMA,
+                    'consolidation_mode': {
+                        'type': 'boolean',
+                        # When unset, automatically enabled for deploy-mode
+                        # servers (--deploy) if no existing controller
+                        # clusters are found.
+                    },
+                    'controller_logs_gc_retention_hours': {
+                        'type': 'integer',
+                    },
+                    'task_logs_gc_retention_hours': {
+                        'type': 'integer',
+                    },
+                },
+            },
+            'bucket': {
+                'type': 'string',
+                'pattern': '^(https|s3|gs|r2|cos)://.+',
+                'required': [],
+            },
+            'force_disable_cloud_bucket': {
+                'type': 'boolean',
+                'default': False,
+            },
+        }
+        if extra_properties:
+            props.update(extra_properties)
+        return {
+            'type': 'object',
+            'required': [],
+            'additionalProperties': _allow_additional_properties(),
+            'properties': props,
+        }
+
+    # Budgets bounding how long the managed-job controller tolerates
+    # consecutive failures of its job-status check before treating the job as
+    # unhealthy and recovering it. Recovery is only triggered once *both*
+    # budgets are exhausted; see
+    # sky.jobs.utils.TransientStatusCheckWindow.
+    jobs_status_check_schema = {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'min_elapsed_seconds': {
+                'type': 'number',
+                'minimum': 0,
+            },
+            'min_retries': {
+                'type': 'integer',
+                'minimum': 0,
+            },
+        },
+    }
+
+    cloud_configs = {
+        'aws': {
+            'type': 'object',
+            'required': [],
+            'additionalProperties': False,
+            'properties': {
+                'prioritize_reservations': {
+                    'type': 'boolean',
+                },
+                'specific_reservations': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'string',
+                    },
+                },
+                'disk_encrypted': {
+                    'type': 'boolean',
+                },
+                'ssh_user': {
+                    'type': 'string',
+                },
+                'security_group_name':
+                    (_PROPERTY_NAME_OR_CLUSTER_NAME_TO_PROPERTY),
+                'vpc_name': {
+                    'oneOf': [{
+                        'type': 'string',
+                    }, {
+                        'type': 'null',
+                    }]
+                },
+                'vpc_names': {
+                    'oneOf': [{
+                        'type': 'string',
+                    }, {
+                        'type': 'null',
+                    }, {
+                        'type': 'array',
+                        'items': {
+                            'type': 'string'
+                        }
+                    }],
+                },
+                'subnet_names': {
+                    'oneOf': [{
+                        'type': 'string',
+                    }, {
+                        'type': 'null',
+                    }, {
+                        'type': 'array',
+                        'items': {
+                            'type': 'string'
+                        }
+                    }],
+                },
+                'use_ssm': {
+                    'type': 'boolean',
+                },
+                'post_provision_runcmd': {
+                    'type': 'array',
+                    'items': {
+                        'oneOf': [{
+                            'type': 'string'
+                        }, {
+                            'type': 'array',
+                            'items': {
+                                'type': 'string'
+                            }
+                        }]
+                    },
+                },
+                'enforce_tags': {
+                    'type': 'array',
+                    'uniqueItems': True,
+                    'items': {
+                        'type': 'string',
+                        'case_sensitive_enum': ['instance', 'volume'],
+                    },
+                },
+                **_CAPABILITIES_SCHEMA,
+                **_LABELS_SCHEMA,
+                **_NETWORK_CONFIG_SCHEMA,
+            },
+            **_check_not_both_fields_present('instance_tags', 'labels')
+        },
+        'gcp': {
+            'type': 'object',
+            'required': [],
+            'additionalProperties': False,
+            'properties': {
+                'prioritize_reservations': {
+                    'type': 'boolean',
+                },
+                'specific_reservations': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'string',
+                    },
+                },
+                'managed_instance_group': {
+                    'type': 'object',
+                    'required': ['run_duration'],
+                    'additionalProperties': False,
+                    'properties': {
+                        'run_duration': {
+                            'type': 'integer',
+                        },
+                        'provision_timeout': {
+                            'type': 'integer',
+                        }
+                    }
+                },
+                'force_enable_external_ips': {
+                    'type': 'boolean'
+                },
+                'enable_gvnic': {
+                    'type': 'boolean'
+                },
+                'enable_gpu_direct': {
+                    'type': 'boolean'
+                },
+                'placement_policy': {
+                    'type': 'string',
+                },
+                'vpc_name': {
+                    'oneOf': [
+                        {
+                            'type': 'string',
+                            # vpc-name or project-id/vpc-name
+                            # VPC name and Project ID have -, a-z, and 0-9.
+                            'pattern': '^(?:[-a-z0-9]+/)?[-a-z0-9]+$'
+                        },
+                        {
+                            'type': 'null',
+                        }
+                    ],
+                },
+                'subnet_names': {
+                    'oneOf': [{
+                        'type': 'string',
+                    }, {
+                        'type': 'null',
+                    }, {
+                        'type': 'array',
+                        'items': {
+                            'type': 'string'
+                        }
+                    }],
+                },
+                **_CAPABILITIES_SCHEMA,
+                **_LABELS_SCHEMA,
+                **_NETWORK_CONFIG_SCHEMA,
+            },
+            **_check_not_both_fields_present('instance_tags', 'labels')
+        },
+        'azure': {
+            'type': 'object',
+            'required': [],
+            'additionalProperties': False,
+            'properties': {
+                'storage_account': {
+                    'type': 'string',
+                },
+                'resource_group_vm': {
+                    'type': 'string',
+                },
+                'vpc_name': {
+                    'oneOf': [{
+                        'type': 'string',
+                    }, {
+                        'type': 'null',
+                    }]
+                },
+                **_LABELS_SCHEMA,
+                **_CAPABILITIES_SCHEMA,
+                **_NETWORK_CONFIG_SCHEMA,
+            },
+            **_check_not_both_fields_present('instance_tags', 'labels')
+        },
+        'kubernetes': {
+            'type': 'object',
+            'required': [],
+            # On the server, plugins have registered
+            # their properties via
+            # register_kubernetes_property(), so we
+            # can be strict. On the client we allow
+            # unknown properties to pass through for
+            # server-side validation.
+            'additionalProperties': _allow_additional_properties(),
+            'properties': {
+                'allowed_contexts': {
+                    'oneOf': [{
+                        'type': 'array',
+                        'items': {
+                            'type': 'string',
+                        },
+                    }, {
+                        'type': 'string',
+                        'pattern': '^all$'
+                    }]
+                },
+                'context_configs': {
+                    'type': 'object',
+                    'required': [],
+                    'properties': {},
+                    # Properties are kubernetes context names.
+                    'additionalProperties': {
+                        'type': 'object',
+                        'required': [],
+                        # On the server, plugins have registered
+                        # their properties via
+                        # register_kubernetes_property(), so we
+                        # can be strict. On the client we allow
+                        # unknown properties to pass through for
+                        # server-side validation.
+                        'additionalProperties': _allow_additional_properties(),
+                        'properties': {
+                            **_CONTEXT_CONFIG_SCHEMA_KUBERNETES,
+                            **_extra_kubernetes_properties,
+                        },
+                    },
+                },
+                **_CONTEXT_CONFIG_SCHEMA_KUBERNETES,
+                **_extra_kubernetes_properties,
+            }
+        },
+        'ssh': {
+            'type': 'object',
+            'required': [],
+            'additionalProperties': False,
+            'properties': {
+                'allowed_node_pools': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'string',
+                    },
+                },
+                'context_configs': {
+                    'type': 'object',
+                    'required': [],
+                    'properties': {},
+                    # Properties are ssh cluster names, which are the
+                    # kubernetes context names without `ssh-` prefix.
+                    'additionalProperties': {
+                        'type': 'object',
+                        'required': [],
+                        'additionalProperties': False,
+                        'properties': {
+                            **_CONTEXT_CONFIG_SCHEMA_MINIMAL,
+                        },
+                    },
+                },
+                **_CONTEXT_CONFIG_SCHEMA_MINIMAL,
+            }
+        },
+        'slurm': {
+            'type': 'object',
+            'required': [],
+            # On the server, plugins have registered their properties via
+            # register_slurm_property(), so we can be strict. On the client we
+            # allow unknown properties to pass through for server-side
+            # validation.
+            'additionalProperties': _allow_additional_properties(),
+            'properties': {
+                'allowed_clusters': {
+                    'oneOf': [{
+                        'type': 'array',
+                        'items': {
+                            'type': 'string',
+                        },
+                    }, {
+                        'type': 'string',
+                        'pattern': '^all$'
+                    }]
+                },
+                'provision_timeout': {
+                    'type': 'integer',
+                },
+                'submit_as_user': {
+                    'type': 'boolean',
+                },
+                'username_map': (_SLURM_USERNAME_MAP_SCHEMA),
+                'pricing': _PRICING_SCHEMA,
+                'sbatch_options': _SBATCH_OPTIONS_SCHEMA,
+                'quota': _SLURM_QUOTA_SCHEMA,
+                'gpu_partition_map': _GPU_PARTITION_MAP_SCHEMA,
+                'cpu_partition': {
+                    'type': 'string',
+                },
+                'container_mounts': _CONTAINER_MOUNTS_SCHEMA,
+                # Shared GPU-metrics federation defaults, applied to any
+                # cluster that does not override them under cluster_configs.
+                # The common case: one central Prometheus, reachable through a
+                # single fleet's login node, serving every cluster — set `url`
+                # (and `via`) once here rather than on each cluster, and give
+                # each cluster only its own `prometheus.filter`.
+                'prometheus': {
+                    'type': 'object',
+                    'required': [],
+                    'additionalProperties': False,
+                    'properties': {
+                        'url': {
+                            'type': 'string',
+                        },
+                        'via': {
+                            'type': 'string',
+                        },
+                    },
+                },
+                'cluster_configs': {
+                    'type': 'object',
+                    'required': [],
+                    'properties': {},
+                    'additionalProperties': {
+                        'type': 'object',
+                        'required': [],
+                        # Strict on the server (plugins have registered their
+                        # per-cluster properties via register_slurm_property);
+                        # permissive on the client for server-side validation.
+                        'additionalProperties': _allow_additional_properties(),
+                        'properties': {
+                            'workdir': {
+                                'type': 'string',
+                            },
+                            'tmpdir': {
+                                'type': 'string',
+                            },
+                            'submit_as_user': {
+                                'type': 'boolean',
+                            },
+                            'username_map': (_SLURM_USERNAME_MAP_SCHEMA),
+                            # The Prometheus this cluster's GPU metrics are
+                            # federated from.
+                            'prometheus': {
+                                'type': 'object',
+                                'required': [],
+                                'additionalProperties': False,
+                                'properties': {
+                                    # Reachable from the cluster's login
+                                    # node, scraping the cluster's node/DCGM
+                                    # exporters; opts the cluster into
+                                    # /gpu-metrics federation.
+                                    'url': {
+                                        'type': 'string',
+                                    },
+                                    # Label matchers scoping this cluster's
+                                    # slice of `url`, for a Prometheus that
+                                    # aggregates several fleets. Without them
+                                    # an unscoped DCGM_.* pull attributes
+                                    # every fleet's series to this cluster.
+                                    'filter': {
+                                        'type': 'object',
+                                        'additionalProperties': {
+                                            'type': 'string',
+                                        },
+                                    },
+                                    # Slurm cluster whose login node runs the
+                                    # /federate curl instead of this
+                                    # cluster's own, for a central Prometheus
+                                    # reachable from only some login nodes.
+                                    'via': {
+                                        'type': 'string',
+                                    },
+                                },
+                            },
+                            # Deprecated: superseded by `prometheus.url`,
+                            # kept so deployed configs keep federating.
+                            'prometheus_url': {
+                                'type': 'string',
+                            },
+                            'pricing': _PRICING_SCHEMA,
+                            'sbatch_options': _SBATCH_OPTIONS_SCHEMA,
+                            'quota': _SLURM_QUOTA_SCHEMA,
+                            'gpu_partition_map': _GPU_PARTITION_MAP_SCHEMA,
+                            'cpu_partition': {
+                                'type': 'string',
+                            },
+                            'container_mounts': _CONTAINER_MOUNTS_SCHEMA,
+                            'partition_configs': {
+                                'type': 'object',
+                                'required': [],
+                                'properties': {},
+                                'additionalProperties': {
+                                    'type': 'object',
+                                    'required': [],
+                                    'additionalProperties': False,
+                                    'properties': {
+                                        'pricing': _PRICING_SCHEMA,
+                                        'sbatch_options': _SBATCH_OPTIONS_SCHEMA,  # pylint: disable=line-too-long
+                                        'quota': _SLURM_QUOTA_SCHEMA,
+                                    },
+                                },
+                            },
+                            # Plugin-registered per-cluster slurm properties
+                            # via register_slurm_property().
+                            **_extra_slurm_properties,
+                        },
+                    },
+                },
+                # Plugin-registered top-level slurm properties via
+                # register_slurm_property().
+                **_extra_slurm_properties,
+            }
+        },
+        'oci': {
+            'type': 'object',
+            'required': [],
+            'properties': {
+                'region_configs': {
+                    'type': 'object',
+                    'required': [],
+                    'properties': {},
+                    # Properties are either 'default' or a region
+                    # name.
+                    'additionalProperties': {
+                        'type': 'object',
+                        'required': [],
+                        'additionalProperties': False,
+                        'properties': {
+                            'compartment_ocid': {
+                                'type': 'string',
+                            },
+                            'image_tag_general': {
+                                'type': 'string',
+                            },
+                            'image_tag_gpu': {
+                                'type': 'string',
+                            },
+                            'vcn_ocid': {
+                                'type': 'string',
+                            },
+                            'vcn_subnet': {
+                                'type': 'string',
+                            },
+                        }
+                    },
+                }
+            },
+        },
+        'vast': {
+            'type': 'object',
+            'required': [],
+            'additionalProperties': False,
+            'properties': {
+                'datacenter_only': {
+                    'type': 'boolean',
+                },
+                'create_instance_kwargs': {
+                    'type': 'object',
+                },
+            }
+        },
+        'nebius': {
+            'type': 'object',
+            'required': [],
+            'properties': {
+                **_NETWORK_CONFIG_SCHEMA, 'use_static_ip_address': {
+                    'type': 'boolean',
+                },
+                'disk_encrypted': {
+                    'type': 'boolean',
+                },
+                'tenant_id': {
+                    'type': 'string',
+                },
+                'domain': {
+                    'type': 'string',
+                },
+                'use_personal_pricing': {
+                    'type': 'boolean',
+                },
+                'security_group_name':
+                    (_PROPERTY_NAME_OR_CLUSTER_NAME_TO_PROPERTY),
+                'region_configs': {
+                    'type': 'object',
+                    'required': [],
+                    'properties': {},
+                    'additionalProperties': {
+                        'type': 'object',
+                        'required': [],
+                        'additionalProperties': False,
+                        'properties': {
+                            'project_id': {
+                                'type': 'string',
+                            },
+                            'subnet_id': {
+                                'type': 'string',
+                            },
+                            'fabric': {
+                                'type': 'string',
+                            },
+                            'disk_encrypted': {
+                                'type': 'boolean',
+                            },
+                            'filesystems': {
+                                'type': 'array',
+                                'items': {
+                                    'type': 'object',
+                                    'additionalProperties': False,
+                                    'properties': {
+                                        'filesystem_id': {
+                                            'type': 'string',
+                                        },
+                                        'attach_mode': {
+                                            'type': 'string',
+                                            'case_sensitive_enum': [
+                                                'READ_WRITE', 'READ_ONLY'
+                                            ]
+                                        },
+                                        'mount_path': {
+                                            'type': 'string',
+                                        }
+                                    }
+                                }
+                            },
+                        },
+                    }
+                }
+            },
+        }
+    }
+
+    admin_policy_schema = {
+        'type': 'string',
+        'anyOf': [
+            {
+                # Check regex to be a valid python module path
+                'pattern': (r'^[a-zA-Z_][a-zA-Z0-9_]*'
+                            r'(\.[a-zA-Z_][a-zA-Z0-9_]*)+$'),
+            },
+            {
+                # Check for valid HTTP/HTTPS URL
+                'pattern': r'^https?://.*$',
+            }
+        ]
+    }
+
+    allowed_clouds = {
+        # A list of cloud names that are allowed to be used
+        'type': 'array',
+        'items': {
+            'type': 'string',
+            'case_insensitive_enum':
+                (list(constants.ALL_CLOUDS) + constants.STORAGE_ONLY_CLOUDS)
+        }
+    }
+
+    docker_configs = {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'run_options': {
+                'anyOf': [{
+                    'type': 'string',
+                }, {
+                    'type': 'array',
+                    'items': {
+                        'type': 'string',
+                    }
+                }]
+            }
+        }
+    }
+    gpu_configs = {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'disable_ecc': {
+                'type': 'boolean',
+            },
+        }
+    }
+
+    daemon_config = {
+        'type': 'object',
+        'required': [],
+        'properties': {
+            'log_level': {
+                'type': 'string',
+                'case_insensitive_enum': ['DEBUG', 'INFO', 'WARNING'],
+            },
+            # Only honored by daemons that opt in to reading this; see the
+            # per-daemon event functions in sky/server/daemons.py for support.
+            'interval_seconds': {
+                'type': 'integer',
+                'minimum': 1,
+            },
+        }
+    }
+
+    daemon_schema: Dict[str, Any] = {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {}
+    }
+
+    for daemon in daemons.INTERNAL_REQUEST_DAEMONS:
+        daemon_schema['properties'][daemon.id] = daemon_config
+
+    api_server = {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'endpoint': {
+                'type': 'string',
+                # Apply validation for URL
+                'pattern': r'^https?://.*$',
+            },
+            'service_account_token': {
+                'anyOf': [
+                    {
+                        'type': 'string',
+                        # Validate that token starts with sky_ prefix
+                        'pattern': r'^sky_.+$',
+                    },
+                    {
+                        'type': 'null',
+                    }
+                ]
+            },
+            'requests_retention_hours': {
+                'type': 'integer',
+            },
+            'logs_retention_hours': {
+                'type': 'integer',
+            },
+            'cluster_event_retention_hours': {
+                'type': 'number',
+            },
+            'cluster_debug_event_retention_hours': {
+                'type': 'number',
+            },
+            'cluster_terminal_event_retention_hours': {
+                'type': 'number',
+            },
+            'launch_attempt_retention_hours': {
+                'type': 'number',
+            },
+            'daemon_log_max_bytes': {
+                'type': 'integer',
+                'minimum': 0,
+            },
+        }
+    }
+
+    rbac_schema = {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'default_role': {
+                'type': 'string',
+                'case_insensitive_enum': ['admin', 'user', 'viewer']
+            },
+            # When true, GET /workspaces/config is restricted to admins (the
+            # config payload includes admin-only secrets). Defaults to true.
+            'restrict_config_to_admins': {
+                'type': 'boolean',
+            },
+            # Per-role permission overrides. Schema is intentionally
+            # permissive (additionalProperties: True on
+            # `permissions`) because admin/user use `blocklist`
+            # entries while `viewer` uses `allowlist`; both shapes
+            # are `[{path, method}, ...]`.
+            'roles': {
+                'type': 'object',
+                'additionalProperties': {
+                    'type': 'object',
+                    'properties': {
+                        'permissions': {
+                            'type': 'object',
+                            'additionalProperties': True,
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+    workspace_schema = {'type': 'string'}
+
+    allowed_workspace_cloud_names = list(
+        constants.ALL_CLOUDS) + constants.STORAGE_ONLY_CLOUDS
+    # Create pattern for not supported clouds, i.e. all clouds except aws,
+    # gcp, kubernetes, ssh, nebius, slurm.
+    not_supported_clouds = [
+        cloud for cloud in allowed_workspace_cloud_names if cloud.lower() not in
+        ['aws', 'gcp', 'kubernetes', 'ssh', 'nebius', 'slurm']
+    ]
+    not_supported_cloud_regex = '|'.join(not_supported_clouds)
+    slurm_allowed_clusters_schema = cloud_configs['slurm']['properties'][
+        'allowed_clusters']
+    workspaces_schema = {
+        'type': 'object',
+        'required': [],
+        # each key is a workspace name
+        'additionalProperties': {
+            'type': 'object',
+            'additionalProperties': False,
+            'patternProperties': {
+                # Pattern for clouds with no workspace-specific config -
+                # only allow 'disabled' property.
+                f'^({not_supported_cloud_regex})$': {
+                    'type': 'object',
+                    'additionalProperties': False,
+                    'properties': {
+                        'disabled': {
+                            'type': 'boolean'
+                        }
+                    },
+                },
+            },
+            'properties': {
+                # Explicit definition for GCP allows both project_id and
+                # disabled
+                'private': {
+                    'type': 'boolean',
+                },
+                'allowed_users': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'string',
+                    },
+                },
+                # Who may read a (private) workspace. 'allowed_users'
+                # (default): only the workspace's allowed users (members)
+                # and admins can see it; it is hidden from everyone else.
+                # 'all': anyone can see the workspace and its clusters/jobs, but
+                # writes stay members-only, so non-members get read-only access.
+                # Only meaningful for private workspaces; an open (non-private)
+                # workspace is usable by everyone regardless.
+                'read_access': {
+                    'type': 'string',
+                    'enum': ['allowed_users', 'all'],
+                },
+                'gcp': {
+                    'type': 'object',
+                    'properties': {
+                        'project_id': {
+                            'type': 'string'
+                        },
+                        'disabled': {
+                            'type': 'boolean'
+                        },
+                        **_CAPABILITIES_SCHEMA,
+                        **_REMOTE_IDENTITY_SCHEMA,
+                    },
+                    'additionalProperties': False,
+                },
+                'aws': {
+                    'type': 'object',
+                    'properties': {
+                        'profile': {
+                            'type': 'string'
+                        },
+                        'disabled': {
+                            'type': 'boolean'
+                        },
+                        **_CAPABILITIES_SCHEMA,
+                        'remote_identity':
+                            (_PROPERTY_NAME_OR_CLUSTER_NAME_TO_PROPERTY),
+                    },
+                    'additionalProperties': False,
+                },
+                'ssh': {
+                    'type': 'object',
+                    'required': [],
+                    'properties': {
+                        'allowed_node_pools': {
+                            'type': 'array',
+                            'items': {
+                                'type': 'string',
+                            },
+                        },
+                        'disabled': {
+                            'type': 'boolean'
+                        },
+                    },
+                    'additionalProperties': False,
+                },
+                'kubernetes': {
+                    'type': 'object',
+                    'required': [],
+                    'properties': {
+                        'allowed_contexts': {
+                            'oneOf': [{
+                                'type': 'array',
+                                'items': {
+                                    'type': 'string',
+                                },
+                            }, {
+                                'type': 'string',
+                                'pattern': '^all$'
+                            }]
+                        },
+                        'disabled': {
+                            'type': 'boolean'
+                        },
+                        'namespace': {
+                            'type': 'string',
+                        },
+                        'kueue': {
+                            'type': 'object',
+                            'required': [],
+                            'additionalProperties': False,
+                            'properties': {
+                                'local_queue_name': {
+                                    'type': 'string',
+                                },
+                                'admission_timeout': {
+                                    'type': 'integer',
+                                },
+                            },
+                        },
+                        'quota': {
+                            'type': 'object',
+                            'required': [],
+                            # Permissive — see the per-context quota block
+                            # below; mirrors that policy at the workspace
+                            # cloud level.
+                            'additionalProperties': True,
+                            'properties': {
+                                'queue': {
+                                    'type': 'string',
+                                },
+                            },
+                        },
+                        'context_configs': {
+                            'type': 'object',
+                            'required': [],
+                            'properties': {},
+                            # Properties are kubernetes context names.
+                            'additionalProperties': {
+                                'type': 'object',
+                                'required': [],
+                                # On the server, plugins have registered
+                                # their properties via
+                                # register_kubernetes_property(), so we
+                                # can be strict. On the client we allow
+                                # unknown properties to pass through for
+                                # server-side validation.
+                                'additionalProperties':
+                                    _allow_additional_properties(),
+                                'properties': {
+                                    'namespace': {
+                                        'type': 'string',
+                                    },
+                                    'kueue': {
+                                        'type': 'object',
+                                        'required': [],
+                                        'additionalProperties': False,
+                                        'properties': {
+                                            'local_queue_name': {
+                                                'type': 'string',
+                                            },
+                                        },
+                                    },
+                                    'quota': {
+                                        'type': 'object',
+                                        'required': [],
+                                        # Permissive — see the per-context
+                                        # quota block under
+                                        # _CONTEXT_CONFIG_SCHEMA_KUBERNETES.
+                                        'additionalProperties': True,
+                                        'properties': {
+                                            'queue': {
+                                                'type': 'string',
+                                            },
+                                        },
+                                    },
+                                    **_extra_kubernetes_properties,
+                                    **_REMOTE_IDENTITY_SCHEMA_KUBERNETES,
+                                },
+                            },
+                        },
+                        **_extra_kubernetes_properties,
+                        **_REMOTE_IDENTITY_SCHEMA_KUBERNETES,
+                    },
+                    # On the server, plugins have registered
+                    # their properties via
+                    # register_kubernetes_property(), so we
+                    # can be strict. On the client we allow
+                    # unknown properties to pass through for
+                    # server-side validation.
+                    'additionalProperties': _allow_additional_properties(),
+                },
+                'slurm': {
+                    'type': 'object',
+                    'required': [],
+                    'additionalProperties': False,
+                    'properties': {
+                        'disabled': {
+                            'type': 'boolean'
+                        },
+                        'allowed_clusters': slurm_allowed_clusters_schema,
+                        'sbatch_options': _SBATCH_OPTIONS_SCHEMA,
+                        'quota': _SLURM_QUOTA_SCHEMA,
+                        'cluster_configs': {
+                            'type': 'object',
+                            'required': [],
+                            'properties': {},
+                            'additionalProperties': {
+                                'type': 'object',
+                                'required': [],
+                                'additionalProperties': False,
+                                'properties': {
+                                    'sbatch_options': _SBATCH_OPTIONS_SCHEMA,
+                                    'quota': _SLURM_QUOTA_SCHEMA,
+                                    'partition_configs': {
+                                        'type': 'object',
+                                        'required': [],
+                                        'properties': {},
+                                        'additionalProperties': {
+                                            'type': 'object',
+                                            'required': [],
+                                            'additionalProperties': False,
+                                            'properties': {
+                                                'sbatch_options': _SBATCH_OPTIONS_SCHEMA,  # pylint: disable=line-too-long
+                                                'quota': _SLURM_QUOTA_SCHEMA,
+                                            },
+                                        },
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+                'nebius': {
+                    'type': 'object',
+                    'required': [],
+                    'properties': {
+                        'credentials_file_path': {
+                            'type': 'string',
+                        },
+                        'tenant_id': {
+                            'type': 'string',
+                        },
+                        'domain': {
+                            'type': 'string',
+                        },
+                        'disabled': {
+                            'type': 'boolean'
+                        },
+                    },
+                    'additionalProperties': False,
+                },
+            },
+        },
+    }
+
+    provision_configs = {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'ssh_timeout': {
+                'type': 'integer',
+                'minimum': 1,
+            },
+            'install_conda': {
+                'type': 'boolean',
+            },
+        }
+    }
+
+    logs_schema = {
+        'type': 'object',
+        'required': ['store'],
+        'additionalProperties': False,
+        'properties': {
+            'store': {
+                'type': 'string',
+                'case_insensitive_enum': ['gcp', 'aws'],
+            },
+            'gcp': {
+                'type': 'object',
+                'properties': {
+                    'project_id': {
+                        'type': 'string',
+                    },
+                    'credentials_file': {
+                        'type': 'string',
+                    },
+                    'additional_labels': {
+                        'type': 'object',
+                        'additionalProperties': {
+                            'type': 'string',
+                        },
+                    },
+                },
+            },
+            'aws': {
+                'type': 'object',
+                'properties': {
+                    'region': {
+                        'type': 'string',
+                    },
+                    'credentials_file': {
+                        'type': 'string',
+                    },
+                    'log_group_name': {
+                        'type': 'string',
+                    },
+                    'log_stream_prefix': {
+                        'type': 'string',
+                    },
+                    'auto_create_group': {
+                        'type': 'boolean',
+                    },
+                    'additional_tags': {
+                        'type': 'object',
+                        'additionalProperties': {
+                            'type': 'string',
+                        },
+                    },
+                },
+            },
+        },
+    }
+
+    for cloud, config in cloud_configs.items():
+        if cloud in ('aws', 'azure'):
+            config['properties'].update(
+                {'remote_identity': _PROPERTY_NAME_OR_CLUSTER_NAME_TO_PROPERTY})
+        elif cloud == 'kubernetes':
+            config['properties'].update(_REMOTE_IDENTITY_SCHEMA_KUBERNETES)
+        else:
+            config['properties'].update(_REMOTE_IDENTITY_SCHEMA)
+
+    # TODO (kyuds): deprecated; remove v0.13.0
+    data_schema = {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'mount_cached': {
+                'type': 'object',
+                'required': [],
+                'additionalProperties': False,
+                'properties': {
+                    'sequential_upload': {
+                        'type': 'boolean',
+                    },
+                },
+            },
+        },
+    }
+
+    metrics_schema = {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            # The Prometheus deployment that /gpu-metrics federates from
+            # in each context. Defaults match the SkyPilot Helm chart
+            # (service `skypilot-prometheus-server` in namespace
+            # `skypilot`, port 80).
+            'prometheus': {
+                'type': 'object',
+                'required': [],
+                'additionalProperties': False,
+                'properties': {
+                    'namespace': {
+                        'type': 'string',
+                    },
+                    'service': {
+                        'type': 'string',
+                    },
+                    'port': {
+                        'type': 'integer',
+                        'minimum': 1,
+                        'maximum': 65535,
+                    },
+                },
+            },
+        },
+    }
+
+    dashboard_schema = {
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            'external_links': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'required': ['label'],
+                    'additionalProperties': False,
+                    'properties': {
+                        'label': {
+                            'type': 'string',
+                            'minLength': 1,
+                        },
+                        'regex': {
+                            'type': 'string',
+                            'minLength': 1,
+                        },
+                        'url': {
+                            'type': 'string',
+                            'minLength': 1,
+                        },
+                        # Pages the link may appear on. Omitted means all
+                        # pages (subject to template-variable resolution).
+                        'scope': {
+                            'type': 'array',
+                            'minItems': 1,
+                            'uniqueItems': True,
+                            'items': {
+                                'type': 'string',
+                                'enum': list(DASHBOARD_EXTERNAL_LINK_SCOPES),
+                            },
+                        },
+                    },
+                    # Each entry is either a log-scanning pattern (regex) or
+                    # a templated link (url), never both.
+                    'oneOf': [
+                        {
+                            'required': ['regex']
+                        },
+                        {
+                            'required': ['url']
+                        },
+                    ],
+                },
+            },
+        },
+    }
+
+    return {
+        '$schema': 'https://json-schema.org/draft/2020-12/schema',
+        'type': 'object',
+        'required': [],
+        'additionalProperties': False,
+        'properties': {
+            # TODO Replace this with whatever syang cooks up
+            'workspace': {
+                'type': 'string',
+            },
+            'db': {
+                'type': 'string',
+            },
+            'jobs': _get_controller_schema(extra_properties={
+                'status_check': jobs_status_check_schema,
+                **_extra_jobs_properties,
+            },),
+            'serve': _get_controller_schema(),
+            'allowed_clouds': allowed_clouds,
+            'admin_policy': admin_policy_schema,
+            'docker': docker_configs,
+            'nvidia_gpus': gpu_configs,
+            'api_server': api_server,
+            'active_workspace': workspace_schema,
+            'workspaces': workspaces_schema,
+            # Org-wide defaults applied to every workspace unless the
+            # workspace overrides them under `workspaces.<name>`.
+            'workspace_config': {
+                'type': 'object',
+                'required': [],
+                'additionalProperties': False,
+                'properties': {
+                    # Default read access for private workspaces. A
+                    # per-workspace `read_access` overrides this.
+                    'read_access': {
+                        'type': 'string',
+                        'enum': ['allowed_users', 'all'],
+                    },
+                },
+            },
+            'provision': provision_configs,
+            'rbac': rbac_schema,
+            'logs': logs_schema,
+            'daemons': daemon_schema,
+            'data': data_schema,
+            'dashboard': dashboard_schema,
+            'metrics': metrics_schema,
+            **cloud_configs,
+            # For plugin-specific config.
+            'plugins': {
+                'type': 'object',
+                'required': [],
+                # Allow unknown properties since a plugin can be turned off
+                # and the previously valid config should not block server
+                # from reading the config file.
+                'additionalProperties': True,
+                'properties': _extra_plugin_properties,
+            },
+        },
+    }

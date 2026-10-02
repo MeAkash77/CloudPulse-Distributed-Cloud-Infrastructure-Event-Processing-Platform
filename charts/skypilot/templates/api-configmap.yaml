@@ -1,0 +1,13 @@
+{{- $fullName := include "skypilot.fullname" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullName }}-config
+  namespace: {{ .Release.Namespace }}
+data:
+  config.yaml: |-
+    {{- if .Values.apiService.config }}
+    {{- .Values.apiService.config | nindent 4 }}
+    {{- else }}
+    {}
+    {{- end }}

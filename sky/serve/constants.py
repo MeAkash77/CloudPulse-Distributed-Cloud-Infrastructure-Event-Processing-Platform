@@ -1,0 +1,133 @@
+"""Constants used for SkyServe."""
+
+CONTROLLER_TEMPLATE = 'sky-serve-controller.yaml.j2'
+
+SKYSERVE_METADATA_DIR = '~/.sky/serve'
+
+# The filelock for selecting service ports when starting a service. Two
+# requirements:
+#  (1) Same-pod sky.serve.service subprocesses must serialize so they don't
+#      both pick the same just-freed port between their respective
+#      `find_free_port` and the controller subprocess actually `bind()`-ing.
+#  (2) The lock must NOT live on a network filesystem. fcntl/flock over NFS
+#      requires a working NLM server (rpc.statd/lockd); many K8s NFS PVC
+#      setups mount with `local_lock=none` and the server has no lockd, so
+#      flock silently becomes a no-op — multiple processes "acquire" the
+#      lock simultaneously and race anyway.
+PORT_SELECTION_FILE_LOCK_PATH = '~/.sky/skyserve_port_selection.lock'
+
+# Signal file path for controller to handle signals.
+SIGNAL_FILE_PATH = '~/.sky/signals/sky_serve_controller_signal_{}'
+
+# The consolidation mode lock ensures that if multiple API servers are running
+# at the same time (e.g. during a rolling update), recovery can only happen once
+# the previous API server has exited.
+POOL_CONSOLIDATION_MODE_LOCK_ID = '~/.sky/pool_consolidation_mode_lock'
+SERVE_CONSOLIDATION_MODE_LOCK_ID = '~/.sky/serve_consolidation_mode_lock'
+
+# Time to wait in seconds for controller to setup, this involves the time to run
+# cloud dependencies installation.
+CONTROLLER_SETUP_TIMEOUT_SECONDS = 300
+# Time to wait in seconds for service to register on the controller.
+SERVICE_REGISTER_TIMEOUT_SECONDS = 60
+
+# The time interval in seconds for load balancer to sync with controller. Every
+# time the load balancer syncs with controller, it will update all available
+# replica ips for each service, also send the number of requests in last query
+# interval.
+LB_CONTROLLER_SYNC_INTERVAL_SECONDS = 20
+
+# The maximum retry times for load balancer for each request. After changing to
+# proxy implementation, we do retry for failed requests.
+# TODO(tian): Expose this option to users in yaml file.
+LB_MAX_RETRY = 3
+
+# The timeout in seconds for load balancer to wait for a response from replica.
+# Large LLMs like Llama2-70b is able to process the request within ~30 seconds.
+# We set the timeout to 120s to be safe. For reference, FastChat uses 100s:
+# https://github.com/lm-sys/FastChat/blob/f2e6ca964af7ad0585cadcf16ab98e57297e2133/fastchat/constants.py#L39 # pylint: disable=line-too-long
+DEFAULT_LB_STREAM_TIMEOUT = 120
+
+# Default interval in seconds to probe replica endpoint.
+DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS = 10
+# Backward compatibility alias.
+ENDPOINT_PROBE_INTERVAL_SECONDS = DEFAULT_ENDPOINT_PROBE_INTERVAL_SECONDS
+
+# The default timeout in seconds for a readiness probe request. We set the
+# timeout to 15s since using actual generation in LLM services as readiness
+# probe is very time-consuming (33B, 70B, ...).
+DEFAULT_READINESS_PROBE_TIMEOUT_SECONDS = 15
+
+# Autoscaler window size in seconds for query per second. We calculate qps by
+# divide the number of queries in last window size by this window size.
+AUTOSCALER_QPS_WINDOW_SIZE_SECONDS = 60
+# Autoscaler scale decision interval in seconds.
+# We will try to scale up/down every `decision_interval`.
+AUTOSCALER_DEFAULT_DECISION_INTERVAL_SECONDS = 20
+# Autoscaler no replica decision interval in seconds.
+AUTOSCALER_NO_REPLICA_DECISION_INTERVAL_SECONDS = 5
+# Autoscaler default upscale delays in seconds.
+# We will upscale only if the target number of instances
+# is larger than the current launched instances for delay amount of time.
+AUTOSCALER_DEFAULT_UPSCALE_DELAY_SECONDS = 300
+# Autoscaler default downscale delays in seconds.
+# We will downscale only if the target number of instances
+# is smaller than the current launched instances for delay amount of time.
+AUTOSCALER_DEFAULT_DOWNSCALE_DELAY_SECONDS = 1200
+# Default queue length threshold for pool autoscaling.
+# When max_workers is set but queue_length_threshold is not specified,
+# this default threshold will be used.
+AUTOSCALER_DEFAULT_QUEUE_LENGTH_THRESHOLD = 1
+# The default controller resources. We use default 257 GB disk space to
+# enable using Azure as controller, since its default image size is 150 GB.
+# TODO(tian): We might need to be careful that service logs can take a lot of
+# disk space. Maybe we could use a larger disk size, migrate to cloud storage or
+# do some log rotation.
+# Set default minimal memory to 8GB to allow at least one service to run.
+CONTROLLER_RESOURCES = {'cpus': '4+', 'memory': '8+'}
+# Autostop config for the jobs controller. These are the default values for
+# serve.controller.autostop in ~/.sky/config.yaml.
+CONTROLLER_AUTOSTOP = {
+    'idle_minutes': 10,
+    'down': False,
+}
+
+# A period of time to initialize your service. Any readiness probe failures
+# during this period will be ignored.
+DEFAULT_INITIAL_DELAY_SECONDS = 1200
+DEFAULT_MIN_REPLICAS = 1
+
+# Default port range start for controller and load balancer. Ports will be
+# automatically generated from this start port.
+CONTROLLER_PORT_START = 20001
+LOAD_BALANCER_PORT_START = 30001
+LOAD_BALANCER_PORT_RANGE = '30001-30020'
+
+# Initial version of service.
+INITIAL_VERSION = 1
+
+# Replica ID environment variable name that can be accessed on the replica.
+REPLICA_ID_ENV_VAR = 'SKYPILOT_SERVE_REPLICA_ID'
+
+# The version of the lib files that serve use. Whenever there is an API
+# change for the serve_utils.ServeCodeGen, we need to bump this version, so that
+# the user can be notified to update their SkyPilot serve version on the remote
+# cluster.
+# Changelog:
+# v1.0 - Introduce rolling update.
+# v2.0 - Added template-replica feature.
+# v3.0 - Added pool.
+# v4.0 - Added pool argument to wait_service_registration.
+# v5.0 - Added pool argument to stream_serve_process_logs & stream_replica_logs.
+SERVE_VERSION = 5
+
+TERMINATE_REPLICA_VERSION_MISMATCH_ERROR = (
+    'The version of service is outdated and does not support manually '
+    'terminating replicas. Please terminate the service and spin up again.')
+
+# Dummy run command for pool.
+POOL_DUMMY_RUN_COMMAND = 'echo "setup done"'
+
+# Error message prefix for max number of services reached.
+# This is used as a marker to detect the error in controller logs.
+MAX_NUMBER_OF_SERVICES_REACHED_ERROR = 'Max number of services reached'

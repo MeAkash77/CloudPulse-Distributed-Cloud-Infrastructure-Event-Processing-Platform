@@ -1,0 +1,15 @@
+config:
+  kubernetes:
+    pod_config:
+      spec:
+        securityContext:
+          fsGroup: 1000
+          fsGroupChangePolicy: OnRootMismatch
+        volumes:
+        - name: test-volume
+          persistentVolumeClaim:
+            claimName: {{ pvc_name }}
+        containers:
+        - volumeMounts:
+          - name: test-volume
+            mountPath: /mnt/test-data

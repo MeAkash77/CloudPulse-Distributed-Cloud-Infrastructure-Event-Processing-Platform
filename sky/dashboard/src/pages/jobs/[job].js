@@ -1,0 +1,2289 @@
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useMemo,
+  useCallback,
+} from 'react';
+import { CircularProgress } from '@mui/material';
+import { useRouter } from 'next/router';
+import { Card } from '@/components/ui/card';
+import {
+  Table,
+  TableHeader,
+  TableRow,
+  TableHead,
+  TableBody,
+  TableCell,
+} from '@/components/ui/table';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  useSingleManagedJob,
+  getPoolStatus,
+  computeJobGroupStatus,
+} from '@/data/connectors/jobs';
+import Link from 'next/link';
+import {
+  RotateCwIcon,
+  ChevronDownIcon,
+  ChevronRightIcon,
+  CopyIcon,
+  CheckIcon,
+  Download,
+} from 'lucide-react';
+import {
+  CustomTooltip as Tooltip,
+  formatFullTimestamp,
+  formatDuration,
+  renderPoolLink,
+  extractNodeTypes,
+} from '@/components/utils';
+import { LogFilter } from '@/components/utils';
+import {
+  streamManagedJobLogs,
+  downloadManagedJobLogs,
+} from '@/data/connectors/jobs';
+import { StatusBadge } from '@/components/elements/StatusBadge';
+import { DynamicBadge } from '@/components/elements/DynamicBadge';
+import { PrimaryBadge } from '@/components/elements/PrimaryBadge';
+import { BatchBadge } from '@/components/elements/BatchBadge';
+import { useMobile } from '@/hooks/useMobile';
+import Head from 'next/head';
+import { NonCapitalizedTooltip } from '@/components/utils';
+import { formatJobYaml } from '@/lib/yamlUtils';
+import { UserDisplay } from '@/components/elements/UserDisplay';
+import { YamlCodeBlock } from '@/components/ui/yaml-code-block';
+import dashboardCache from '@/lib/cache';
+import { PluginSlot } from '@/plugins/PluginSlot';
+import { usePluginComponents } from '@/plugins/PluginProvider';
+import { checkGrafanaAvailability } from '@/utils/grafana';
+import {
+  LINK_SCOPE_JOBS,
+  normalizeUrl,
+  useLogLinkExtractor,
+  useScopedLinks,
+  useTemplateLinks,
+} from '@/utils/externalLinks';
+import { TelemetrySection } from '@/components/TelemetrySection';
+import { hasAccelerator } from '@/utils/gpuUtils';
+import { useLogStreamer } from '@/hooks/useLogStreamer';
+import PropTypes from 'prop-types';
+
+function JobDetails({
+  overrideJobId = null,
+  taskContext = null,
+  preloaded = null,
+  onRefresh = null,
+} = {}) {
+  // `taskContext` is set when this page renders a dynamic task under its
+  // group's URL (/jobs/<root>/<index>, see [task].js): the job shown is
+  // `overrideJobId`, and the header reads as task <index> of the root.
+  const router = useRouter();
+  const { job: routeJobId, tab } = router.query;
+  const jobId = overrideJobId ?? routeJobId;
+  const [refreshTrigger, setRefreshTrigger] = useState(0);
+  // The job's rows and, from the same fetch, the rows of the jobs launched
+  // from inside it (dynamic job group members). A dynamic task's page gets
+  // its rows preloaded from the group's tree ([task].js) and fetches nothing.
+  const {
+    jobData,
+    loading,
+    members: treeMemberRows,
+  } = useSingleManagedJob(jobId, refreshTrigger, { preloaded });
+  // A dynamic task is addressed as task <index> of its group: /jobs/67 for
+  // task 2 of group 66 becomes /jobs/66/2 (the URL matches the `66-2` the
+  // CLI takes). The page content is the same job's.
+  useEffect(() => {
+    if (taskContext || overrideJobId) return;
+    const row = jobData?.jobs?.find((j) => String(j.id) === String(jobId));
+    if (row && row.root_job_id != null && row.dynamic_task_index != null) {
+      router.replace(
+        `/jobs/${row.root_job_id}/${row.dynamic_task_index}${tab ? `?tab=${tab}` : ''}`
+      );
+    }
+  }, [jobData, jobId, taskContext, overrideJobId, router, tab]);
+  // Jobs launched from inside this job (dynamic job group members), one
+  // entry per job with its rows, in submission order.
+  const launchedJobs = useMemo(() => {
+    const byJob = new Map();
+    treeMemberRows.forEach((row) => {
+      if (!byJob.has(row.id)) {
+        byJob.set(row.id, []);
+      }
+      byJob.get(row.id).push(row);
+    });
+    const jobs = Array.from(byJob.entries()).map(([id, rows]) => ({
+      id,
+      rows,
+      name: rows[0].name,
+      user: rows[0].user,
+      parent_job_id: rows[0].parent_job_id,
+      parent_task_id: rows[0].parent_task_id,
+      dynamic_task_index: rows[0].dynamic_task_index,
+      status: rows.length > 1 ? computeJobGroupStatus(rows) : rows[0].status,
+      job_duration: rows.reduce((sum, r) => sum + (r.job_duration || 0), 0),
+      infra: rows[0].infra,
+      full_infra: rows[0].full_infra,
+      cloud: rows[0].cloud,
+      requested_resources: rows[0].requested_resources,
+      resources_str: rows[0].resources_str,
+      resources_str_full: rows[0].resources_str_full,
+      recoveries: rows.reduce((sum, r) => sum + (r.recoveries || 0), 0),
+    }));
+    // In the order the jobs table shows them: by dynamic task index, else
+    // by job id (launch order).
+    const orderKey = (j) =>
+      j.dynamic_task_index != null
+        ? Number(j.dynamic_task_index)
+        : Number(j.id);
+    jobs.sort((a, b) => orderKey(a) - orderKey(b));
+    return jobs;
+  }, [treeMemberRows]);
+  const [poolsData, setPoolsData] = useState([]);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isInitialLoad, setIsInitialLoad] = useState(true);
+  const [isLoadingLogs, setIsLoadingLogs] = useState(false);
+  const [isLoadingControllerLogs, setIsLoadingControllerLogs] = useState(false);
+  const [scrollExecuted, setScrollExecuted] = useState(false);
+  const [pageLoaded, setPageLoaded] = useState(false);
+  const [domReady, setDomReady] = useState(false);
+  const [refreshLogsFlag, setRefreshLogsFlag] = useState(0);
+  const [refreshControllerLogsFlag, setRefreshControllerLogsFlag] = useState(0);
+  const [selectedTaskIndex, setSelectedTaskIndex] = useState(0);
+  // The Logs selector also offers the dynamic tasks; their logs live on
+  // their own managed job, so a selected one streams that job instead of a
+  // task index of this one.
+  const [selectedDynamicJob, setSelectedDynamicJob] = useState(null);
+  const [selectedNode, setSelectedNode] = useState('all');
+  const [logNodes, setLogNodes] = useState([]);
+  // If a plugin owns the logs slot, the OSS "(Logs are not streaming;
+  // click refresh ...)" hint is misleading — the plugin's component
+  // streams live. Hide it. (ControllerLogsSection makes the same check
+  // independently for the controller-logs heading.)
+  const logsSlotHasPlugin = usePluginComponents('jobs.detail.logs').length > 0;
+  const [logExtractedLinks, setLogExtractedLinks] = useState({});
+  // Track download-in-flight per kind ('logs' / 'controller' / per-task)
+  // so we can disable the button + spin the icon while the zip is being
+  // assembled on the server. Without feedback, users click and assume
+  // nothing is happening because the browser only shows the file in the
+  // download bar a second or two later.
+  const [logsDownloading, setLogsDownloading] = useState(false);
+  const downloadLogsZip = async () => {
+    if (logsDownloading) return;
+    setLogsDownloading(true);
+    try {
+      const detail = jobData?.jobs?.find((j) => String(j.id) === String(jobId));
+      await downloadManagedJobLogs({
+        jobId: parseInt(Array.isArray(jobId) ? jobId[0] : jobId),
+        controller: false,
+        jobStatus: detail?.status,
+      });
+    } finally {
+      setLogsDownloading(false);
+    }
+  };
+  const isMobile = useMobile();
+
+  // Telemetry state
+  const [isGrafanaAvailable, setIsGrafanaAvailable] = useState(false);
+  // Telemetry task selection for job groups
+  const [telemetryTaskIndex, setTelemetryTaskIndex] = useState(0);
+  const TELEMETRY_EXPANDED_KEY = 'skypilot-jobs-telemetry-expanded';
+
+  // Update isInitialLoad when data is first loaded
+  React.useEffect(() => {
+    if (!loading && isInitialLoad) {
+      setIsInitialLoad(false);
+    }
+  }, [loading, isInitialLoad]);
+
+  // Fetch pools data for hash comparison
+  useEffect(() => {
+    async function fetchPoolsData() {
+      try {
+        const poolsResponse = await dashboardCache.get(getPoolStatus, [{}]);
+        setPoolsData(poolsResponse.pools || []);
+      } catch (error) {
+        console.error('Error fetching pools data:', error);
+        setPoolsData([]);
+      }
+    }
+    fetchPoolsData();
+  }, []);
+
+  // Check Grafana availability on mount
+  useEffect(() => {
+    const checkGrafana = async () => {
+      const available = await checkGrafanaAvailability();
+      setIsGrafanaAvailable(available);
+    };
+    checkGrafana();
+  }, []);
+
+  // Function to scroll to a specific section
+  const scrollToSection = (sectionId) => {
+    const element = document.getElementById(sectionId);
+    if (element) {
+      element.scrollIntoView({ behavior: 'smooth' });
+    }
+  };
+
+  // Set pageLoaded to true when the component mounts
+  useEffect(() => {
+    setPageLoaded(true);
+  }, []);
+
+  // Use MutationObserver to detect when the DOM is fully rendered
+  useEffect(() => {
+    if (!domReady) {
+      const observer = new MutationObserver(() => {
+        // Check if the sections we want to scroll to exist in the DOM
+        const logsSection = document.getElementById('logs-section');
+        const controllerLogsSection = document.getElementById(
+          'controller-logs-section'
+        );
+
+        if (
+          (tab === 'logs' && logsSection) ||
+          (tab === 'controllerlogs' && controllerLogsSection)
+        ) {
+          setDomReady(true);
+          observer.disconnect();
+        }
+      });
+
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+      });
+
+      return () => observer.disconnect();
+    }
+  }, [domReady, tab]);
+
+  // Scroll to the appropriate section when the page loads with a tab parameter
+  useEffect(() => {
+    if (router.isReady && pageLoaded && domReady && !scrollExecuted) {
+      // Add a small delay to ensure the DOM is fully rendered
+      const timer = setTimeout(() => {
+        if (tab === 'logs') {
+          scrollToSection('logs-section');
+          setScrollExecuted(true);
+        } else if (tab === 'controllerlogs') {
+          scrollToSection('controller-logs-section');
+          setScrollExecuted(true);
+        }
+      }, 800);
+
+      return () => clearTimeout(timer);
+    }
+  }, [router.isReady, tab, scrollExecuted, pageLoaded, domReady]);
+
+  // Reset scrollExecuted when tab changes
+  useEffect(() => {
+    setScrollExecuted(false);
+    setDomReady(false);
+  }, [tab]);
+
+  // Handle manual refresh of everything
+  const handleManualRefresh = async () => {
+    setIsRefreshing(true);
+    try {
+      // Trigger job data refresh. Preloaded rows come from the parent's
+      // fetch, so the parent refreshes them.
+      if (onRefresh) {
+        onRefresh();
+      } else {
+        setRefreshTrigger((prev) => prev + 1);
+      }
+      // Trigger logs refresh
+      setRefreshLogsFlag((prev) => prev + 1);
+      // Trigger controller logs refresh
+      setRefreshControllerLogsFlag((prev) => prev + 1);
+      // Trigger telemetry refresh
+      setTelemetryRefreshTrigger((prev) => prev + 1);
+    } catch (error) {
+      console.error('Error refreshing data:', error);
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
+  // Individual refresh handlers for logs
+  const handleLogsRefresh = () => {
+    setRefreshLogsFlag((prev) => prev + 1);
+  };
+
+  const handleControllerLogsRefresh = () => {
+    setRefreshControllerLogsFlag((prev) => prev + 1);
+  };
+
+  // Get all tasks for this job (supports multi-task jobs) - computed early for telemetry
+  const allTasksForTelemetry = useMemo(() => {
+    return (
+      jobData?.jobs?.filter((item) => String(item.id) === String(jobId)) || []
+    );
+  }, [jobData, jobId]);
+
+  // Determine which tasks have telemetry (Kubernetes, not pool, has cluster_name_on_cloud)
+  const tasksWithTelemetry = useMemo(() => {
+    return allTasksForTelemetry.map((task, index) => ({
+      index,
+      task,
+      hasMetrics:
+        task.full_infra?.toLowerCase().includes('kubernetes') &&
+        !task.pool &&
+        task.cluster_name_on_cloud,
+    }));
+  }, [allTasksForTelemetry]);
+
+  const hasAnyTaskWithTelemetry = tasksWithTelemetry.some((t) => t.hasMetrics);
+
+  // Get the currently selected task for telemetry
+  const telemetryTask =
+    allTasksForTelemetry[telemetryTaskIndex] || allTasksForTelemetry[0];
+
+  // Get cluster name for telemetry from selected task
+  const telemetryClusterName =
+    telemetryTask?.cluster_name_on_cloud ||
+    allTasksForTelemetry[0]?.cluster_name_on_cloud;
+
+  if (!router.isReady) {
+    return <div>Loading...</div>;
+  }
+
+  // Get all tasks for this job (supports multi-task jobs)
+  const allTasks =
+    jobData?.jobs?.filter((item) => String(item.id) === String(jobId)) || [];
+
+  // Use the first task for main details display
+  const detailJobData = allTasks.length > 0 ? allTasks[0] : null;
+  const isMultiTask = allTasks.length > 1;
+
+  // For multi-task jobs, find fields from any task (they may only be on one task)
+  const jobYaml =
+    allTasks.find((t) => t.dag_yaml)?.dag_yaml || detailJobData?.dag_yaml;
+  const jobEntrypoint =
+    allTasks.find((t) => t.entrypoint)?.entrypoint || detailJobData?.entrypoint;
+  const jobIsJobGroup =
+    allTasks.find((t) => t.is_job_group)?.is_job_group ||
+    detailJobData?.is_job_group ||
+    allTasks.length > 1;
+
+  // For execution, check stored values first, then apply defaults for multi-task jobs
+  // Older jobs may not have these fields stored, so provide sensible defaults
+  const storedExecution =
+    allTasks.find((t) => t.execution)?.execution || detailJobData?.execution;
+  // Default execution to 'parallel' for multi-task jobs without stored value
+  const jobExecution = storedExecution || (isMultiTask ? 'parallel' : null);
+
+  // Enhanced job data with fields from any task
+  const enhancedJobData = detailJobData
+    ? {
+        ...detailJobData,
+        dag_yaml: jobYaml,
+        entrypoint: jobEntrypoint,
+        execution: jobExecution,
+        is_job_group: jobIsJobGroup,
+      }
+    : null;
+
+  // What the Logs card streams: a dynamic task streams its own managed job
+  // (all of its tasks); otherwise the selected task of this job.
+  const logsJobData = selectedDynamicJob
+    ? selectedDynamicJob.rows[0]
+    : isMultiTask
+      ? allTasks[selectedTaskIndex]
+      : detailJobData;
+  const logsTaskIndex =
+    !selectedDynamicJob && isMultiTask ? selectedTaskIndex : null;
+
+  const title = taskContext
+    ? `Job ${taskContext.rootId} › Task ${taskContext.index} | SkyPilot Dashboard`
+    : jobId
+      ? `Job: ${jobId} | SkyPilot Dashboard`
+      : 'Job Details | SkyPilot Dashboard';
+
+  return (
+    <>
+      <Head>
+        <title>{title}</title>
+      </Head>
+      <>
+        <div className="flex items-center justify-between mb-4">
+          <div className="text-base flex items-center">
+            <Link href="/jobs" className="text-sky-blue hover:underline">
+              Managed Jobs
+            </Link>
+            <span className="mx-2 text-gray-500">›</span>
+            {taskContext ? (
+              <>
+                <Link
+                  href={`/jobs/${taskContext.rootId}`}
+                  className="text-sky-blue hover:underline"
+                >
+                  {taskContext.rootId}
+                  {taskContext.rootName ? ` (${taskContext.rootName})` : ''}
+                </Link>
+                <span className="mx-2 text-gray-500">›</span>
+                <span className="text-gray-700">
+                  Task {taskContext.index}
+                  {detailJobData?.name && (
+                    <span className="text-gray-500">
+                      {' '}
+                      ({detailJobData.name})
+                    </span>
+                  )}
+                </span>
+              </>
+            ) : (
+              <>
+                <Link
+                  href={`/jobs/${jobId}`}
+                  className="text-sky-blue hover:underline"
+                >
+                  {jobId} {detailJobData?.name ? `(${detailJobData.name})` : ''}
+                </Link>
+                {(detailJobData?.is_batch === true ||
+                  detailJobData?.batch_total_batches != null) && (
+                  <BatchBadge className="ml-2" />
+                )}
+                {(isMultiTask || launchedJobs.length > 0) && (
+                  // Same count as the jobs table's badge: declared tasks plus
+                  // the dynamic tasks launched from inside the group, which
+                  // are marked in the task list rather than here.
+                  <span className="ml-2 text-xs text-gray-500 bg-gray-200 px-1.5 py-0.5 rounded">
+                    {allTasks.length + launchedJobs.length} tasks
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+
+          <div className="text-sm flex items-center">
+            {(loading ||
+              isRefreshing ||
+              isLoadingLogs ||
+              isLoadingControllerLogs) && (
+              <div className="flex items-center mr-4">
+                <CircularProgress size={15} className="mt-0" />
+                <span className="ml-2 text-gray-500">Loading...</span>
+              </div>
+            )}
+            <Tooltip content="Refresh" className="text-muted-foreground">
+              <button
+                onClick={handleManualRefresh}
+                disabled={loading || isRefreshing}
+                className="text-sky-blue hover:text-sky-blue-bright font-medium inline-flex items-center h-8"
+              >
+                <RotateCwIcon className="w-4 h-4 mr-1.5" />
+                {!isMobile && <span>Refresh</span>}
+              </button>
+            </Tooltip>
+          </div>
+        </div>
+
+        {loading && isInitialLoad ? (
+          <div className="flex items-center justify-center py-32">
+            <CircularProgress size={20} className="mr-2" />
+            <span>Loading...</span>
+          </div>
+        ) : detailJobData ? (
+          <div className="space-y-8">
+            {/* Details Section */}
+            <div id="details-section">
+              <Card>
+                <div className="flex items-center justify-between px-4 pt-4">
+                  <h3 className="text-lg font-semibold">Details</h3>
+                </div>
+                <div className="p-4">
+                  <JobDetailsContent
+                    taskContext={taskContext}
+                    jobData={enhancedJobData}
+                    allTasks={allTasks}
+                    activeTab="info"
+                    setIsLoadingLogs={setIsLoadingLogs}
+                    setIsLoadingControllerLogs={setIsLoadingControllerLogs}
+                    isLoadingLogs={isLoadingLogs}
+                    isLoadingControllerLogs={isLoadingControllerLogs}
+                    refreshFlag={0}
+                    poolsData={poolsData}
+                    links={enhancedJobData?.links}
+                    logExtractedLinks={logExtractedLinks}
+                    onLinksExtracted={setLogExtractedLinks}
+                  />
+                </div>
+              </Card>
+            </div>
+
+            {/* Tasks: the job's declared tasks, then the dynamic tasks launched
+                 from inside it (each a managed job of its own), numbered on
+                 from the declared tasks exactly as the jobs table shows them. */}
+            {(isMultiTask || launchedJobs.length > 0) && (
+              <div id="tasks-section" className="mt-6">
+                <Card>
+                  <div className="flex items-center justify-between px-4 pt-4">
+                    <h3 className="text-lg font-semibold flex items-center">
+                      Tasks
+                      <span className="ml-2 text-sm font-normal text-gray-500">
+                        ({allTasks.length + launchedJobs.length} tasks
+                        {launchedJobs.length > 0 &&
+                          `, ${launchedJobs.length} dynamic`}
+                        )
+                      </span>
+                    </h3>
+                  </div>
+                  <div className="p-4">
+                    <div className="overflow-x-auto rounded-lg border">
+                      <Table className="min-w-full">
+                        <TableHeader>
+                          <TableRow>
+                            <TableHead className="whitespace-nowrap">
+                              ID
+                            </TableHead>
+                            <TableHead className="whitespace-nowrap">
+                              Name
+                            </TableHead>
+                            <TableHead className="whitespace-nowrap">
+                              Status
+                            </TableHead>
+                            <TableHead className="whitespace-nowrap">
+                              Duration
+                            </TableHead>
+                            <TableHead className="whitespace-nowrap">
+                              Infra
+                            </TableHead>
+                            <TableHead className="whitespace-nowrap">
+                              Resources
+                            </TableHead>
+                            <TableHead className="whitespace-nowrap">
+                              Recoveries
+                            </TableHead>
+                            <TableHead className="whitespace-nowrap">
+                              Logs
+                            </TableHead>
+                          </TableRow>
+                        </TableHeader>
+                        <TableBody>
+                          {allTasks.map((task, index) => (
+                            <TableRow
+                              key={task.task_job_id}
+                              className="hover:bg-gray-50"
+                            >
+                              <TableCell>
+                                <Link
+                                  href={`/jobs/${jobId}/${index}`}
+                                  className="text-blue-600 hover:underline"
+                                >
+                                  {index}
+                                </Link>
+                              </TableCell>
+                              <TableCell>
+                                <Link
+                                  href={`/jobs/${jobId}/${index}`}
+                                  className="text-blue-600 hover:underline"
+                                >
+                                  {task.task || `Job ${index}`}
+                                  {/* Show Primary badge for primary tasks in job groups with auxiliaries */}
+                                  {allTasks.some(
+                                    (t) => t.is_primary_in_job_group === false
+                                  ) &&
+                                    task.is_primary_in_job_group === true && (
+                                      <span className="ml-1.5">
+                                        <PrimaryBadge />
+                                      </span>
+                                    )}
+                                </Link>
+                              </TableCell>
+                              <TableCell>
+                                <StatusBadge
+                                  status={task.status}
+                                  statusTooltip={task.statusTooltip}
+                                />
+                              </TableCell>
+                              <TableCell>
+                                {formatDuration(task.job_duration)}
+                              </TableCell>
+                              <TableCell className="whitespace-nowrap">
+                                {task.infra && task.infra !== '-' ? (
+                                  <NonCapitalizedTooltip
+                                    content={task.full_infra || task.infra}
+                                    className="text-sm text-muted-foreground"
+                                  >
+                                    <span>
+                                      {task.cloud ||
+                                        task.infra.split('(')[0].trim()}
+                                      {task.infra.includes('(') && (
+                                        <span className="text-gray-500">
+                                          {' ' +
+                                            task.infra.substring(
+                                              task.infra.indexOf('(')
+                                            )}
+                                        </span>
+                                      )}
+                                    </span>
+                                  </NonCapitalizedTooltip>
+                                ) : (
+                                  <span>-</span>
+                                )}
+                              </TableCell>
+                              <TableCell>
+                                <NonCapitalizedTooltip
+                                  content={
+                                    task.requested_resources ||
+                                    task.resources_str_full ||
+                                    task.resources_str ||
+                                    '-'
+                                  }
+                                  className="text-sm text-muted-foreground"
+                                >
+                                  <span>
+                                    {task.requested_resources ||
+                                      task.resources_str ||
+                                      '-'}
+                                  </span>
+                                </NonCapitalizedTooltip>
+                              </TableCell>
+                              <TableCell>{task.recoveries || 0}</TableCell>
+                              <TableCell>
+                                <Tooltip
+                                  content="Download job logs"
+                                  className="text-muted-foreground"
+                                >
+                                  <button
+                                    onClick={() =>
+                                      downloadManagedJobLogs({
+                                        jobId: parseInt(jobId),
+                                        controller: false,
+                                        jobStatus: task?.status,
+                                      })
+                                    }
+                                    className="text-sky-blue hover:text-sky-blue-bright"
+                                  >
+                                    <Download className="w-4 h-4" />
+                                  </button>
+                                </Tooltip>
+                              </TableCell>
+                            </TableRow>
+                          ))}
+                          {launchedJobs.map((job) => (
+                            <TableRow
+                              key={`dynamic-${job.id}`}
+                              className="hover:bg-gray-50"
+                            >
+                              <TableCell>
+                                <Link
+                                  href={
+                                    job.dynamic_task_index != null
+                                      ? `/jobs/${jobId}/${job.dynamic_task_index}`
+                                      : `/jobs/${job.id}`
+                                  }
+                                  className="text-blue-600 hover:underline"
+                                  title={
+                                    job.dynamic_task_index != null
+                                      ? `sky jobs cancel ${jobId} --task ${job.dynamic_task_index}`
+                                      : `Dynamic task, job ${job.id}`
+                                  }
+                                >
+                                  {job.dynamic_task_index ?? '↳'}
+                                </Link>
+                              </TableCell>
+                              <TableCell>
+                                <Link
+                                  href={
+                                    job.dynamic_task_index != null
+                                      ? `/jobs/${jobId}/${job.dynamic_task_index}`
+                                      : `/jobs/${job.id}`
+                                  }
+                                  className="text-blue-600 hover:underline"
+                                >
+                                  {job.name || `Job ${job.id}`}
+                                </Link>
+                                <span className="ml-1.5">
+                                  <DynamicBadge
+                                    launchedFrom={
+                                      job.parent_task_id != null
+                                        ? `task ${job.parent_task_id} of ${
+                                            String(job.parent_job_id) ===
+                                            String(jobId)
+                                              ? 'this job'
+                                              : `job ${job.parent_job_id}`
+                                          }`
+                                        : null
+                                    }
+                                  />
+                                </span>
+                                {job.rows.length > 1 && (
+                                  <span className="ml-1.5 text-xs text-gray-500">
+                                    {job.rows.length} tasks
+                                  </span>
+                                )}
+                              </TableCell>
+                              <TableCell>
+                                <StatusBadge status={job.status} />
+                              </TableCell>
+                              <TableCell>
+                                {formatDuration(job.job_duration)}
+                              </TableCell>
+                              <TableCell className="whitespace-nowrap">
+                                {job.infra && job.infra !== '-' ? (
+                                  <NonCapitalizedTooltip
+                                    content={job.full_infra || job.infra}
+                                    className="text-sm text-muted-foreground"
+                                  >
+                                    <span>
+                                      {job.cloud ||
+                                        job.infra.split('(')[0].trim()}
+                                      {job.infra.includes('(') && (
+                                        <span className="text-gray-500">
+                                          {' ' +
+                                            job.infra.substring(
+                                              job.infra.indexOf('(')
+                                            )}
+                                        </span>
+                                      )}
+                                    </span>
+                                  </NonCapitalizedTooltip>
+                                ) : (
+                                  <span>-</span>
+                                )}
+                              </TableCell>
+                              <TableCell>
+                                <NonCapitalizedTooltip
+                                  content={
+                                    job.requested_resources ||
+                                    job.resources_str_full ||
+                                    job.resources_str ||
+                                    '-'
+                                  }
+                                  className="text-sm text-muted-foreground"
+                                >
+                                  <span>
+                                    {job.requested_resources ||
+                                      job.resources_str ||
+                                      '-'}
+                                  </span>
+                                </NonCapitalizedTooltip>
+                              </TableCell>
+                              <TableCell>{job.recoveries || 0}</TableCell>
+                              <TableCell>
+                                <Tooltip
+                                  content="Download job logs"
+                                  className="text-muted-foreground"
+                                >
+                                  <button
+                                    onClick={() =>
+                                      downloadManagedJobLogs({
+                                        jobId: parseInt(job.id),
+                                        controller: false,
+                                        jobStatus: job.status,
+                                      })
+                                    }
+                                    className="text-sky-blue hover:text-sky-blue-bright"
+                                  >
+                                    <Download className="w-4 h-4" />
+                                  </button>
+                                </Tooltip>
+                              </TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </div>
+                  </div>
+                </Card>
+              </div>
+            )}
+
+            {/* Logs Section — moved up so the live tail is visible
+                 right under the job summary instead of below
+                 Telemetry / Infra Nodes panels. */}
+            <div id="logs-section" className="mt-6">
+              <Card>
+                <div className="flex items-center justify-between px-4 pt-4">
+                  <div className="flex items-center gap-4">
+                    <h3 className="text-lg font-semibold">Logs</h3>
+                    {(isMultiTask || launchedJobs.length > 0) && (
+                      <Select
+                        onValueChange={(value) => {
+                          if (value.startsWith('dyn:')) {
+                            const id = value.slice(4);
+                            setSelectedDynamicJob(
+                              launchedJobs.find((j) => String(j.id) === id) ||
+                                null
+                            );
+                          } else {
+                            setSelectedDynamicJob(null);
+                            setSelectedTaskIndex(parseInt(value, 10));
+                          }
+                        }}
+                        value={
+                          selectedDynamicJob
+                            ? `dyn:${selectedDynamicJob.id}`
+                            : String(selectedTaskIndex)
+                        }
+                      >
+                        <SelectTrigger
+                          aria-label="Task"
+                          className="focus:ring-0 focus:ring-offset-0 h-8 w-auto min-w-[160px] text-sm"
+                        >
+                          <SelectValue placeholder="Select Task" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {allTasks.map((task, index) => (
+                            <SelectItem
+                              key={task.task_job_id || index}
+                              value={String(index)}
+                            >
+                              Task {index}
+                              {task.task ? `: ${task.task}` : ''}
+                            </SelectItem>
+                          ))}
+                          {launchedJobs.map((job) => (
+                            <SelectItem
+                              key={`dyn-${job.id}`}
+                              value={`dyn:${job.id}`}
+                            >
+                              Task {job.dynamic_task_index ?? '↳'}
+                              {job.name ? `: ${job.name}` : ''} (dynamic)
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    )}
+                    <Select
+                      onValueChange={(value) => setSelectedNode(value)}
+                      value={selectedNode}
+                    >
+                      <SelectTrigger
+                        aria-label="Node"
+                        className="focus:ring-0 focus:ring-offset-0 h-8 w-auto min-w-[120px] text-sm"
+                      >
+                        <SelectValue placeholder="All Nodes" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="all">All Nodes</SelectItem>
+                        {logNodes.map((node) => (
+                          <SelectItem key={node} value={node}>
+                            {node.charAt(0).toUpperCase() + node.slice(1)}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    {/* Slot for plugins to add extra log filters beside the
+                        node picker. jobId/taskId mirror the jobs.detail.logs
+                        context exactly (the per-task object's id for
+                        multi-task jobs) so a plugin can key shared state on
+                        the same identity as the log pane below. */}
+                    <PluginSlot
+                      name="jobs.detail.logfilters"
+                      context={{
+                        jobId: logsJobData?.id,
+                        taskId: logsTaskIndex,
+                        isController: false,
+                        refreshTrigger: refreshLogsFlag,
+                      }}
+                    />
+                    {!logsSlotHasPlugin && (
+                      <span className="text-xs text-gray-500">
+                        (Logs are not streaming; click refresh to fetch the
+                        latest logs.)
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center space-x-3">
+                    <PluginSlot
+                      name="jobs.detail.downloadbutton"
+                      context={{
+                        jobId: parseInt(
+                          Array.isArray(jobId) ? jobId[0] : jobId
+                        ),
+                        controller: false,
+                        jobStatus: detailJobData?.status,
+                        downloading: logsDownloading,
+                        onDownloadingChange: setLogsDownloading,
+                      }}
+                      fallback={
+                        <Tooltip
+                          content={
+                            logsDownloading
+                              ? 'Preparing zip… download will start shortly'
+                              : 'Download all job logs (zip)'
+                          }
+                          className="text-muted-foreground"
+                        >
+                          <button
+                            onClick={downloadLogsZip}
+                            disabled={logsDownloading}
+                            className="text-sky-blue hover:text-sky-blue-bright disabled:opacity-50 disabled:cursor-wait flex items-center"
+                          >
+                            {logsDownloading ? (
+                              <CircularProgress size={16} />
+                            ) : (
+                              <Download className="w-4 h-4" />
+                            )}
+                          </button>
+                        </Tooltip>
+                      }
+                    />
+                    <Tooltip
+                      content="Refresh logs"
+                      className="text-muted-foreground"
+                    >
+                      <button
+                        onClick={handleLogsRefresh}
+                        disabled={isLoadingLogs}
+                        className="text-sky-blue hover:text-sky-blue-bright flex items-center"
+                      >
+                        <RotateCwIcon
+                          className={`w-4 h-4 ${isLoadingLogs ? 'animate-spin' : ''}`}
+                        />
+                      </button>
+                    </Tooltip>
+                  </div>
+                </div>
+                <div className="p-4">
+                  <JobDetailsContent
+                    taskContext={taskContext}
+                    jobData={logsJobData}
+                    allTasks={allTasks}
+                    activeTab="logs"
+                    setIsLoadingLogs={setIsLoadingLogs}
+                    setIsLoadingControllerLogs={setIsLoadingControllerLogs}
+                    isLoadingLogs={isLoadingLogs}
+                    isLoadingControllerLogs={isLoadingControllerLogs}
+                    refreshFlag={refreshLogsFlag}
+                    poolsData={poolsData}
+                    selectedTaskIndex={logsTaskIndex}
+                    selectedNode={selectedNode}
+                    onNodesExtracted={setLogNodes}
+                    onLinksExtracted={setLogExtractedLinks}
+                  />
+                </div>
+              </Card>
+            </div>
+
+            {/* Telemetry Section (GPU + CPU/Memory) - Show for Kubernetes managed jobs with cluster_name_on_cloud */}
+            {isGrafanaAvailable && hasAnyTaskWithTelemetry && (
+              <TelemetrySection
+                clusterNameOnCloud={telemetryClusterName}
+                displayName={
+                  isMultiTask
+                    ? `${telemetryTask?.task || telemetryTask?.name || detailJobData.name} (Task ${telemetryTaskIndex})`
+                    : telemetryTask?.task ||
+                      telemetryTask?.name ||
+                      detailJobData.name
+                }
+                storageKey={TELEMETRY_EXPANDED_KEY}
+                hasGpu={hasAccelerator(telemetryTask?.accelerators)}
+                noMetricsMessage={
+                  telemetryTask?.pool
+                    ? 'Telemetry is not available for pool jobs.'
+                    : !telemetryTask?.full_infra?.includes('Kubernetes')
+                      ? 'Telemetry is only available for Kubernetes tasks.'
+                      : 'No telemetry available for this task.'
+                }
+                headerExtra={
+                  isMultiTask && (
+                    <Select
+                      onValueChange={(value) =>
+                        setTelemetryTaskIndex(parseInt(value, 10))
+                      }
+                      value={String(telemetryTaskIndex)}
+                    >
+                      <SelectTrigger
+                        onClick={(e) => e.stopPropagation()}
+                        aria-label="Task"
+                        className="focus:ring-0 focus:ring-offset-0 h-8 w-auto min-w-[160px] text-sm ml-4"
+                      >
+                        <SelectValue placeholder="Select Task" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {tasksWithTelemetry.map(
+                          ({ index, task, hasMetrics }) => (
+                            <SelectItem
+                              key={index}
+                              value={String(index)}
+                              disabled={!hasMetrics}
+                            >
+                              Task {index}
+                              {task.task ? `: ${task.task}` : ''}
+                              {!hasMetrics ? ' (no metrics)' : ''}
+                            </SelectItem>
+                          )
+                        )}
+                      </SelectContent>
+                    </Select>
+                  )
+                }
+              />
+            )}
+
+            {/* Plugin Slot: Job Detail GPU metrics. The built-in
+                TelemetrySection above covers Kubernetes; this lets a plugin
+                contribute a GPU-metrics/telemetry panel for other infra
+                (empty when no plugin registers for it). */}
+            <PluginSlot
+              name="jobs.detail.gpu-metrics"
+              context={{
+                clusterName: detailJobData.current_cluster_name,
+                clusterNameOnCloud: detailJobData.cluster_name_on_cloud,
+                nodeNames: detailJobData.node_names,
+                infra: detailJobData.full_infra,
+                status: detailJobData.status,
+              }}
+              wrapperClassName="mt-6"
+            />
+
+            {/* Plugin Slot: Job Infra Nodes */}
+            <PluginSlot
+              name="jobs.detail.nodes"
+              context={{
+                clusterName: detailJobData.current_cluster_name,
+                clusterNameOnCloud: detailJobData.cluster_name_on_cloud,
+                nodeNames: detailJobData.node_names,
+                infra: detailJobData.full_infra,
+                status: detailJobData.status,
+              }}
+              wrapperClassName="mt-6"
+            />
+
+            {/* Plugin Slot: Job Detail Events */}
+            <PluginSlot
+              name="jobs.detail.events"
+              context={{
+                jobId: detailJobData.id,
+              }}
+              wrapperClassName="mt-6"
+            />
+
+            {/* Controller Logs Section - Collapsible */}
+            <ControllerLogsSection
+              jobId={jobId}
+              detailJobData={detailJobData}
+              isLoadingControllerLogs={isLoadingControllerLogs}
+              handleControllerLogsRefresh={handleControllerLogsRefresh}
+              setIsLoadingControllerLogs={setIsLoadingControllerLogs}
+              setIsLoadingLogs={setIsLoadingLogs}
+              refreshControllerLogsFlag={refreshControllerLogsFlag}
+              poolsData={poolsData}
+            />
+          </div>
+        ) : (
+          <div className="flex items-center justify-center py-32">
+            <span>Job not found</span>
+          </div>
+        )}
+      </>
+    </>
+  );
+}
+
+function ControllerLogsSection({
+  jobId,
+  detailJobData,
+  isLoadingControllerLogs,
+  handleControllerLogsRefresh,
+  setIsLoadingControllerLogs,
+  setIsLoadingLogs,
+  refreshControllerLogsFlag,
+  poolsData,
+}) {
+  const CONTROLLER_LOGS_EXPANDED_KEY = 'skypilot-controller-logs-expanded';
+  const controllerLogsSlotHasPlugin =
+    usePluginComponents('jobs.detail.controllerlogs').length > 0;
+  const [downloading, setDownloading] = useState(false);
+  const downloadControllerZip = async () => {
+    if (downloading) return;
+    setDownloading(true);
+    try {
+      await downloadManagedJobLogs({
+        jobId: parseInt(Array.isArray(jobId) ? jobId[0] : jobId),
+        controller: true,
+        jobStatus: detailJobData?.status,
+      });
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  // Initialize state from localStorage
+  const [isExpanded, setIsExpanded] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem(CONTROLLER_LOGS_EXPANDED_KEY);
+      return saved === 'true';
+    }
+    return false;
+  });
+
+  // Persist state to localStorage when it changes
+  const toggleExpanded = () => {
+    const newValue = !isExpanded;
+    setIsExpanded(newValue);
+    if (typeof window !== 'undefined') {
+      localStorage.setItem(CONTROLLER_LOGS_EXPANDED_KEY, String(newValue));
+    }
+  };
+
+  return (
+    <div id="controller-logs-section" className="mt-6">
+      <Card>
+        <div
+          className={`flex items-center justify-between px-4 ${isExpanded ? 'pt-4' : 'py-4'}`}
+        >
+          <button
+            onClick={toggleExpanded}
+            className="flex items-center text-left focus:outline-none hover:text-gray-700 transition-colors duration-200"
+          >
+            {isExpanded ? (
+              <ChevronDownIcon className="w-5 h-5 mr-2" />
+            ) : (
+              <ChevronRightIcon className="w-5 h-5 mr-2" />
+            )}
+            <h3 className="text-lg font-semibold">Controller Logs</h3>
+            {!controllerLogsSlotHasPlugin && (
+              <span className="ml-2 text-xs text-gray-500">
+                (Logs are not streaming; click refresh to fetch the latest
+                logs.)
+              </span>
+            )}
+          </button>
+          {isExpanded && (
+            <div className="flex items-center space-x-3">
+              <PluginSlot
+                name="jobs.detail.downloadbutton"
+                context={{
+                  jobId: parseInt(Array.isArray(jobId) ? jobId[0] : jobId),
+                  controller: true,
+                  jobStatus: detailJobData?.status,
+                  downloading,
+                  onDownloadingChange: setDownloading,
+                }}
+                fallback={
+                  <Tooltip
+                    content={
+                      downloading
+                        ? 'Preparing zip… download will start shortly'
+                        : 'Download full controller logs'
+                    }
+                    className="text-muted-foreground"
+                  >
+                    <button
+                      onClick={downloadControllerZip}
+                      disabled={downloading}
+                      className="text-sky-blue hover:text-sky-blue-bright disabled:opacity-50 disabled:cursor-wait flex items-center"
+                    >
+                      {downloading ? (
+                        <CircularProgress size={16} />
+                      ) : (
+                        <Download className="w-4 h-4" />
+                      )}
+                    </button>
+                  </Tooltip>
+                }
+              />
+              <Tooltip
+                content="Refresh controller logs"
+                className="text-muted-foreground"
+              >
+                <button
+                  onClick={handleControllerLogsRefresh}
+                  disabled={isLoadingControllerLogs}
+                  className="text-sky-blue hover:text-sky-blue-bright flex items-center"
+                >
+                  <RotateCwIcon
+                    className={`w-4 h-4 ${isLoadingControllerLogs ? 'animate-spin' : ''}`}
+                  />
+                </button>
+              </Tooltip>
+            </div>
+          )}
+        </div>
+        {isExpanded && (
+          <div className="p-4">
+            <JobDetailsContent
+              jobData={detailJobData}
+              activeTab="controllerlogs"
+              setIsLoadingLogs={setIsLoadingLogs}
+              setIsLoadingControllerLogs={setIsLoadingControllerLogs}
+              isLoadingLogs={false}
+              isLoadingControllerLogs={isLoadingControllerLogs}
+              refreshFlag={refreshControllerLogsFlag}
+              poolsData={poolsData}
+            />
+          </div>
+        )}
+      </Card>
+    </div>
+  );
+}
+function JobDetailsContent({
+  taskContext,
+  jobData,
+  allTasks = [],
+  activeTab,
+  setIsLoadingLogs,
+  setIsLoadingControllerLogs,
+  isLoadingLogs,
+  isLoadingControllerLogs,
+  refreshFlag,
+  poolsData,
+  links,
+  logExtractedLinks: logExtractedLinksFromParent,
+  onLinksExtracted,
+  selectedTaskIndex = null,
+  onTaskChange = null,
+  selectedNode = 'all',
+  onNodesExtracted = null,
+}) {
+  const [isYamlExpanded, setIsYamlExpanded] = useState(false);
+  const [expandedYamlDocs, setExpandedYamlDocs] = useState({});
+  const [showFullYaml, setShowFullYaml] = useState(false);
+  const [isCopied, setIsCopied] = useState(false);
+  const [isCommandCopied, setIsCommandCopied] = useState(false);
+
+  // Auto-scroll refs
+  const logsContainerRef = useRef(null);
+  const controllerLogsContainerRef = useRef(null);
+
+  // Custom hook for auto-scrolling
+  const scrollToBottom = useCallback((logType) => {
+    const containerRef =
+      logType === 'logs' ? logsContainerRef : controllerLogsContainerRef;
+
+    if (!containerRef.current) return;
+
+    // Try multiple ways to find the scrollable container
+    const attempts = [
+      () => containerRef.current.querySelector('.logs-container'),
+      () => containerRef.current.querySelector('[class*="logs-container"]'),
+      () => containerRef.current.querySelector('div[style*="overflow"]'),
+      () => containerRef.current, // Fallback to the ref itself
+    ];
+
+    for (const attempt of attempts) {
+      const container = attempt();
+      if (container && container.scrollHeight > container.clientHeight) {
+        container.scrollTop = container.scrollHeight;
+        console.log(`Auto-scrolled ${logType} to bottom`); // Debug log
+        break;
+      }
+    }
+  }, []);
+
+  const PENDING_STATUSES = ['PENDING', 'SUBMITTED', 'STARTING'];
+  const PRE_START_STATUSES = ['PENDING', 'SUBMITTED'];
+  const RECOVERING_STATUSES = ['RECOVERING'];
+
+  const isPending = PENDING_STATUSES.includes(jobData.status);
+  // After priority-based scheduling (#5682), a job can be PENDING while its
+  // controller is already running. Show controller logs when schedule_state
+  // indicates the controller has been claimed (anything other than
+  // INACTIVE/WAITING/null).
+  const isControllerRunning =
+    jobData.schedule_state != null &&
+    jobData.schedule_state !== 'INACTIVE' &&
+    jobData.schedule_state !== 'WAITING';
+  const isPreStart =
+    PRE_START_STATUSES.includes(jobData.status) && !isControllerRunning;
+  const isRecovering = RECOVERING_STATUSES.includes(jobData.status);
+
+  // Compute job group status based on primary tasks
+  // For job groups with primary/auxiliary tasks, status is determined only by primary tasks
+  const computedStatus = useMemo(() => {
+    if (allTasks.length > 1) {
+      return computeJobGroupStatus(allTasks);
+    }
+    return jobData.status;
+  }, [allTasks, jobData.status]);
+
+  // The connector only sets statusTooltip when it is meaningful (PENDING
+  // reason, FAILED* attribution), but only show it when the aggregated
+  // status matches the row's own status so a tooltip computed for another
+  // state is not shown.
+  const statusTooltip =
+    computedStatus === jobData.status ? jobData.statusTooltip : null;
+
+  const toggleYamlExpanded = () => {
+    setIsYamlExpanded(!isYamlExpanded);
+  };
+
+  const toggleYamlDocExpanded = (index) => {
+    setExpandedYamlDocs((prev) => ({
+      ...prev,
+      [index]: !prev[index],
+    }));
+  };
+
+  const copyYamlToClipboard = async () => {
+    try {
+      const yamlDocs = formatJobYaml(jobData.dag_yaml);
+      // Build JobGroup header with name and execution
+      const hasJobGroupConfig = jobData.name || jobData.execution;
+      const jobGroupHeader = hasJobGroupConfig
+        ? [
+            jobData.name ? `name: ${jobData.name}` : null,
+            jobData.execution ? `execution: ${jobData.execution}` : null,
+          ]
+            .filter(Boolean)
+            .join('\n') + '\n---\n'
+        : '';
+
+      let textToCopy = '';
+
+      if (yamlDocs.length === 1) {
+        // Single document - use the formatted content directly
+        textToCopy = jobGroupHeader + yamlDocs[0].content;
+      } else if (yamlDocs.length > 1) {
+        // Multiple documents - join them with document separators
+        textToCopy =
+          jobGroupHeader + yamlDocs.map((doc) => doc.content).join('\n---\n');
+      } else {
+        // Fallback to raw YAML if formatting fails
+        textToCopy = jobGroupHeader + jobData.dag_yaml;
+      }
+
+      await navigator.clipboard.writeText(textToCopy);
+      setIsCopied(true);
+      setTimeout(() => setIsCopied(false), 2000); // Reset after 2 seconds
+    } catch (err) {
+      console.error('Failed to copy YAML to clipboard:', err);
+    }
+  };
+
+  const copyCommandToClipboard = async () => {
+    try {
+      await navigator.clipboard.writeText(jobData.entrypoint);
+      setIsCommandCopied(true);
+      setTimeout(() => setIsCommandCopied(false), 2000); // Reset after 2 seconds
+    } catch (err) {
+      console.error('Failed to copy command to clipboard:', err);
+    }
+  };
+
+  const logStreamArgs = useMemo(
+    () => ({
+      jobId: jobData.id,
+      controller: false,
+      // Pass task index (as int) when viewing a specific task in a multi-task job
+      task: selectedTaskIndex,
+    }),
+    [jobData.id, selectedTaskIndex]
+  );
+
+  const controllerStreamArgs = useMemo(
+    () => ({
+      jobId: jobData.id,
+      controller: true,
+    }),
+    [jobData.id]
+  );
+
+  const handleLogsError = useCallback((error) => {
+    console.error('Error streaming logs:', error);
+  }, []);
+
+  const handleControllerLogsError = useCallback((error) => {
+    console.error('Error streaming controller logs:', error);
+  }, []);
+
+  // If a plugin registers a component for the logs slot, it owns the
+  // entire log panel (its own streamer, its own rendering). Skip the
+  // OSS streamer to avoid double-fetching.
+  const logsSlotPluginComponents = usePluginComponents('jobs.detail.logs');
+  const controllerLogsSlotPluginComponents = usePluginComponents(
+    'jobs.detail.controllerlogs'
+  );
+  const logsSlotOverridden = logsSlotPluginComponents.length > 0;
+  const controllerLogsSlotOverridden =
+    controllerLogsSlotPluginComponents.length > 0;
+
+  const {
+    lines: logs,
+    isLoading: streamingLogsLoading,
+    hasReceivedFirstChunk: hasReceivedLogChunk,
+  } = useLogStreamer({
+    streamFn: streamManagedJobLogs,
+    streamArgs: logStreamArgs,
+    enabled:
+      activeTab === 'logs' &&
+      !isPending &&
+      !isRecovering &&
+      !logsSlotOverridden,
+    refreshTrigger: activeTab === 'logs' ? refreshFlag : 0,
+    onError: handleLogsError,
+  });
+
+  const {
+    lines: controllerLogs,
+    isLoading: streamingControllerLogsLoading,
+    hasReceivedFirstChunk: hasReceivedControllerChunk,
+  } = useLogStreamer({
+    streamFn: streamManagedJobLogs,
+    streamArgs: controllerStreamArgs,
+    enabled:
+      activeTab === 'controllerlogs' &&
+      !isPreStart &&
+      !controllerLogsSlotOverridden,
+    refreshTrigger: activeTab === 'controllerlogs' ? refreshFlag : 0,
+    onError: handleControllerLogsError,
+  });
+
+  useEffect(() => {
+    setIsLoadingLogs(streamingLogsLoading);
+  }, [streamingLogsLoading, setIsLoadingLogs]);
+
+  useEffect(() => {
+    setIsLoadingControllerLogs(streamingControllerLogsLoading);
+  }, [streamingControllerLogsLoading, setIsLoadingControllerLogs]);
+
+  // Extract node types from logs and pass them to parent
+  useEffect(() => {
+    if (onNodesExtracted && logs.length > 0) {
+      const logsText = logs.join('\n');
+      const nodes = extractNodeTypes(logsText);
+      onNodesExtracted(nodes);
+    }
+  }, [logs, onNodesExtracted]);
+
+  // External-link extraction from log lines. Matches accumulate inside
+  // the hook so they survive tab switches and re-renders. `scanLines` is
+  // a stable callback: besides feeding it from the OSS streamer below,
+  // it is handed to a plugin that owns the logs slot — the OSS streamer
+  // does not run in that case, so the plugin forwards its own lines.
+  const { extractedLinks: logExtractedLinks, scanLines } =
+    useLogLinkExtractor(LINK_SCOPE_JOBS);
+
+  useEffect(() => {
+    scanLines(logs);
+  }, [logs, scanLines]);
+
+  // Notify parent when links are extracted (for cross-component sharing)
+  useEffect(() => {
+    if (onLinksExtracted && Object.keys(logExtractedLinks).length > 0) {
+      onLinksExtracted(logExtractedLinks);
+    }
+  }, [logExtractedLinks, onLinksExtracted]);
+
+  // Admin-configured url templates (dashboard.external_links entries with a
+  // `url` field) resolved against this managed job's metadata. The backing
+  // cluster name is the job's current cluster (present while running or
+  // after the last recovery).
+  const templateLinkContext = useMemo(
+    () => ({
+      cluster_name: jobData?.current_cluster_name,
+      job_id: jobData?.id,
+      job_name: jobData?.name,
+      user: jobData?.user,
+      workspace: jobData?.workspace,
+    }),
+    [
+      jobData?.current_cluster_name,
+      jobData?.id,
+      jobData?.name,
+      jobData?.user,
+      jobData?.workspace,
+    ]
+  );
+  const templateLinks = useTemplateLinks(templateLinkContext, LINK_SCOPE_JOBS);
+
+  // Combine template links, database links, and log-extracted links.
+  // Use logExtractedLinksFromParent if provided (for info tab), otherwise use local extraction
+  const mergedLinks = useMemo(() => {
+    // Template links are the base; database links take priority if there's
+    // a conflict.
+    const combined = { ...templateLinks, ...(links || {}) };
+    // Use parent-provided links (for info tab) or locally extracted links (for logs tab)
+    const extractedToUse = logExtractedLinksFromParent || logExtractedLinks;
+    // Add log-extracted links (only if not already present)
+    for (const [key, value] of Object.entries(extractedToUse)) {
+      if (!combined[key]) {
+        combined[key] = value;
+      }
+    }
+    return combined;
+  }, [templateLinks, links, logExtractedLinks, logExtractedLinksFromParent]);
+  // Scope-filter the merged map so server-computed (DB) links honor entry
+  // scopes too.
+  const combinedLinks = useScopedLinks(mergedLinks, LINK_SCOPE_JOBS);
+
+  // Auto-scroll to bottom when logs change or tab changes
+  useEffect(() => {
+    const performScroll = () => {
+      if (
+        (activeTab === 'logs' && logs.length) ||
+        (activeTab === 'controllerlogs' && controllerLogs.length)
+      ) {
+        scrollToBottom(activeTab === 'logs' ? 'logs' : 'controllerlogs');
+      }
+    };
+
+    // Use requestAnimationFrame for better timing after DOM updates
+    requestAnimationFrame(() => {
+      requestAnimationFrame(performScroll); // Double RAF to ensure DOM is updated
+    });
+  }, [activeTab, logs, controllerLogs, scrollToBottom]);
+
+  if (activeTab === 'logs') {
+    const defaultLogsContent = (
+      <div className="max-h-96 overflow-y-auto" ref={logsContainerRef}>
+        {isPending ? (
+          <div className="bg-[#f7f7f7] flex items-center justify-center py-4 text-gray-500">
+            <span>Waiting for the job to start; refresh in a few moments.</span>
+          </div>
+        ) : isRecovering ? (
+          <div className="bg-[#f7f7f7] flex items-center justify-center py-4 text-gray-500">
+            <span>
+              Waiting for the job to recover; refresh in a few moments.
+            </span>
+          </div>
+        ) : (
+          <LogFilter
+            logs={logs}
+            isLoading={isLoadingLogs && !hasReceivedLogChunk && !logs.length}
+            selectedNode={selectedNode}
+          />
+        )}
+      </div>
+    );
+    // Plugin override: a registered plugin component owns the entire log
+    // panel (its own streamer, its own rendering). We pass enough context
+    // (jobId, taskId, status) for the plugin to drive `/jobs/logs` itself.
+    // Pass `onNodesExtracted` too so the plugin can populate the
+    // node-filter dropdown (the OSS `useLogStreamer` no longer runs to
+    // discover node names when the plugin is in charge).
+    return (
+      <PluginSlot
+        name="jobs.detail.logs"
+        context={{
+          jobId: jobData.id,
+          taskId: selectedTaskIndex,
+          status: jobData.status,
+          isPending,
+          isRecovering,
+          selectedNode,
+          isController: false,
+          onNodesExtracted,
+          // The OSS streamer that feeds External Links extraction does
+          // not run when a plugin owns this slot. The plugin should
+          // forward its visible log lines (raw buffer string or array of
+          // lines) through this callback so extraction keeps working.
+          onLogLines: scanLines,
+          // Forward the refresh-button signal so a plugin owning this slot
+          // can re-fetch on refresh (the OSS streamer it replaces consumes
+          // the same flag). Without this the refresh button is a no-op for
+          // plugin-owned log panels.
+          refreshTrigger: refreshFlag,
+        }}
+        fallback={defaultLogsContent}
+      />
+    );
+  }
+
+  if (activeTab === 'controllerlogs') {
+    const defaultControllerLogsContent = (
+      <div
+        className="max-h-96 overflow-y-auto"
+        ref={controllerLogsContainerRef}
+      >
+        {isPreStart ? (
+          <div className="bg-[#f7f7f7] flex items-center justify-center py-4 text-gray-500">
+            <span>
+              Waiting for the job controller process to start; refresh in a few
+              moments.
+            </span>
+          </div>
+        ) : hasReceivedControllerChunk || controllerLogs.length ? (
+          <LogFilter logs={controllerLogs} controller={true} />
+        ) : isLoadingControllerLogs ? (
+          <div className="flex items-center justify-center py-4">
+            <CircularProgress size={20} className="mr-2" />
+            <span>Loading logs...</span>
+          </div>
+        ) : (
+          <LogFilter logs={controllerLogs} controller={true} />
+        )}
+      </div>
+    );
+    return (
+      <PluginSlot
+        name="jobs.detail.controllerlogs"
+        context={{
+          jobId: jobData.id,
+          status: jobData.status,
+          isPreStart,
+          isController: true,
+          // Forward the refresh-button signal (see jobs.detail.logs slot).
+          refreshTrigger: refreshFlag,
+        }}
+        fallback={defaultControllerLogsContent}
+      />
+    );
+  }
+
+  // Default 'info' tab content
+  return (
+    <div className="grid grid-cols-2 gap-6">
+      <div>
+        <div className="text-gray-600 font-medium text-base">
+          {taskContext ? 'Task' : 'Job ID (Name)'}
+        </div>
+        <div className="text-base mt-1 flex items-center gap-2">
+          {taskContext ? (
+            // Same shape as a declared task's page; the handle
+            // `<root>-<index>` is what `sky jobs cancel` / `logs` take.
+            <span
+              title={`sky jobs cancel ${taskContext.rootId} --task ${taskContext.index}`}
+            >
+              {taskContext.index}
+              {jobData.name && (
+                <span className="text-gray-500"> ({jobData.name})</span>
+              )}
+            </span>
+          ) : (
+            <span>
+              {jobData.id} {jobData.name ? `(${jobData.name})` : ''}
+            </span>
+          )}
+          {taskContext && (
+            <DynamicBadge launchedFrom={taskContext.launchedFrom} />
+          )}
+          {/* Badge for batch job */}
+          {(jobData.is_batch === true ||
+            jobData.batch_total_batches != null) && <BatchBadge />}
+          {/* Badge for job group */}
+          {jobData.is_job_group && (
+            <span className="px-2 py-0.5 rounded text-xs font-medium bg-gray-200 text-gray-700">
+              JobGroup
+            </span>
+          )}
+        </div>
+        {taskContext && taskContext.parentTask && (
+          <div className="text-sm text-gray-500 mt-1">
+            Launched by Task:{' '}
+            <Link
+              href={taskContext.parentTask.href}
+              className="text-sky-blue hover:text-sky-blue-bright hover:underline"
+            >
+              {taskContext.parentTask.label}
+            </Link>
+          </div>
+        )}
+      </div>
+      {taskContext && (
+        <div>
+          <div className="text-gray-600 font-medium text-base">Job</div>
+          <div className="text-base mt-1">
+            <Link
+              href={`/jobs/${taskContext.rootId}`}
+              className="text-sky-blue hover:text-sky-blue-bright hover:underline"
+            >
+              {taskContext.rootId}
+              {taskContext.rootName ? ` (${taskContext.rootName})` : ''}
+            </Link>
+          </div>
+        </div>
+      )}
+      <div>
+        <div className="text-gray-600 font-medium text-base">Status</div>
+        <div className="text-base mt-1">
+          {(() => {
+            const isBatchRunning =
+              jobData.status === 'RUNNING' &&
+              jobData.batch_total_batches != null;
+            if (isBatchRunning) {
+              const completed = jobData.batch_completed_batches || 0;
+              const total = jobData.batch_total_batches;
+              const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+              const barColor =
+                completed >= total ? 'bg-green-500' : 'bg-blue-500';
+              return (
+                <div className="flex items-center gap-3">
+                  <div className="w-32 bg-gray-200 rounded-full h-2.5">
+                    <div
+                      className={`${barColor} h-2.5 rounded-full transition-all`}
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                  <span className="text-sm text-gray-600">
+                    {completed}/{total} batches ({pct}%)
+                  </span>
+                </div>
+              );
+            }
+            return (
+              <PluginSlot
+                name="jobs.detail.status.badge"
+                // The slot must see the status the fallback renders:
+                // jobData is the first task's row, not the group's
+                // aggregate.
+                context={{
+                  ...jobData,
+                  status: computedStatus,
+                  statusTooltip,
+                }}
+                fallback={
+                  <StatusBadge
+                    status={computedStatus}
+                    statusTooltip={statusTooltip}
+                  />
+                }
+              />
+            );
+          })()}
+        </div>
+      </div>
+      <div>
+        <div className="text-gray-600 font-medium text-base">User</div>
+        <div className="text-base mt-1">
+          <UserDisplay username={jobData.user} userHash={jobData.user_hash} />
+        </div>
+      </div>
+      <div>
+        <div className="text-gray-600 font-medium text-base">Workspace</div>
+        <div className="text-base mt-1">
+          <Link
+            href="/workspaces"
+            className="text-gray-700 hover:text-blue-600 hover:underline"
+          >
+            {jobData.workspace || 'default'}
+          </Link>
+        </div>
+      </div>
+      <div>
+        <div className="text-gray-600 font-medium text-base">Submitted</div>
+        <div className="text-base mt-1">
+          {jobData.submitted_at
+            ? formatFullTimestamp(jobData.submitted_at)
+            : 'N/A'}
+        </div>
+      </div>
+      <div>
+        <div className="text-gray-600 font-medium text-base">Started</div>
+        <div className="text-base mt-1">
+          {jobData.started_at ? formatFullTimestamp(jobData.started_at) : '-'}
+        </div>
+      </div>
+      <div>
+        <div className="text-gray-600 font-medium text-base">Duration</div>
+        <div className="text-base mt-1">
+          {(() => {
+            if (allTasks.length <= 1) {
+              return formatDuration(jobData.job_duration);
+            }
+            // For a job group, sum the durations of all tasks instead of
+            // showing only the first task's duration, matching the CLI's
+            // aggregated row. A task that has not started yet contributes
+            // 0; one that has started keeps accruing.
+            const totalDuration = allTasks.reduce(
+              (sum, t) => sum + (t.job_duration || 0),
+              0
+            );
+            return formatDuration(totalDuration);
+          })()}
+        </div>
+      </div>
+      <div>
+        <div className="text-gray-600 font-medium text-base">Recoveries</div>
+        <div className="text-base mt-1">{jobData.recoveries || 0}</div>
+      </div>
+      <div>
+        <div className="text-gray-600 font-medium text-base">
+          Requested Resources
+        </div>
+        <div className="text-base mt-1">
+          {allTasks.length > 1 ? (
+            <NonCapitalizedTooltip
+              content={`Aggregated from ${allTasks.length} tasks:\n${allTasks
+                .map(
+                  (task, index) =>
+                    `Task ${index}${task.task ? ` (${task.task})` : ''}: ${task.requested_resources || task.resources_str || 'N/A'}`
+                )
+                .join('\n')}`}
+              className="text-sm text-muted-foreground"
+            >
+              <span className="cursor-help border-b border-dotted border-gray-400">
+                {(() => {
+                  const resourcesList = allTasks
+                    .map((t) => t.requested_resources || t.resources_str)
+                    .filter(Boolean);
+                  const uniqueResources = [...new Set(resourcesList)];
+                  return uniqueResources.length === 1
+                    ? `${uniqueResources[0]} (x${allTasks.length} tasks)`
+                    : `${resourcesList[0]} (+${allTasks.length - 1} more)`;
+                })()}
+              </span>
+            </NonCapitalizedTooltip>
+          ) : (
+            jobData.requested_resources || 'N/A'
+          )}
+        </div>
+      </div>
+      <div>
+        <div className="text-gray-600 font-medium text-base">Infra</div>
+        <div className="text-base mt-1">
+          {(() => {
+            // The default rendering, also handed to the plugin slot as
+            // `defaultContent` so a plugin that only changes how *some* jobs
+            // read can return it unchanged for the rest. `fallback` keeps the
+            // no-plugin case identical.
+            const infraContent = jobData.infra ? (
+              <NonCapitalizedTooltip
+                content={jobData.full_infra || jobData.infra}
+                className="text-sm text-muted-foreground"
+              >
+                <span>
+                  <Link href="/infra" className="text-blue-600 hover:underline">
+                    {jobData.cloud || jobData.infra.split('(')[0].trim()}
+                  </Link>
+                  {jobData.infra.includes('(') && (
+                    <span>
+                      {' ' +
+                        jobData.infra.substring(jobData.infra.indexOf('('))}
+                    </span>
+                  )}
+                </span>
+              </NonCapitalizedTooltip>
+            ) : (
+              '-'
+            );
+            return (
+              <PluginSlot
+                name="jobs.detail.infra"
+                context={{ job: jobData, defaultContent: infraContent }}
+                fallback={infraContent}
+              />
+            );
+          })()}
+        </div>
+      </div>
+      {/* Slurm schedules onto a partition (its zone); it is how quota and
+          priority are carved up on a Slurm cluster, so it gets its own row.
+          Multi-task jobs list every task's partition, like Requested
+          Resources above. */}
+      {(() => {
+        const slurmTasks = allTasks.filter(
+          (t) => t.cloud && t.cloud.toLowerCase() === 'slurm' && t.zone
+        );
+        if (slurmTasks.length === 0) return null;
+        const partitions = [...new Set(slurmTasks.map((t) => t.zone))];
+        return (
+          <div>
+            <div className="text-gray-600 font-medium text-base">Partition</div>
+            <div className="text-base mt-1">
+              {allTasks.length > 1 ? (
+                <NonCapitalizedTooltip
+                  content={slurmTasks
+                    .map(
+                      (task) =>
+                        `Task ${allTasks.indexOf(task)}${task.task ? ` (${task.task})` : ''}: ${task.zone}`
+                    )
+                    .join('\n')}
+                  className="text-sm text-muted-foreground"
+                >
+                  <span className="cursor-help border-b border-dotted border-gray-400">
+                    {partitions.join(', ')}
+                  </span>
+                </NonCapitalizedTooltip>
+              ) : (
+                partitions[0]
+              )}
+            </div>
+          </div>
+        );
+      })()}
+      <div>
+        <div className="text-gray-600 font-medium text-base">Resources</div>
+        <div className="text-base mt-1">
+          {jobData.resources_str_full || jobData.resources_str || '-'}
+        </div>
+      </div>
+      <div>
+        <div className="text-gray-600 font-medium text-base">Git Commit</div>
+        <div className="text-base mt-1 flex items-center">
+          {jobData.git_commit && jobData.git_commit !== '-' ? (
+            <span className="flex items-center mr-2">
+              {jobData.git_commit}
+              <Tooltip
+                content={isCopied ? 'Copied!' : 'Copy commit'}
+                className="text-muted-foreground"
+              >
+                <button
+                  onClick={async () => {
+                    await navigator.clipboard.writeText(jobData.git_commit);
+                    setIsCopied(true);
+                    setTimeout(() => setIsCopied(false), 2000);
+                  }}
+                  className="flex items-center text-gray-500 hover:text-gray-700 transition-colors duration-200 p-1 ml-2"
+                >
+                  {isCopied ? (
+                    <CheckIcon className="w-4 h-4 text-green-600" />
+                  ) : (
+                    <CopyIcon className="w-4 h-4" />
+                  )}
+                </button>
+              </Tooltip>
+            </span>
+          ) : (
+            <span className="text-gray-400">-</span>
+          )}
+        </div>
+      </div>
+
+      <div>
+        <div className="text-gray-600 font-medium text-base">Pool</div>
+        <div className="text-base mt-1">
+          {renderPoolLink(jobData.pool, jobData.pool_hash, poolsData)}
+        </div>
+      </div>
+
+      {jobData.depends_on?.length > 0 && (
+        <div>
+          <div className="text-gray-600 font-medium text-base">Depends On</div>
+          <div className="text-base mt-1">
+            {jobData.depends_on.map((dependency, index) => (
+              <span key={dependency}>
+                {index > 0 && ', '}
+                <Link
+                  href={`/jobs/${dependency}`}
+                  className="text-blue-600 hover:underline"
+                >
+                  {dependency}
+                </Link>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Batch Progress section - only for batch jobs */}
+      {jobData.batch_total_batches != null && (
+        <div>
+          <div className="text-gray-600 font-medium text-base">
+            Batch Progress
+          </div>
+          <div className="text-base mt-1">
+            {(() => {
+              const completed = jobData.batch_completed_batches || 0;
+              const total = jobData.batch_total_batches;
+              const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+              const barColor =
+                completed >= total ? 'bg-green-500' : 'bg-blue-500';
+              const failed = total - completed;
+              const isTerminal = [
+                'SUCCEEDED',
+                'FAILED',
+                'CANCELLED',
+                'FAILED_SETUP',
+                'FAILED_PRECHECKS',
+                'FAILED_NO_RESOURCE',
+                'FAILED_CONTROLLER',
+              ].includes(jobData.status);
+              return (
+                <div className="space-y-1.5">
+                  <div className="flex items-center gap-3">
+                    <div className="w-40 bg-gray-200 rounded-full h-2.5">
+                      <div
+                        className={`${barColor} h-2.5 rounded-full transition-all`}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <span className="text-sm text-gray-600">
+                      {completed}/{total} ({pct}%)
+                    </span>
+                  </div>
+                  {isTerminal && failed > 0 && completed < total && (
+                    <div className="text-xs text-red-600">
+                      {total - completed} batches incomplete
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
+        </div>
+      )}
+
+      {/* External Links section - full width row */}
+      <div className="col-span-2">
+        <div className="text-gray-600 font-medium text-base">
+          External Links
+        </div>
+        <div className="text-base mt-1">
+          {combinedLinks && Object.keys(combinedLinks).length > 0 ? (
+            <div className="flex flex-wrap gap-4">
+              {Object.entries(combinedLinks).map(([label, url]) => {
+                const normalizedUrl = normalizeUrl(url);
+                return (
+                  <a
+                    key={label}
+                    href={normalizedUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-blue-600 hover:text-blue-800 hover:underline"
+                  >
+                    {label}
+                  </a>
+                );
+              })}
+            </div>
+          ) : (
+            <span className="text-gray-400">-</span>
+          )}
+        </div>
+      </div>
+
+      {/* Details section - surfaces the reason behind the current status
+          (e.g. why a job is still PENDING). A plugin may take over this slot
+          to render richer queue-specific details (e.g. Kueue); otherwise the
+          OSS fallback shows the plain details string so the reason is visible
+          here in the job details view, not just in the event table. */}
+      {jobData.details && (
+        <PluginSlot
+          name="jobs.detail.queue_details"
+          context={{
+            details: jobData.details,
+            queueName: jobData.kueue_queue_name,
+            infra: jobData.full_infra,
+            jobData: jobData,
+            title: 'Queue Details',
+          }}
+          fallback={
+            <div>
+              <div className="text-gray-600 font-medium text-base">Details</div>
+              <div className="text-base mt-1 whitespace-pre-wrap break-words">
+                {jobData.details}
+              </div>
+            </div>
+          }
+        />
+      )}
+
+      {/* Entrypoint section - full width row */}
+      {(jobData.entrypoint || jobData.dag_yaml) && (
+        <div className="col-span-2">
+          <div className="flex items-center">
+            <div className="text-gray-600 font-medium text-base">
+              Entrypoint
+            </div>
+            {jobData.entrypoint && (
+              <Tooltip
+                content={isCommandCopied ? 'Copied!' : 'Copy command'}
+                className="text-muted-foreground"
+              >
+                <button
+                  onClick={copyCommandToClipboard}
+                  className="flex items-center text-gray-500 hover:text-gray-700 transition-colors duration-200 p-1 ml-2"
+                >
+                  {isCommandCopied ? (
+                    <CheckIcon className="w-4 h-4 text-green-600" />
+                  ) : (
+                    <CopyIcon className="w-4 h-4" />
+                  )}
+                </button>
+              </Tooltip>
+            )}
+          </div>
+
+          <div className="space-y-4 mt-3">
+            {/* Launch Command */}
+            {jobData.entrypoint && (
+              <div>
+                <div className="bg-gray-50 border border-gray-200 rounded-md p-3">
+                  <code className="text-sm text-gray-800 font-mono break-all">
+                    {jobData.entrypoint}
+                  </code>
+                </div>
+              </div>
+            )}
+
+            {/* Job YAML - Collapsible */}
+            {jobData.dag_yaml && jobData.dag_yaml !== '{}' && (
+              <div>
+                <div className="flex items-center mb-2">
+                  <button
+                    onClick={toggleYamlExpanded}
+                    className="flex items-center text-left focus:outline-none text-gray-700 hover:text-gray-900 transition-colors duration-200"
+                  >
+                    {isYamlExpanded ? (
+                      <ChevronDownIcon className="w-4 h-4 mr-1" />
+                    ) : (
+                      <ChevronRightIcon className="w-4 h-4 mr-1" />
+                    )}
+                    <span className="text-base">Show SkyPilot YAML</span>
+                  </button>
+
+                  <Tooltip
+                    content={isCopied ? 'Copied!' : 'Copy YAML'}
+                    className="text-muted-foreground"
+                  >
+                    <button
+                      onClick={copyYamlToClipboard}
+                      className="flex items-center text-gray-500 hover:text-gray-700 transition-colors duration-200 p-1 ml-2"
+                    >
+                      {isCopied ? (
+                        <CheckIcon className="w-4 h-4 text-green-600" />
+                      ) : (
+                        <CopyIcon className="w-4 h-4" />
+                      )}
+                    </button>
+                  </Tooltip>
+                </div>
+
+                {isYamlExpanded && (
+                  <div>
+                    {(() => {
+                      const yamlDocs = formatJobYaml(jobData.dag_yaml);
+                      // Build JobGroup header with name and execution
+                      const hasJobGroupConfig =
+                        jobData.name || jobData.execution;
+                      const jobGroupHeader = hasJobGroupConfig
+                        ? [
+                            jobData.name ? `name: ${jobData.name}` : null,
+                            jobData.execution
+                              ? `execution: ${jobData.execution}`
+                              : null,
+                          ]
+                            .filter(Boolean)
+                            .join('\n') + '\n---\n'
+                        : '';
+
+                      if (yamlDocs.length === 0) {
+                        return (
+                          <div className="text-gray-500">No YAML available</div>
+                        );
+                      } else if (yamlDocs.length === 1) {
+                        // Single document - show directly
+                        return (
+                          <YamlCodeBlock
+                            value={jobGroupHeader + yamlDocs[0].content}
+                            readOnly
+                          />
+                        );
+                      } else {
+                        // Multiple documents - show toggle and content
+                        return (
+                          <div className="space-y-4">
+                            {/* Toggle for Full YAML vs Per-Job */}
+                            <div className="flex items-center space-x-4 pb-2 border-b border-gray-200">
+                              <button
+                                onClick={() => setShowFullYaml(false)}
+                                className={`text-sm px-2 py-1 rounded ${!showFullYaml ? 'bg-blue-100 text-blue-700' : 'text-gray-600 hover:text-gray-800'}`}
+                              >
+                                By Job
+                              </button>
+                              <button
+                                onClick={() => setShowFullYaml(true)}
+                                className={`text-sm px-2 py-1 rounded ${showFullYaml ? 'bg-blue-100 text-blue-700' : 'text-gray-600 hover:text-gray-800'}`}
+                              >
+                                Full YAML
+                              </button>
+                            </div>
+
+                            {showFullYaml ? (
+                              // Show full YAML with JobGroup header
+                              <YamlCodeBlock
+                                value={
+                                  jobGroupHeader +
+                                  yamlDocs
+                                    .map((doc) => doc.content)
+                                    .join('\n---\n')
+                                }
+                                readOnly
+                              />
+                            ) : (
+                              // Show per-job YAMLs
+                              yamlDocs.map((doc, index) => (
+                                <div
+                                  key={index}
+                                  className="border-b border-gray-200 pb-4 last:border-b-0"
+                                >
+                                  <button
+                                    onClick={() => toggleYamlDocExpanded(index)}
+                                    className="flex items-center justify-between w-full text-left focus:outline-none"
+                                  >
+                                    <div className="flex items-center">
+                                      {expandedYamlDocs[index] ? (
+                                        <ChevronDownIcon className="w-4 h-4 mr-2" />
+                                      ) : (
+                                        <ChevronRightIcon className="w-4 h-4 mr-2" />
+                                      )}
+                                      <span className="text-sm font-medium text-gray-700">
+                                        Job {index + 1}: {doc.preview}
+                                      </span>
+                                    </div>
+                                  </button>
+                                  {expandedYamlDocs[index] && (
+                                    <div className="mt-3 ml-6">
+                                      <YamlCodeBlock
+                                        value={doc.content}
+                                        readOnly
+                                      />
+                                    </div>
+                                  )}
+                                </div>
+                              ))
+                            )}
+                          </div>
+                        );
+                      }
+                    })()}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+JobDetailsContent.propTypes = {
+  jobData: PropTypes.shape({
+    id: PropTypes.oneOfType([PropTypes.string, PropTypes.number]),
+    name: PropTypes.oneOfType([PropTypes.string, PropTypes.number]),
+    status: PropTypes.string,
+    schedule_state: PropTypes.string,
+    user: PropTypes.string,
+    user_hash: PropTypes.string,
+    workspace: PropTypes.string,
+    submitted_at: PropTypes.oneOfType([
+      PropTypes.string,
+      PropTypes.number,
+      PropTypes.instanceOf(Date),
+    ]),
+    requested_resources: PropTypes.string,
+    infra: PropTypes.string,
+    full_infra: PropTypes.string,
+    cloud: PropTypes.string,
+    resources_str_full: PropTypes.string,
+    resources_str: PropTypes.string,
+    git_commit: PropTypes.string,
+    pool: PropTypes.string,
+    pool_hash: PropTypes.string,
+    entrypoint: PropTypes.string,
+    dag_yaml: PropTypes.string,
+  }),
+  allTasks: PropTypes.array,
+  activeTab: PropTypes.string,
+  setIsLoadingLogs: PropTypes.func,
+  setIsLoadingControllerLogs: PropTypes.func,
+  isLoadingLogs: PropTypes.bool,
+  isLoadingControllerLogs: PropTypes.bool,
+  refreshFlag: PropTypes.number,
+  poolsData: PropTypes.array,
+  links: PropTypes.object,
+  logExtractedLinks: PropTypes.object,
+  onLinksExtracted: PropTypes.func,
+  selectedTaskIndex: PropTypes.number,
+  onTaskChange: PropTypes.func,
+};
+
+export default JobDetails;

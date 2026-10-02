@@ -1,0 +1,74 @@
+import React, { useEffect } from 'react';
+import { TopBar, SidebarProvider } from './sidebar';
+import { useMobile } from '@/hooks/useMobile';
+import { WelcomeNotification } from './WelcomeNotification';
+import { TourButton } from './TourButton';
+import { UpgradeBanner } from './UpgradeBanner';
+import {
+  useUpgradeDetection,
+  UpgradeDetectionProvider,
+} from '@/hooks/useUpgradeDetection';
+import { installUpgradeInterceptor } from '@/utils/apiInterceptor';
+import { PluginSlot } from '@/plugins/PluginSlot';
+
+function DefaultNavbarLayout({ children }) {
+  return (
+    <>
+      {/* Fixed top bar with navigation */}
+      <div className="fixed top-0 left-0 right-0 z-50 shadow-sm">
+        <TopBar />
+      </div>
+
+      {/* Main content */}
+      <div
+        className="transition-all duration-200 ease-in-out min-h-screen"
+        style={{ paddingTop: '56px' }}
+      >
+        <main className="p-6">{children}</main>
+      </div>
+    </>
+  );
+}
+
+// This component is only rendered once plugin registration has settled — see
+// the gate in _app.js. That is what keeps the PluginSlot below from first
+// rendering its fallback and then swapping in a navigation plugin's component,
+// which would remount everything under it.
+function LayoutContent({ children, highlighted }) {
+  const isMobile = useMobile();
+  const { reportUpgrade, clearUpgrade } = useUpgradeDetection();
+
+  // Install the fetch interceptor on mount
+  useEffect(() => {
+    installUpgradeInterceptor(reportUpgrade, clearUpgrade);
+  }, [reportUpgrade, clearUpgrade]);
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      {/* Upgrade banner - rendered outside PluginSlot so it shows
+          regardless of which navigation plugin is active */}
+      <UpgradeBanner />
+
+      <PluginSlot
+        name="layout.navigation"
+        context={{ children, isMobile }}
+        fallback={<DefaultNavbarLayout>{children}</DefaultNavbarLayout>}
+      />
+
+      {/* Welcome notification for first-time visitors */}
+      <WelcomeNotification />
+
+      <TourButton />
+    </div>
+  );
+}
+
+export function Layout(props) {
+  return (
+    <UpgradeDetectionProvider>
+      <SidebarProvider>
+        <LayoutContent {...props} />
+      </SidebarProvider>
+    </UpgradeDetectionProvider>
+  );
+}

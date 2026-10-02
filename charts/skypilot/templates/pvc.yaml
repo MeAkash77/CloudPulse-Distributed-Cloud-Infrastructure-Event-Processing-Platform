@@ -1,0 +1,28 @@
+{{- if and .Values.storage.enabled (not .Values.storage.existingClaim) }}
+{{- $fullName := include "skypilot.fullname" . -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullName }}-state
+  namespace: {{ .Release.Namespace }}
+  {{- with .Values.storage.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.storage.storageClassName }}
+  storageClassName: {{ .Values.storage.storageClassName }}
+  {{- end }}
+  {{- if .Values.storage.volumeName }}
+  volumeName: {{ .Values.storage.volumeName }}
+  {{- end }}
+  accessModes:
+    - {{ .Values.storage.accessMode }}
+  resources:
+    requests:
+      storage: {{ .Values.storage.size }}
+  {{- with .Values.storage.selector }}
+  selector:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}

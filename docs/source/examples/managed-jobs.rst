@@ -1,0 +1,943 @@
+.. _managed-jobs:
+
+Managed Jobs
+============
+
+SkyPilot **managed jobs** (:code:`sky jobs`) manage the full lifecycle of a user job:
+
+* **Provisioning and managing the resources**, on either reserved clusters or elastic instances.
+* **Automatically recovering from failures** (job preemptions, GPU errors, node crashes, etc.) and retrying application errors.
+* **Cleaning up the resources** when done.
+
+Use managed jobs for scaling out --- running a single job for long durations, or running many jobs in parallel.
+
+.. seealso::
+
+   :doc:`pools` for running batch inference workloads or workloads with expensive worker setup.
+
+   :ref:`job-groups` for running multiple heterogeneous tasks in parallel that
+   can communicate with each other (e.g., RL workloads).
+
+To start a managed job, use :code:`sky jobs launch`:
+
+.. code-block:: console
+
+  $ sky jobs launch -n myjob hello_sky.yaml
+
+  Task from YAML spec: hello_sky.yaml
+  Managed job 'myjob' will be launched on (estimated):
+  Considered resources (1 node):
+  ------------------------------------------------------------------------------------------
+   INFRA              INSTANCE      vCPUs   Mem(GB)   GPUS   COST ($)   CHOSEN
+  ------------------------------------------------------------------------------------------
+   AWS (us-east-1)    m6i.2xlarge   8       32        -      0.38          ✔
+  ------------------------------------------------------------------------------------------
+  Launching a managed job 'myjob'. Proceed? [Y/n]: Y
+  ... <job is submitted and launched>
+  (setup pid=2383) Running setup.
+  (myjob, pid=2383) Hello, SkyPilot!
+  ✓ Managed job finished: 1 (status: SUCCEEDED).
+
+  Managed Job ID: 1
+  📋 Useful Commands
+  ├── To cancel the job:                sky jobs cancel 1
+  ├── To stream job logs:               sky jobs logs 1
+  ├── To stream controller logs:        sky jobs logs --controller 1
+  └── To view all managed jobs:         sky jobs queue
+
+The job is launched on a temporary SkyPilot cluster, managed end-to-end, and automatically cleaned up.
+
+Managed jobs have several benefits:
+
+#. :ref:`Auto-recover from different failures <failure-recovery>`: Automatically recover from node crashes, job preemptions, GPU failures, NCCL timeouts, or hardware issues. Application errors can also be retried for a configurable number of times.
+#. :ref:`Scale across infra (clusters, regions, clouds) <scaling-to-many-jobs>`: Easily run and manage a large number of jobs across your infrastructure choices.
+#. :ref:`Managed pipelines <pipeline>`: Run pipelines that contain multiple tasks.
+   Useful for running a sequence of tasks that depend on each other, e.g., data
+   processing, training a model, and then running inference on it.
+#. :ref:`Use spot instances <spot-jobs>`: Optionally run on auto-recovering spot instances to save ~70\% on GPU costs while maintaining reliability through automatic preemption recovery.
+
+
+.. contents:: Contents
+   :local:
+   :backlinks: none
+
+
+.. _managed-job-quickstart:
+
+Create a managed job
+--------------------
+
+A managed job is created from a standard :ref:`SkyPilot YAML <yaml-spec>`. For example:
+
+.. code-block:: yaml
+
+  # qwen_finetune.yaml
+  name: qwen-finetune
+
+  resources:
+    accelerators: B200:8
+
+  envs:
+    # Fill in your wandb key: copy from https://wandb.ai/authorize
+    # Alternatively, you can use `--env WANDB_API_KEY=$WANDB_API_KEY`
+    # to pass the key in the command line, during `sky jobs launch`.
+    WANDB_API_KEY:
+
+  # Assume your working directory is under `~/transformers`.
+  # To get the code for this example, run:
+  # git clone https://github.com/huggingface/transformers.git ~/transformers
+  workdir: ~/transformers
+
+  setup: |
+    pip install -e .
+    cd examples/pytorch/language-modeling/
+    pip install -r requirements.txt
+    pip install wandb
+
+  run: |
+    cd examples/pytorch/language-modeling/
+    torchrun --nproc_per_node=8 run_clm.py \
+      --model_name_or_path Qwen/Qwen3-8B \
+      --dataset_name wikitext \
+      --dataset_config_name wikitext-2-raw-v1 \
+      --do_train \
+      --do_eval \
+      --per_device_train_batch_size 1 \
+      --gradient_accumulation_steps 8 \
+      --learning_rate 2e-5 \
+      --num_train_epochs 3 \
+      --bf16 \
+      --report_to wandb \
+      --output_dir /tmp/qwen_finetune/
+
+.. note::
+
+  :ref:`Workdir <sync-code-artifacts>` and :ref:`file mounts with local files <sync-code-artifacts>` will be :ref:`automatically uploaded to a cloud bucket <intermediate-bucket>`.
+  The bucket will be cleaned up after the job finishes.
+
+To launch this YAML as a managed job, use :code:`sky jobs launch`:
+
+.. code-block:: console
+
+  $ sky jobs launch -n qwen-finetune qwen_finetune.yaml
+
+To see all flags, you can run :code:`sky jobs launch --help` or see the :ref:`CLI reference <sky-job-launch>` for more information.
+
+SkyPilot will launch and start monitoring the job.
+
+- Under the hood, SkyPilot spins up a temporary cluster for the job.
+- If any failure happens (GPU errors, node crashes, or job preemptions), SkyPilot will automatically search for resources to re-launch the job.
+- Resources are cleaned up as soon as the job is finished.
+
+.. tip::
+   You can test your YAML on |unmanaged sky launch|_ , then do a production run as a managed job using :code:`sky jobs launch`.
+
+.. https://stackoverflow.com/a/4836544
+.. |unmanaged sky launch| replace:: unmanaged :code:`sky launch`
+.. _unmanaged sky launch: ../getting-started/quickstart.html
+
+:code:`sky launch` and :code:`sky jobs launch` have a similar interface, but are useful in different scenarios.
+
+.. list-table::
+   :header-rows: 1
+
+   * - :code:`sky launch` (cluster jobs)
+     - :code:`sky jobs launch` (managed jobs)
+   * - Long-lived, manually managed cluster
+     - Dedicated auto-managed cluster for each job
+   * - Failures must be manually recovered
+     - Failures can be auto-recovered
+   * - Number of parallel jobs limited by cluster resources
+     - Easily manage hundreds or thousands of jobs at once
+   * - Good for interactive dev
+     - Good for scaling out production jobs
+
+
+Work with managed jobs
+~~~~~~~~~~~~~~~~~~~~~~
+
+For a list of all commands and options, run :code:`sky jobs --help` or read the :ref:`CLI reference <cli>`.
+
+See a list of managed jobs:
+
+.. code-block:: console
+
+  $ sky jobs queue
+
+.. code-block:: console
+
+  Fetching managed jobs...
+  Managed jobs:
+  ID  NAME           RESOURCES    SUBMITTED  TOT. DURATION  JOB DURATION  #RECOVERIES  STATUS
+  2   qwen-rl        1x [H200:8]  2 hrs ago  2h 47m 18s     2h 36m 18s    0            RUNNING
+  1   qwen-finetune  1x [B200:8]  4 hrs ago  4h 24m 26s     4h 17m 54s    0            RUNNING
+
+This command shows 50 managed jobs by default, use ``--limit <num>`` to show more jobs or use ``--all`` to show all jobs.
+
+Stream the logs of a running managed job:
+
+.. code-block:: console
+
+  $ sky jobs logs -n qwen-finetune  # by name
+  $ sky jobs logs 2           # by job ID
+
+Cancel a managed job:
+
+.. code-block:: console
+
+  $ sky jobs cancel -n qwen-finetune  # by name
+  $ sky jobs cancel 2           # by job ID
+
+.. note::
+  If any failure happens for a managed job, you can check :code:`sky jobs queue -a` for the brief reason
+  of the failure. For more details related to provisioning, check :code:`sky jobs logs --controller <job_id>`.
+
+
+Viewing jobs in dashboard
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The SkyPilot dashboard, ``sky dashboard`` has a **Jobs** page that shows all managed jobs.
+
+
+.. image:: ../images/dashboard-managed-jobs.png
+  :width: 800
+  :alt: Managed jobs dashboard
+
+The UI shows the same information as the CLI ``sky jobs queue -au``.
+
+
+.. _checkpointing:
+
+Checkpointing and recovery
+--------------------------
+
+To recover quickly from failures (hardware issues, preemptions, etc.), your job should checkpoint its state periodically to persistent storage. When a job is auto-recovered after a failure, it can reload the latest checkpoint and resume from there instead of starting over.
+
+SkyPilot supports several persistent storage options for checkpointing:
+
+Using Kubernetes volumes
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+On Kubernetes, :ref:`persistent volumes <volumes-on-kubernetes>` provide high-performance storage for checkpoints. Volumes are ideal when your jobs run on Kubernetes clusters with shared filesystems (NFS, JuiceFS, Nebius shared filesystem, etc.).
+
+.. code-block:: yaml
+
+  resources:
+    infra: k8s
+
+  volumes:
+    /checkpoint: my-volume  # Mount a persistent volume
+
+  run: |
+    # Your training script saves checkpoints to /checkpoint
+    python train.py --checkpoint-dir /checkpoint
+
+Volumes offer better performance than cloud buckets. See :ref:`Volumes <volumes-all>` for setup instructions.
+
+Using cloud buckets
+~~~~~~~~~~~~~~~~~~~
+
+In cases where a volume is not available, use :ref:`cloud bucket mounts <sky-storage>`:
+
+.. code-block:: yaml
+
+  file_mounts:
+    /checkpoint:
+      name: # NOTE: Fill in your bucket name
+      mode: MOUNT_CACHED # or MOUNT
+
+To learn more about the different modes, see :ref:`SkyPilot bucket mounting <sky-storage>` and :ref:`high-performance training <training-guide>`.
+
+Real-world examples
+~~~~~~~~~~~~~~~~~~~
+
+See the :ref:`Model training guide <training-guide>` for more training examples and best practices.
+
+
+
+.. _failure-recovery:
+
+Recovering from application failures
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Hardware failures (e.g., node crashes) and preemptions are auto-recovered by default. However, **user code failures (non-zero exit codes) are not auto-recovered by default**.
+
+In many cases, you'll want jobs to automatically restart on application errors that are actually caused by transient hardware issues. For instance, if a training job crashes due to an NVIDIA driver issue or NCCL timeout, it should be recovered. To enable this, set :code:`max_restarts_on_errors` in :code:`resources.job_recovery` in the :ref:`SkyPilot YAML <yaml-spec>`.
+
+.. code-block:: yaml
+
+  resources:
+    accelerators: A100:8
+    job_recovery:
+      # Restart the job up to 3 times on user code errors.
+      max_restarts_on_errors: 3
+
+This will restart the job, up to 3 times (for a total of 4 attempts), if your code has any non-zero exit code. Each restart runs on a newly provisioned temporary cluster.
+
+Recovering on specific exit codes
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+You can also specify a list of exit codes that should always trigger recovery, regardless of the :code:`max_restarts_on_errors` limit. This is useful when certain exit codes indicate transient errors that should always be retried (e.g., NCCL timeouts, specific GPU driver issues).
+
+.. code-block:: yaml
+
+  resources:
+    accelerators: A100:8
+    job_recovery:
+      max_restarts_on_errors: 3
+      # Always recover if the job exits with code 33 or 34.
+      # In a multi-node job, recovery is triggered if any node exits with a code in [33, 34].
+      # Can also use a single integer: recover_on_exit_codes: 33
+      recover_on_exit_codes: [33, 34]
+
+In this configuration:
+
+- If the job exits with code 33 or 34, it will be recovered. Restarts triggered by these specific exit codes do not count towards the `max_restarts_on_errors` limit.
+- For any other non-zero exit code, the job will be recovered up to 3 times (as specified by :code:`max_restarts_on_errors`)
+
+.. note::
+  For multi-node jobs, recovery is triggered if **any** node exits with a code in :code:`recover_on_exit_codes`.
+
+.. warning::
+
+  You should **not** use exit code 137 in :code:`recover_on_exit_codes`. This code is used internally by SkyPilot and including it may interfere with proper recovery behavior.
+
+
+When will my job be recovered?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Here's how various kinds of failures will be handled by SkyPilot:
+
+.. list-table::
+   :widths: 1 2
+   :header-rows: 0
+
+   * - Hardware fails (GPU errors, node crashes, preemptions):
+     - Tear down the old temporary cluster and provision a new one in another region, then restart the job.
+   * - User code fails (:code:`setup` or :code:`run` commands have non-zero exit code):
+     - If the exit code is in :code:`recover_on_exit_codes`, always restart. Otherwise, if :code:`max_restarts_on_errors` is set, restart up to that many times. If neither condition is met, set the job to :code:`FAILED` or :code:`FAILED_SETUP`.
+   * - Can't find available resources due to capacity:
+     - Try other infra (clusters, regions, or clouds) indefinitely until resources are found.
+   * - Cloud config/auth issue or invalid job configuration:
+     - Mark the job as :code:`FAILED_PRECHECKS` and exit. Won't be retried.
+
+To see the logs of user code (:code:`setup` or :code:`run` commands), use :code:`sky jobs logs <job_id>`. If there is a provisioning or recovery issue, you can see the provisioning logs by running :code:`sky jobs logs --controller <job_id>`.
+
+.. tip::
+  Under the hood, SkyPilot uses a "controller" to provision, monitor, and recover the underlying temporary clusters. See :ref:`jobs-controller`.
+
+
+.. _spot-jobs:
+
+Running on spot instances (optional)
+------------------------------------
+
+To reduce costs, managed jobs can optionally run on spot instances. Spot preemptions are auto-recovered by SkyPilot, just like hardware failures.
+
+To run on spot instances, use :code:`sky jobs launch --use-spot`, or specify :code:`use_spot: true` in your SkyPilot YAML.
+
+.. code-block:: yaml
+
+  name: spot-job
+
+  resources:
+    accelerators: A100:8
+    use_spot: true
+
+  run: ...
+
+.. tip::
+   Spot instances are cloud VMs that may be "preempted".
+   The cloud provider can forcibly shut down the underlying VM and remove your access to it, interrupting the job running on that instance.
+
+   In exchange, spot instances are significantly cheaper than normal instances that are not subject to preemption (so-called "on-demand" instances).
+   Depending on the cloud and VM type, spot instances can be 70-90% cheaper.
+
+SkyPilot automatically finds available spot instances across regions and clouds to maximize availability.
+Any spot preemptions are automatically handled by SkyPilot without user intervention.
+
+.. note::
+   By default, a job will be restarted from scratch after each recovery (whether from preemption or hardware failure).
+   To avoid redoing work after recovery, implement :ref:`checkpointing <checkpointing>`.
+   Your application code can checkpoint its progress periodically to persistent storage (a :ref:`Kubernetes volume <volumes-on-kubernetes>` or :ref:`cloud bucket <sky-storage>`). The program can then reload the latest checkpoint when restarted.
+
+Here is :ref:`an example of a training job <qwen>` failing over different regions across AWS and GCP.
+
+.. image:: https://i.imgur.com/Vteg3fK.gif
+  :width: 600
+  :alt: GIF for managed job auto-recovery across regions
+  :align: center
+
+Quick comparison between *managed spot jobs* vs. *launching unmanaged spot clusters*:
+
+.. list-table::
+   :widths: 30 18 12 35
+   :header-rows: 1
+
+   * - Command
+     - Managed?
+     - SSH-able?
+     - Best for
+   * - :code:`sky jobs launch --use-spot`
+     - Yes, preemptions are auto-recovered
+     - No
+     - Scaling out long-running jobs (e.g., data processing, training, batch inference)
+   * - :code:`sky launch --use-spot`
+     - No, preemptions are not handled
+     - Yes
+     - Interactive dev on spot instances (especially for hardware with low preemption rates)
+
+
+Either spot or on-demand/reserved
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+By default, on-demand instances will be used (not spot instances). To use spot instances, you must specify :code:`--use-spot` on the command line or :code:`use_spot: true` in your SkyPilot YAML.
+
+However, you can also tell SkyPilot to use **both spot instance and on-demand instances**, depending on availability. In your SkyPilot YAML, use ``any_of`` to specify either spot or on-demand/reserved instances as
+candidate resources for a job. See documentation :ref:`here
+<multiple-resources>` for more details.
+
+.. code-block:: yaml
+
+  resources:
+    accelerators: A100:8
+    any_of:
+      - use_spot: true
+      - use_spot: false
+
+In this example, SkyPilot will choose the cheapest resource to use, which almost certainly
+will be spot instances. If spot instances are not available, SkyPilot will fall back to launching on-demand/reserved instances.
+
+
+.. _scaling-to-many-jobs:
+
+Scaling to many jobs
+--------------------
+
+You can easily manage dozens, hundreds, or thousands of managed jobs at once. This is a great fit for batch jobs such as **data processing**, **batch inference**, or **hyperparameter sweeps**. To see an example launching many jobs in parallel, see :ref:`many-jobs`.
+
+.. tip::
+
+  For workloads that can reuse the same environment across many jobs, consider using :ref:`Pools <pool>`. Pools provide faster cold-starts by maintaining a set of pre-provisioned workers that can be reused across job submissions.
+
+.. TODO(cooperc): code block or dashboard showcasing UX of many jobs (thousand-scale)
+
+To increase the maximum number of jobs that can run at once, see :ref:`consolidation-mode-resource-planning`.
+
+.. _num-jobs:
+
+Submitting many jobs at once with ``--num-jobs``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When every job runs the same YAML and differs only in which slice of the work it
+processes, use :code:`--num-jobs` to submit them all with one command:
+
+.. code-block:: console
+
+  $ sky jobs launch --num-jobs 10 batch-job.yaml
+
+This submits 10 independent managed jobs. Each job is launched on its own
+cluster and is recovered independently if it is preempted or fails — exactly
+as if you had run :code:`sky jobs launch` ten times.
+
+Each job is given two environment variables that let it work out which slice of
+the work is its own:
+
+- :code:`$SKYPILOT_JOB_RANK`: this job's rank, an integer from :code:`0` to :code:`num_jobs - 1`.
+- :code:`$SKYPILOT_NUM_JOBS`: the total number of jobs submitted.
+
+Both are always set, so the same YAML also works when launched as a single job
+(rank :code:`0` of :code:`1` job).
+
+For example, to evaluate 1000 prompts across 10 jobs, job rank :code:`i` can
+process prompts :code:`i * 100` through :code:`(i + 1) * 100`:
+
+.. code-block:: yaml
+
+  # batch-job.yaml
+  name: batch-workload
+
+  resources:
+    accelerators: {H100:1, H200:1}
+
+  run: |
+    echo "Job rank: $SKYPILOT_JOB_RANK out of $SKYPILOT_NUM_JOBS"
+    echo "Processing prompts from $(($SKYPILOT_JOB_RANK * 100)) to $((($SKYPILOT_JOB_RANK + 1) * 100))"
+    # Actual business logic here...
+    echo "Job $SKYPILOT_JOB_RANK finished"
+
+Submitting it produces one job per rank:
+
+.. code-block:: console
+
+  $ sky jobs launch --num-jobs 10 batch-job.yaml
+  YAML to run: batch-job.yaml
+  Submitting 10 managed jobs. Each job will be launched on its own cluster.
+  Managed job 'batch-workload' will be launched on (estimated):
+  ...
+  Launching 10 managed jobs 'batch-workload'. Proceed? [Y/n]: Y
+  Jobs submitted with IDs: 1-10.
+  📋 Useful Commands
+  ├── Show all jobs:                      https://<api-server>/dashboard/jobs
+  ├── To stream job logs:                 sky jobs logs <job-id>
+  ├── To stream controller logs:          sky jobs logs --controller <job-id>
+  └── To cancel all these jobs:           sky jobs cancel <job-ids>
+
+All 10 jobs are submitted immediately, but they do not necessarily all start at
+once: how many run concurrently is bounded by the jobs controller's capacity.
+Jobs beyond that limit stay :code:`PENDING` and start as capacity frees up. See
+:ref:`consolidation-mode-resource-planning` to raise the limit.
+
+.. note::
+
+  Use :code:`--num-jobs` when the jobs share one YAML — either because they
+  differ only by rank, or because each job works out its own assignment (e.g.,
+  a sweep agent that pulls its next configuration from a controller). If each
+  job needs different resources or a different launch command, launch them
+  separately instead — see :ref:`many-jobs` for that workflow.
+
+
+.. _pipeline:
+
+Managed pipelines
+-----------------
+
+A pipeline is a managed job that contains a sequence of tasks running one after another.
+
+This is useful for running a sequence of tasks that depend on each other, e.g., training a model and then running inference on it.
+Different tasks can have different resource requirements to use appropriate per-task resources, which saves costs, while  keeping the burden of managing the tasks off the user.
+
+.. seealso::
+
+  :ref:`job-groups` for running multiple tasks **in parallel** instead of sequentially.
+
+.. note::
+  In other words, a managed job is either a single task, a pipeline (sequential tasks), or a :ref:`job group <job-groups>` (parallel tasks). All managed jobs are submitted by :code:`sky jobs launch`.
+
+To run a pipeline, specify the sequence of tasks in a YAML file. Here is an example:
+
+.. code-block:: yaml
+
+  name: pipeline
+
+  ---
+
+  name: train
+
+  resources:
+    accelerators: V100:8
+    any_of:
+      - use_spot: true
+      - use_spot: false
+
+  file_mounts:
+    /checkpoint:
+      name: train-eval # NOTE: Fill in your bucket name
+      mode: MOUNT
+
+  setup: |
+    echo setup for training
+
+  run: |
+    echo run for training
+    echo save checkpoints to /checkpoint
+
+  ---
+
+  name: eval
+
+  resources:
+    accelerators: T4:1
+    use_spot: false
+
+  file_mounts:
+    /checkpoint:
+      name: train-eval # NOTE: Fill in your bucket name
+      mode: MOUNT
+
+  setup: |
+    echo setup for eval
+
+  run: |
+    echo load trained model from /checkpoint
+    echo eval model on test set
+
+
+The YAML above defines a pipeline with two tasks. The first :code:`name:
+pipeline` names the pipeline. The first task has name :code:`train` and the
+second task has name :code:`eval`. The tasks are separated by a line with three
+dashes :code:`---`. Each task has its own :code:`resources`, :code:`setup`, and
+:code:`run` sections. Tasks are executed sequentially. If a task fails, later tasks are skipped.
+
+.. tip::
+
+   To explicitly indicate a pipeline (sequential execution), you can add
+   :code:`execution: serial` to the header. This is optional since pipelines
+   are the default when :code:`execution` is omitted. Use :code:`execution: parallel`
+   for :ref:`job groups <job-groups>` instead.
+
+To pass data between the tasks, use a shared file mount. In this example, the :code:`train` task writes its output to the :code:`/checkpoint` file mount, which the :code:`eval` task is then able to read from.
+
+To submit the pipeline, the same command :code:`sky jobs launch` is used. The pipeline will be automatically launched and monitored by SkyPilot. You can check the status of the pipeline with :code:`sky jobs queue` or :code:`sky dashboard`.
+
+.. code-block:: console
+
+  $ sky jobs launch -n pipeline pipeline.yaml
+
+  $ sky jobs queue
+
+  Fetching managed job statuses...
+  Managed jobs
+  In progress jobs: 1 RECOVERING
+  ID  TASK  NAME      REQUESTED                    SUBMITTED    TOT. DURATION  JOB DURATION  #RECOVERIES  STATUS
+  8         pipeline  -                            50 mins ago  47m 45s        -             1            RECOVERING
+   ↳  0     train     1x [V100:8][Spot|On-demand]  50 mins ago  47m 45s        -             1            RECOVERING
+   ↳  1     eval      1x [T4:1]                    -            -              -             0            PENDING
+
+.. note::
+
+  The :code:`$SKYPILOT_TASK_ID` environment variable is also available in the :code:`run` section of each task. It is unique for each task in the pipeline.
+  For example, the :code:`$SKYPILOT_TASK_ID` for the :code:`eval` task above is:
+  "sky-managed-2022-10-06-05-17-09-750781_pipeline_eval_8-1".
+
+
+File uploads for managed jobs
+-----------------------------
+
+For managed jobs, SkyPilot uses an intermediate bucket to store files used in the task, such as local :code:`file_mounts` and the :code:`workdir`.
+
+If you do not configure a bucket, SkyPilot will automatically create a temporary bucket named :code:`skypilot-filemounts-{username}-{run_id}` for each job launch. SkyPilot automatically deletes the bucket after the job completes.
+
+**Object store access is not necessary to use managed jobs.** If cloud object storage is not available (e.g., Kubernetes deployments), SkyPilot automatically falls back to a two-hop upload that copies files to the jobs controller and then downloads them to the jobs.
+
+.. tip::
+
+  To force disable using cloud buckets even when available, set :ref:`jobs.force_disable_cloud_bucket <config-yaml-jobs-force-disable-cloud-bucket>` in your config:
+
+  .. code-block:: yaml
+
+    # ~/.sky/config.yaml
+    jobs:
+      force_disable_cloud_bucket: true
+
+.. _intermediate-bucket:
+
+Setting the job files bucket
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+If you want to use a pre-provisioned bucket for storing intermediate files, set :code:`jobs.bucket` in :code:`~/.sky/config.yaml`:
+
+.. code-block:: yaml
+
+  # ~/.sky/config.yaml
+  jobs:
+    bucket: s3://my-bucket  # Supports s3://, gs://, https://<azure_storage_account>.blob.core.windows.net/<container>, r2://, cos://<region>/<bucket>
+
+
+If you choose to specify a bucket, ensure that the bucket already exists and that you have the necessary permissions.
+
+When using a pre-provisioned intermediate bucket with :code:`jobs.bucket`, SkyPilot creates job-specific directories under the bucket root to store files. They are organized in the following structure:
+
+.. code-block:: text
+
+  # cloud bucket, s3://my-bucket/ for example
+  my-bucket/
+  ├── job-15891b25/            # Job-specific directory
+  │   ├── local-file-mounts/   # Files from local file mounts
+  │   ├── tmp-files/           # Temporary files
+  │   └── workdir/             # Files from workdir
+  └── job-cae228be/            # Another job's directory
+      ├── local-file-mounts/
+      ├── tmp-files/
+      └── workdir/
+
+When using a custom bucket (:code:`jobs.bucket`), the job-specific directories (e.g., :code:`job-15891b25/`) created by SkyPilot are removed when the job completes.
+
+.. tip::
+  Multiple users can share the same intermediate bucket. Each user's jobs will have their own unique job-specific directories, ensuring that files are kept separate and organized.
+
+.. _nested-skypilot-managed-jobs:
+
+Calling SkyPilot API from within managed jobs
+---------------------------------------------
+
+By default (:code:`api_server_access: true`), SkyPilot automatically injects API
+server credentials into the job's environment when the server supports it. This
+means managed jobs can call the SkyPilot CLI/SDK to launch new workloads:
+
+.. code-block:: yaml
+
+  setup: |
+    pip install "skypilot-nightly[remote]"
+
+  run: |
+    sky jobs launch -y -n nested --cpus 2 "echo hello from nested job"
+
+The credentials are automatically injected and revoked when the job finishes. To disable this, set :code:`api_server_access: false`.
+
+When the launching job is a task of a :ref:`job group <job-groups>`, the new job attaches to that group: it is listed under the group and cancelled with it. See :ref:`job-groups-dynamic-members`. Pass :code:`--no-job-group` to launch a top-level job instead.
+
+.. note::
+
+  Credential injection requires the SkyPilot API server to have :ref:`service accounts <service-accounts>` enabled. If not enabled, injection is silently skipped.
+
+.. _jobs-controller:
+
+How it works
+------------
+
+Under the hood, SkyPilot manages the full lifecycle of each managed job: provisioning temporary clusters, monitoring job health, recovering from failures, and cleaning up resources.
+
+With a :ref:`remote SkyPilot API server <sky-api-server-remote>`, the API server manages jobs directly. The number of jobs that can run in parallel is bounded by the total memory available to the API server. See :ref:`consolidation-mode-resource-planning` for a capacity table and tuning guidance.
+
+.. _jobs-consolidation-mode:
+
+.. tip::
+  This is referred to as "consolidation mode" in :ref:`SkyPilot configuration <config-yaml-jobs-controller-consolidation-mode>`.
+
+.. note::
+  When using a :ref:`RollingUpdate upgrade strategy <sky-api-server-upgrade-strategy>`, local ``file_mounts`` and ``workdir`` for managed jobs are stored on the pod's ephemeral filesystem and may be lost when the old pod is replaced. To avoid this, enable :ref:`persistent storage <helm-values-storage-enabled>` with a ``ReadWriteMany`` (RWX) PVC, or use :ref:`cloud buckets <sky-storage>` / :ref:`volumes <volumes-on-kubernetes>` / :ref:`git <sync-code-and-project-files-git>` instead of local paths.
+
+.. _jobs-controller-remote:
+
+[Legacy] Using a remote jobs controller
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Alternatively, SkyPilot can launch a dedicated **jobs controller** -- a small on-demand CPU VM or Kubernetes pod -- to manage all jobs. This is used automatically when running with a local API server (no remote server deployed), or can be explicitly enabled.
+
+.. image:: ../images/jobs-consolidation-mode.svg
+  :width: 800
+  :alt: Architecture diagram of SkyPilot remote API server with and without a remote jobs controller
+  :align: center
+
+To use a remote jobs controller with a remote API server, set ``consolidation_mode: false``:
+
+.. code-block:: yaml
+
+  # ~/.sky/config.yaml
+  jobs:
+    controller:
+      consolidation_mode: false
+
+.. note::
+  You must **restart the API server** after changing this setting for it to take effect.
+
+.. note::
+  If you were using managed jobs before upgrading to a version with consolidation mode, your existing remote jobs controller will continue to be used automatically. See :ref:`migrating-from-remote-controller` to switch to the default mode.
+
+The controller cluster is automatically launched when the first managed job is submitted, and it is autostopped after it has been idle for 10 minutes (i.e., after all managed jobs finish and no new managed job is submitted in that duration).
+Thus, **no user action is needed** to manage its lifecycle.
+
+You can see the controller with :code:`sky status -u` and refresh its status by using the :code:`-r/--refresh` flag.
+
+While the cost of the jobs controller is negligible (~$0.25/hour when running and less than $0.004/hour when stopped),
+you can still tear it down manually with
+:code:`sky down <job-controller-name>`, where the ``<job-controller-name>`` can be found in the output of :code:`sky status -u`.
+
+.. note::
+  Tearing down the jobs controller loses all logs and status information for the finished managed jobs. It is only allowed when there are no in-progress managed jobs to ensure no resource leakage.
+
+.. _managed-jobs-high-availability-controller:
+
+High availability controller
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+.. warning::
+
+    **Deprecated.** HA mode for the remote jobs controller is deprecated. By default, the API server runs the jobs controller directly via :ref:`consolidation mode <jobs-consolidation-mode>`, which already provides resilience through the Kubernetes Deployment and persistent database — no separate HA controller is needed.
+
+High availability mode ensures the remote controller cluster remains resilient to failures by running it as a Kubernetes Deployment with automatic restarts and persistent storage. This helps maintain management capabilities even if the controller pod crashes or the node fails.
+
+To enable high availability for Managed Jobs, set the ``high_availability`` flag to ``true`` under ``jobs.controller`` in your ``~/.sky/config.yaml``, and ensure the controller runs on Kubernetes:
+
+.. code-block:: yaml
+    :emphasize-lines: 4-5
+
+    jobs:
+      controller:
+        consolidation_mode: false
+        resources:
+          cloud: kubernetes
+        high_availability: true
+
+This will deploy the controller as a Kubernetes Deployment with persistent storage, allowing automatic recovery on failures.
+
+.. _managed-jobs-creds:
+
+Using long-lived credentials
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Since the jobs controller is a long-lived instance that manages other cloud instances, it's best to **use static credentials that do not expire**. If a credential expires, it could leave the controller with no way to clean up a job, leading to expensive cloud instance leaks.
+
+To use long-lived static credentials for the jobs controller, just make sure the right credentials are in use by SkyPilot. They will be automatically uploaded to the jobs controller. **If you're already using local credentials that don't expire, no action is needed.**
+
+To set up credentials:
+
+- **AWS**: :ref:`Create a dedicated SkyPilot IAM user <dedicated-aws-user>` and use a static ``~/.aws/credentials`` file.
+- **GCP**: :ref:`Create a GCP service account <gcp-service-account>` with a static JSON key file.
+- **Other clouds**: Make sure you are using credentials that do not expire.
+
+.. _jobs-controller-custom-resources:
+
+Customizing controller resources
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+You may want to customize the jobs controller resources for several reasons:
+
+#. Increasing the maximum number of jobs that can be run concurrently, which is based on the controller's memory allocation. (Default: ~600, see :ref:`best practices <jobs-controller-sizing>`)
+#. Use a lower-cost controller (if you have a low number of concurrent managed jobs).
+#. Enforcing the jobs controller to run on a specific location. (Default: cheapest location)
+#. Changing the disk_size of the jobs controller to store more logs. (Default: 50GB)
+
+To achieve the above, you can specify custom configs in :code:`~/.sky/config.yaml` with the following fields:
+
+.. code-block:: yaml
+
+  jobs:
+    # NOTE: these settings only take effect for a new jobs controller, not if
+    # you have an existing one.
+    controller:
+      resources:
+        # All configs below are optional.
+        # Specify the location of the jobs controller.
+        infra: gcp/us-central1
+        # Bump cpus to allow more managed jobs to be launched concurrently. (Default: 4+)
+        cpus: 8+
+        # Bump memory to allow more managed jobs to be running at once.
+        # By default, it scales with CPU (4x).
+        memory: 64+
+        # Specify the disk_size in GB of the jobs controller.
+        disk_size: 100
+
+The :code:`resources` field has the same spec as a normal SkyPilot job; see `here <https://docs.skypilot.co/en/latest/reference/yaml-spec.html>`__.
+
+.. note::
+  These settings will not take effect if you have an existing controller (either
+  stopped or live).  For them to take effect, tear down the existing controller
+  first, which requires all in-progress jobs to finish or be canceled.
+
+To see your current jobs controller, use :code:`sky status -u`.
+
+.. code-block:: console
+
+  $ sky status -u --refresh
+
+  Clusters
+  NAME                          INFRA             RESOURCES                                  STATUS   AUTOSTOP  LAUNCHED
+  my-cluster-1                  AWS (us-east-1)   1x(cpus=16, m6i.4xlarge, ...)              STOPPED  -         1 week ago
+  my-other-cluster              GCP (us-central1) 1x(cpus=16, n2-standard-16, ...)           STOPPED  -         1 week ago
+  sky-jobs-controller-919df126  AWS (us-east-1)   1x(cpus=4, m6i.xlarge, disk_size=50)       STOPPED  10m       1 day ago
+
+  Managed jobs
+  No in-progress managed jobs.
+
+  Services
+  No live services.
+
+In this example, you can see the jobs controller (:code:`sky-jobs-controller-919df126`) is an m6i.xlarge on AWS, which is the default size.
+
+To tear down the current controller, so that new resource config is picked up, use :code:`sky down`.
+
+.. code-block:: console
+
+  $ sky down sky-jobs-controller-919df126
+
+  WARNING: Tearing down the managed jobs controller. Please be aware of the following:
+   * All logs and status information of the managed jobs (output of `sky jobs queue`) will be lost.
+   * No in-progress managed jobs found. It should be safe to terminate (see caveats above).
+  To proceed, please type 'delete': delete
+  Terminating cluster sky-jobs-controller-919df126...done.
+  Terminating 1 cluster ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 100% 0:00:00
+
+The next time you use :code:`sky jobs launch`, a new controller will be created with the updated resources.
+
+
+.. _jobs-controller-sizing:
+
+Scaling best practices
+^^^^^^^^^^^^^^^^^^^^^^^
+
+.. tip::
+  It's highly recommended to use :ref:`long-lived credentials for cloud authentication <managed-jobs-creds>`. This is so that the jobs controller credentials do not expire. This is particularly important in large production runs to avoid leaking resources.
+
+The number of active jobs that the controller supports is based on available memory. There are two limits:
+
+- **Actively launching job count**: limit is ``8 * floor((memory - 2GiB) / 3.59GiB)``, with a maximum of 512 jobs.
+  A job counts towards this limit when it is first starting, launching instances, or recovering.
+
+  - The default controller size has 16 GiB memory, meaning **24 jobs** can be actively launching at once.
+
+- **Running job count**: limit is ``200 * floor((memory - 2GiB) / 3.59GiB)``, with a maximum of 2000 jobs.
+
+  - The default controller supports up to **600 jobs** running in parallel.
+
+The default size is appropriate for most moderate use cases, but if you need to run hundreds or thousands of jobs at once, you should increase the controller size. Each additional ~3.6 GiB of controller memory adds capacity for 8 concurrent launches and 200 concurrently running jobs.
+
+Increase CPU modestly as memory grows to keep controller responsiveness high, but note that the hard parallelism limits are driven by available memory.
+A ratio of 4 GiB memory per CPU works well in our testing.
+
+For absolute maximum parallelism, the following per-cloud configurations are recommended:
+
+.. tab-set::
+
+    .. tab-item:: AWS
+
+        .. code-block:: yaml
+
+            jobs:
+              controller:
+                resources:
+                  infra: aws
+                  cpus: 192
+                  memory: 4x
+                  disk_size: 500
+
+    .. tab-item:: GCP
+
+        .. code-block:: yaml
+
+            jobs:
+              controller:
+                resources:
+                  infra: gcp
+                  cpus: 128
+                  memory: 4x
+                  disk_size: 500
+
+    .. tab-item:: Azure
+
+        .. code-block:: yaml
+
+            jobs:
+              controller:
+                resources:
+                  infra: azure
+                  cpus: 96
+                  memory: 4x
+                  disk_size: 500
+
+.. note::
+  Remember to tear down your controller to apply these changes, as described above.
+
+With this configuration, you can launch up to 512 jobs at once.
+
+.. _migrating-from-remote-controller:
+
+Migrating from a remote jobs controller
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If you were using managed jobs before upgrading to a version with default consolidation mode (0.12+), your existing remote jobs controller will continue to be used. SkyPilot does not auto-enable consolidation mode when an existing controller cluster is found.
+
+To check if you have an existing controller:
+
+.. code-block:: console
+
+  $ sky status -u | grep sky-jobs-controller
+
+If a controller is listed, you are using a remote jobs controller. To migrate to the default mode (API server manages jobs directly):
+
+1. Cancel all in-progress managed jobs: :code:`sky jobs cancel -a`
+2. Tear down the controller: :code:`sky down <controller-name>`
+3. Restart the API server to pick up the change.
+
+After restart, the API server will manage jobs directly, and no separate controller cluster will be created.

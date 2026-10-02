@@ -1,0 +1,18 @@
+# Pool configuration for Stable Diffusion batch image generation
+# Uses L4 GPUs (24GB VRAM, good for SD v1.5 in fp16)
+
+pool:
+  workers: 3  # Number of parallel workers
+
+resources:
+  accelerators: L4:1  # 1x L4 GPU per worker
+
+setup: |
+  uv venv .venv
+  source .venv/bin/activate
+  uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+  # transformers must stay <5.10: the cu124 index tops out at torch 2.6.0,
+  # while transformers 5.10.x references torch.float8_e8m0fnu (torch >= 2.7)
+  # at import time, crashing `from diffusers import StableDiffusionPipeline`.
+  # See https://github.com/huggingface/transformers/issues/46389.
+  uv pip install diffusers 'transformers<5.10' accelerate safetensors huggingface_hub

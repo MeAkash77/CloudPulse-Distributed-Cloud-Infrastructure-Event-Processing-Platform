@@ -1,0 +1,58 @@
+name: resnet-distributed-app
+
+
+resources:
+    accelerators: V100
+
+num_nodes: 2
+
+setup: |
+    uv venv --python 3.10 --seed
+    source .venv/bin/activate
+    git clone https://github.com/michaelzhiluo/pytorch-distributed-resnet
+    cd pytorch-distributed-resnet
+    # The cu118 build ships kernels for sm_70 (V100) through sm_90 (H100), so
+    # this example runs on both older and Hopper GPUs. Do not downgrade to
+    # torch 1.12.1+cu113: it only goes up to sm_86 and fails on H100 with
+    # "no kernel image is available for execution on the device".
+    uv pip install -r requirements.txt numpy==1.26.4 torch==2.7.1+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+    mkdir -p data  && mkdir -p saved_models
+    # Check if working directory is on a shared filesystem (NFS, Lustre, etc.)
+    # If shared, only download on rank 0 to avoid race conditions
+    fstype=$(stat -fc%T .)
+    if [[ "$fstype" =~ ^(nfs|lustre|fuse\.lustre|cifs|smb)$ ]] && [ "${SKYPILOT_SETUP_NODE_RANK:-0}" -ne 0 ]; then
+        exit 0
+    fi
+    cd data && \
+    # CIFAR-10 is served from a SkyPilot-maintained GCS mirror because the
+    # upstream host (cs.toronto.edu) is often slow or unavailable. The md5
+    # check guards against truncated downloads (a truncated file can leave
+    # wget exiting 0, which would otherwise skip the fallback and fail in tar).
+    CIFAR_MD5=c58f30108f718f92721af3b95e74349a
+    cifar_ok() { echo "${CIFAR_MD5}  cifar-10-python.tar.gz" | md5sum -c --status; }
+    timeout 90s wget -c --quiet --timeout=30 --tries=2 https://storage.googleapis.com/skypilot-example-data/datasets/cifar-10-python.tar.gz || true
+    if ! cifar_ok; then
+        rm -f cifar-10-python.tar.gz
+        timeout 120s wget --quiet --timeout=30 --tries=2 https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz
+        cifar_ok
+    fi
+    tar -xzf cifar-10-python.tar.gz
+
+run: |
+    source .venv/bin/activate
+    cd pytorch-distributed-resnet
+
+    num_nodes=`echo "$SKYPILOT_NODE_IPS" | wc -l`
+    master_addr=`echo "$SKYPILOT_NODE_IPS" | head -n1`
+    # resnet_ddp.py takes the local rank as --local_rank, but torch>=2.0's
+    # launcher passes the hyphenated --local-rank, which its argparse rejects.
+    # nproc_per_node is 1, so the local rank is always 0: pass it explicitly and
+    # use torchrun (which does not inject a rank flag of its own).
+    #
+    # num_epochs is deliberately generous: test_cancel_pytorch cancels this job
+    # ~2.5min in and then asserts the GPU went idle, so the run has to still be
+    # alive at that point. 20 epochs finishes in under 4min on 2xH100, which
+    # left the cancel almost nothing to cancel.
+    torchrun --nproc_per_node=1 \
+    --nnodes=$num_nodes --node_rank=${SKYPILOT_NODE_RANK} --master_addr=$master_addr \
+    --master_port=8008 resnet_ddp.py --local_rank=0 --num_epochs 60

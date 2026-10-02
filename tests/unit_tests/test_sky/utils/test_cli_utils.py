@@ -1,0 +1,536 @@
+"""Tests for CLI utilities.
+
+This module contains tests for the CLI utilities in sky.utils.cli_utils.
+"""
+import re
+import time
+
+import colorama
+
+from sky import backends
+from sky.resources import Resources
+from sky.utils import status_lib
+from sky.utils.cli_utils import status_utils
+
+
+def test_status_table_format():
+    """Test the status table format."""
+    # Test AWS case
+    mock_resources = Resources(infra='aws/us-east-1',
+                               instance_type='m6i.2xlarge')
+    mock_handle = backends.CloudVmRayResourceHandle(
+        cluster_name='test-cluster',
+        cluster_name_on_cloud='test-cluster-cloud',
+        cluster_yaml=None,
+        launched_nodes=1,
+        launched_resources=mock_resources)
+    mock_record = {
+        'name': 'test-cluster',
+        'handle': mock_handle,
+        'launched_at': int(time.time()) - 3600,  # 1 hour ago
+        'status': status_lib.ClusterStatus.UP,
+        'autostop': 300,  # 5 minutes
+        'to_down': False,
+    }
+
+    # Test the infra format
+    infra_str = status_utils._get_infra(mock_record)
+    assert infra_str == 'AWS (us-east-1)'
+
+    # Test the resources format
+    resources_str = status_utils._get_resources(mock_record)
+    assert resources_str == '1x(cpus=8, mem=32, m6i.2xlarge, ...)'
+
+    # Test Kubernetes case
+    mock_k8s_resources = Resources(infra='k8s/my-ctx', cpus='2+', memory='4+')
+    mock_k8s_handle = backends.CloudVmRayResourceHandle(
+        cluster_name='test-k8s-cluster',
+        cluster_name_on_cloud='test-k8s-cluster-cloud',
+        cluster_yaml=None,
+        launched_nodes=2,
+        launched_resources=mock_k8s_resources)
+    mock_k8s_record = {
+        'name': 'test-k8s-cluster',
+        'handle': mock_k8s_handle,
+        'launched_at': int(time.time()) - 3600,  # 1 hour ago
+        'status': status_lib.ClusterStatus.UP,
+        'autostop': -1,  # No autostop
+        'to_down': False,
+        'resources_str': '2x (...)',
+    }
+
+    # Test K8S infra format
+    k8s_infra_str = status_utils._get_infra(mock_k8s_record)
+    assert k8s_infra_str == 'Kubernetes (my-ctx)'
+
+    # Test K8S resources format
+    k8s_resources_str = status_utils._get_resources(mock_k8s_record)
+    assert k8s_resources_str == '2x (...)'
+
+    # For test purposes, override _get_resources to avoid trying to call
+    # resources_utils.get_readable_resources_repr on a Resources object
+    orig_get_resources = status_utils._get_resources
+
+    def mock_get_resources(cluster_record, truncate=True):
+        return cluster_record.get('resources_str', '-')
+
+    status_utils._get_resources = mock_get_resources
+
+    try:
+        # Test SSH case
+        mock_ssh_handle = backends.CloudVmRayResourceHandle(
+            cluster_name='test-ssh-cluster',
+            cluster_name_on_cloud='test-ssh-cluster-cloud',
+            cluster_yaml=None,
+            launched_nodes=1,
+            launched_resources=None)
+        mock_ssh_record = {
+            'name': 'test-ssh-cluster',
+            'handle': mock_ssh_handle,
+            'launched_at': int(time.time()) - 3600,  # 1 hour ago
+            'status': status_lib.ClusterStatus.UP,
+            'autostop': -1,  # No autostop
+            'to_down': False,
+            'resources_str': '1x (...)',
+            'infra': 'SSH/my-tobi-box',
+        }
+
+        # Test SSH infra format
+        ssh_infra_str = status_utils._get_infra(mock_ssh_record)
+        assert ssh_infra_str == 'SSH/my-tobi-box'
+
+        # Test SSH resources format
+        ssh_resources_str = status_utils._get_resources(mock_ssh_record)
+        assert ssh_resources_str == '1x (...)'
+    finally:
+        # Restore original function
+        status_utils._get_resources = orig_get_resources
+
+
+def test_show_status_table():
+    """Test the full status table output."""
+    mock_resources = Resources(infra='aws/us-east-1',
+                               instance_type='m6i.2xlarge')
+    mock_handle = backends.CloudVmRayResourceHandle(
+        cluster_name='test-cluster',
+        cluster_name_on_cloud='test-cluster-cloud',
+        cluster_yaml=None,
+        launched_nodes=1,
+        launched_resources=mock_resources)
+
+    # Test different cluster statuses
+    statuses = [
+        status_lib.ClusterStatus.UP,
+        status_lib.ClusterStatus.INIT,
+        status_lib.ClusterStatus.STOPPED,
+    ]
+
+    for status in statuses:
+        mock_record = {
+            'name': 'test-cluster',
+            'handle': mock_handle,
+            'launched_at': int(time.time()) - 3600,  # 1 hour ago
+            'status': status,
+            'autostop': 300,  # 5 minutes
+            'to_down': False,
+            'last_use': 'sky launch test.yaml',
+            'user_name': 'test_user',
+            'user_hash': 'abc123',
+            'head_ip': '1.2.3.4',
+            'resources_str': '1x(cpus=8, mem=32, m6i.2xlarge, ...)',
+            'resources_str_full': ('1x(cpus=8, mem=32, m6i.2xlarge, '
+                                   'disk=50)'),
+            'workspace': 'test-workspace',
+            'last_event': 'Test event.',
+        }
+
+        # Test basic table
+        num_pending = status_utils.show_status_table([mock_record],
+                                                     show_all=False,
+                                                     show_user=False)
+        assert num_pending == (1 if status != status_lib.ClusterStatus.STOPPED
+                               else 0)
+
+        # Test with user info
+        num_pending = status_utils.show_status_table([mock_record],
+                                                     show_all=False,
+                                                     show_user=True)
+        assert num_pending == (1 if status != status_lib.ClusterStatus.STOPPED
+                               else 0)
+
+        # Test with show_all
+        num_pending = status_utils.show_status_table([mock_record],
+                                                     show_all=True,
+                                                     show_user=True)
+        assert num_pending == (1 if status != status_lib.ClusterStatus.STOPPED
+                               else 0)
+
+        # Test with query_clusters
+        num_pending = status_utils.show_status_table(
+            [mock_record],
+            show_all=False,
+            show_user=False,
+            query_clusters=['test-cluster'])
+        assert num_pending == (1 if status != status_lib.ClusterStatus.STOPPED
+                               else 0)
+
+        # Test with non-existent query_clusters
+        num_pending = status_utils.show_status_table(
+            [mock_record],
+            show_all=False,
+            show_user=False,
+            query_clusters=['non-existent'])
+        assert num_pending == (1 if status != status_lib.ClusterStatus.STOPPED
+                               else 0)
+
+
+def test_get_command():
+    """Test command display in status table."""
+    mock_record = {
+        'last_use': 'sky launch test.yaml --env FOO=bar',
+    }
+
+    # Test normal command
+    cmd_str = status_utils._get_command(mock_record)
+    assert cmd_str == 'sky launch test.yaml --env...'
+
+    # Test command without truncation
+    cmd_str = status_utils._get_command(mock_record, truncate=False)
+    assert cmd_str == 'sky launch test.yaml --env FOO=bar'
+
+    # Test short command
+    mock_record['last_use'] = 'sky status'
+    cmd_str = status_utils._get_command(mock_record)
+    assert cmd_str == 'sky status'
+
+
+def test_get_autostop():
+    """Test autostop display in status table."""
+    mock_record = {
+        'autostop': 300,  # multiple of 60 minutes -> rendered in hours
+        'to_down': False,
+    }
+
+    # Multiples of 60 minutes are rendered in hours.
+    autostop_str = status_utils._get_autostop(mock_record)
+    assert autostop_str == '5h'
+
+    # Hours rendering is preserved with to_down.
+    mock_record['to_down'] = True
+    autostop_str = status_utils._get_autostop(mock_record)
+    assert autostop_str == '5h (down)'
+
+    # Non-multiples of 60 stay in minutes.
+    mock_record['autostop'] = 90
+    mock_record['to_down'] = False
+    autostop_str = status_utils._get_autostop(mock_record)
+    assert autostop_str == '90m'
+
+    # 0 stays in minutes (immediate autostop).
+    mock_record['autostop'] = 0
+    autostop_str = status_utils._get_autostop(mock_record)
+    assert autostop_str == '0m'
+
+    # Test no autostop
+    mock_record['autostop'] = -1
+    mock_record['to_down'] = True
+    autostop_str = status_utils._get_autostop(mock_record)
+    assert autostop_str == '(down)'
+
+    # Test no autostop and no to_down
+    mock_record['to_down'] = False
+    autostop_str = status_utils._get_autostop(mock_record)
+    assert autostop_str == '-'
+
+
+def test_get_resources():
+    """Test resources display in status table."""
+    mock_resources = Resources(infra='aws/us-east-1',
+                               instance_type='m6i.2xlarge')
+    mock_handle = backends.CloudVmRayResourceHandle(
+        cluster_name='test-cluster',
+        cluster_name_on_cloud='test-cluster-cloud',
+        cluster_yaml=None,
+        launched_nodes=1,
+        launched_resources=mock_resources)
+    mock_record = {
+        'handle': mock_handle,
+        'resources_str': '1x(cpus=8, mem=32, m6i.2xlarge, ...)',
+        'resources_str_full': '1x(cpus=8, mem=32, m6i.2xlarge, disk=50)',
+    }
+
+    # Test normal resources
+    resources_str = status_utils._get_resources(mock_record)
+    assert resources_str == '1x(cpus=8, mem=32, m6i.2xlarge, ...)'
+
+    # Test full resources
+    resources_str = status_utils._get_resources(mock_record, truncate=False)
+    assert resources_str == '1x(cpus=8, mem=32, m6i.2xlarge, disk=50)'
+
+    # Test no resources
+    mock_record['handle'].launched_resources = None
+    resources_str = status_utils._get_resources(mock_record)
+    assert resources_str == '-'
+
+
+def test_get_resources_gpu():
+    """Test resources display for clusters with GPUs."""
+    # Test AWS with GPU resources
+    mock_resources_aws_gpu = Resources(infra='aws/us-east-1',
+                                       instance_type='p3.2xlarge',
+                                       accelerators='V100')
+    mock_handle_aws_gpu = backends.CloudVmRayResourceHandle(
+        cluster_name='test-gpu-cluster',
+        cluster_name_on_cloud='test-gpu-cluster-cloud',
+        cluster_yaml=None,
+        launched_nodes=1,
+        launched_resources=mock_resources_aws_gpu)
+    mock_record_aws_gpu = {
+        'handle': mock_handle_aws_gpu,
+        'resources_str': '1x(V100:1, cpus=8, mem=61, ...)',
+        'resources_str_full': '1x(V100:1, cpus=8, mem=61, disk=50)',
+    }
+
+    # Test GPU resources
+    resources_str = status_utils._get_resources(mock_record_aws_gpu)
+    assert resources_str == '1x(V100:1, cpus=8, mem=61, ...)'
+
+    # Test full GPU resources
+    resources_str = status_utils._get_resources(mock_record_aws_gpu,
+                                                truncate=False)
+    assert resources_str == '1x(V100:1, cpus=8, mem=61, disk=50)'
+
+    # Test GCP with multiple GPUs
+    mock_resources_gcp_multi_gpu = Resources(infra='gcp/us-central1',
+                                             instance_type='a2-highgpu-4g',
+                                             accelerators='A100:4')
+    mock_handle_gcp_multi_gpu = backends.CloudVmRayResourceHandle(
+        cluster_name='test-gcp-multi-gpu',
+        cluster_name_on_cloud='test-gcp-multi-gpu-cloud',
+        cluster_yaml=None,
+        launched_nodes=2,
+        launched_resources=mock_resources_gcp_multi_gpu)
+    mock_record_gcp_multi_gpu = {
+        'handle': mock_handle_gcp_multi_gpu,
+        'resources_str': '2x(gpus=A100:4, cpus=12, mem=85, ...)',
+        'resources_str_full': '2x(gpus=A100:4, cpus=12, mem=85, disk=50)',
+    }
+
+    # Test multiple GPU resources
+    resources_str = status_utils._get_resources(mock_record_gcp_multi_gpu)
+    assert resources_str == '2x(gpus=A100:4, cpus=12, mem=85, ...)'
+
+
+def test_get_resources_kubernetes():
+    """Test resources display for Kubernetes clusters."""
+    # Test Kubernetes with CPU resources
+    mock_resources_k8s_cpu = Resources(infra='k8s/my-cluster-ctx',
+                                       cpus=4,
+                                       memory=16)
+    mock_handle_k8s_cpu = backends.CloudVmRayResourceHandle(
+        cluster_name='test-k8s-cluster',
+        cluster_name_on_cloud='test-k8s-cluster-cloud',
+        cluster_yaml=None,
+        launched_nodes=1,
+        launched_resources=mock_resources_k8s_cpu)
+    mock_record_k8s_cpu = {
+        'handle': mock_handle_k8s_cpu,
+        'resources_str': '1x(cpus=4, mem=16, ...)',
+        'resources_str_full': '1x(cpus=4, mem=16, disk=50)',
+    }
+
+    # Test K8s CPU resources
+    resources_str = status_utils._get_resources(mock_record_k8s_cpu)
+    assert resources_str == '1x(cpus=4, mem=16, ...)'
+
+    # Test Kubernetes with GPU resources
+    mock_resources_k8s_gpu = Resources(infra='k8s/gpu-cluster-ctx',
+                                       cpus=8,
+                                       memory=32,
+                                       accelerators='A100:2')
+    mock_handle_k8s_gpu = backends.CloudVmRayResourceHandle(
+        cluster_name='test-k8s-gpu-cluster',
+        cluster_name_on_cloud='test-k8s-gpu-cluster-cloud',
+        cluster_yaml=None,
+        launched_nodes=2,
+        launched_resources=mock_resources_k8s_gpu)
+    mock_record_k8s_gpu = {
+        'handle': mock_handle_k8s_gpu,
+        'resources_str': '2x(gpus=A100:2, cpus=8, mem=32, ...)',
+        'resources_str_full': '2x(gpus=A100:2, cpus=8, mem=32, disk=50)',
+    }
+
+    # Test K8s GPU resources
+    resources_str = status_utils._get_resources(mock_record_k8s_gpu)
+    assert resources_str == '2x(gpus=A100:2, cpus=8, mem=32, ...)'
+
+    # Test full K8s GPU resources
+    resources_str = status_utils._get_resources(mock_record_k8s_gpu,
+                                                truncate=False)
+    assert resources_str == '2x(gpus=A100:2, cpus=8, mem=32, disk=50)'
+
+    # Test K8s with TPU resources
+    mock_resources_k8s_tpu = Resources(infra='k8s/gke-tpu-cluster',
+                                       cpus=8,
+                                       memory=32,
+                                       accelerators='tpu-v4-8')
+    mock_handle_k8s_tpu = backends.CloudVmRayResourceHandle(
+        cluster_name='test-k8s-tpu-cluster',
+        cluster_name_on_cloud='test-k8s-tpu-cluster-cloud',
+        cluster_yaml=None,
+        launched_nodes=1,
+        launched_resources=mock_resources_k8s_tpu)
+    mock_record_k8s_tpu = {
+        'handle': mock_handle_k8s_tpu,
+        'resources_str': '1x(gpus=tpu-v4-8:1, cpus=8, mem=32, ...)',
+        'resources_str_full': ('1x(gpus=tpu-v4-8:1, cpus=8, mem=32, '
+                               'disk=50)'),
+    }
+
+    # Test K8s TPU resources
+    resources_str = status_utils._get_resources(mock_record_k8s_tpu)
+    assert resources_str == '1x(gpus=tpu-v4-8:1, cpus=8, mem=32, ...)'
+
+
+def test_get_user_display_name():
+    """Test the get_user_display_name function for service account detection."""
+    # Test regular user (no SA prefix)
+    assert status_utils.get_user_display_name('john_doe',
+                                              'abc123') == 'john_doe'
+    assert status_utils.get_user_display_name('alice', 'regular-id') == 'alice'
+
+    # Test service account (SA prefix - lowercase)
+    assert status_utils.get_user_display_name('service-bot',
+                                              'sa-12345') == 'service-bot (SA)'
+
+    # Test service account (SA prefix - uppercase)
+    assert status_utils.get_user_display_name('ci-runner',
+                                              'SA-67890') == 'ci-runner (SA)'
+
+    # Test service account (SA prefix - mixed case)
+    assert status_utils.get_user_display_name('deploy-agent',
+                                              'Sa-AbCdE') == 'deploy-agent (SA)'
+
+    # Test with None user_id (should return user_name without modification)
+    assert status_utils.get_user_display_name('bob', None) == 'bob'
+
+    # Test with empty string user_id
+    assert status_utils.get_user_display_name('charlie', '') == 'charlie'
+
+
+def test_get_user_name_from_cluster_record():
+    """Test the _get_user_name function for extracting user name from cluster record."""
+    # Test regular user
+    mock_record = {
+        'user_name': 'john_doe',
+        'user_hash': 'abc123',
+    }
+    assert status_utils._get_user_name(mock_record) == 'john_doe'
+
+    # Test service account
+    mock_record_sa = {
+        'user_name': 'service-bot',
+        'user_hash': 'sa-12345',
+    }
+    assert status_utils._get_user_name(mock_record_sa) == 'service-bot (SA)'
+
+    # Test missing user_name (returns '-')
+    mock_record_no_name = {
+        'user_hash': 'abc123',
+    }
+    assert status_utils._get_user_name(mock_record_no_name) == '-'
+
+    # Test user_name is '-' (should return '-' without SA suffix)
+    mock_record_dash = {
+        'user_name': '-',
+        'user_hash': 'sa-12345',
+    }
+    assert status_utils._get_user_name(mock_record_dash) == '-'
+
+    # Test missing user_hash (no SA suffix added)
+    mock_record_no_hash = {
+        'user_name': 'alice',
+    }
+    assert status_utils._get_user_name(mock_record_no_hash) == 'alice'
+
+
+def test_get_resources_fractional_values():
+    """Test resources display for fractional CPU and memory values."""
+    from sky.utils import resources_utils
+
+    # Test fractional CPU and integer memory (0.5 CPU, 4GB)
+    mock_resources_fractional_cpu = Resources(infra='k8s/my-cluster-ctx',
+                                              cpus='0.5',
+                                              memory=4,
+                                              instance_type='0.5CPU--4GB')
+    simple, full = resources_utils.format_resource(
+        mock_resources_fractional_cpu)
+    assert 'cpus=0.5' in simple and 'cpus=0.5' in full
+    assert 'mem=4' in simple and 'mem=4' in full
+    # Ensure we don't have truncated values like 'cpus=0' or 'mem=0'
+    assert not re.search(r'\bcpus=0(?![.\d])', simple)
+    assert not re.search(r'\bcpus=0(?![.\d])', full)
+
+    # Test integer CPU and fractional memory (1 CPU, 0.5GB)
+    mock_resources_fractional_mem = Resources(infra='k8s/my-cluster-ctx',
+                                              cpus='1',
+                                              memory=0.5,
+                                              instance_type='1CPU--0.5GB')
+    simple, full = resources_utils.format_resource(
+        mock_resources_fractional_mem)
+    assert 'cpus=1' in simple and 'cpus=1' in full
+    assert 'mem=0.5' in simple and 'mem=0.5' in full
+    assert not re.search(r'\bmem=0(?![.\d])', simple)
+    assert not re.search(r'\bmem=0(?![.\d])', full)
+
+    # Test decimal CPU and memory (4.5 CPU, 8.5GB)
+    mock_resources_decimal = Resources(infra='k8s/my-cluster-ctx',
+                                       cpus='4.5',
+                                       memory=8.5,
+                                       instance_type='4.5CPU--8.5GB')
+    simple, full = resources_utils.format_resource(mock_resources_decimal)
+    assert 'cpus=4.5' in simple and 'cpus=4.5' in full
+    assert 'mem=8.5' in simple and 'mem=8.5' in full
+
+    # Test integer CPU and memory (4 CPU, 8GB)
+    mock_resources_int = Resources(infra='k8s/my-cluster-ctx',
+                                   cpus='4',
+                                   memory=8,
+                                   instance_type='4CPU--8GB')
+    simple, full = resources_utils.format_resource(mock_resources_int)
+    assert 'cpus=4' in simple and 'cpus=4' in full
+    assert 'mem=8' in simple and 'mem=8' in full
+
+
+def test_get_status_colored_unhealthy_init():
+    """INIT clusters flagged unhealthy render as UNHEALTHY; others do not."""
+    # An INIT cluster stuck in an abnormal state renders as red UNHEALTHY.
+    unhealthy_record = {
+        'status': status_lib.ClusterStatus.INIT,
+        'init_kind': status_lib.INIT_KIND_UNHEALTHY,
+    }
+    colored = status_utils._get_status_colored(unhealthy_record)
+    assert 'UNHEALTHY' in colored
+    assert colorama.Fore.RED in colored
+    assert 'INIT' not in colored
+
+    # An actively-launching INIT cluster still renders as INIT.
+    launching_record = {
+        'status': status_lib.ClusterStatus.INIT,
+        'init_kind': status_lib.INIT_KIND_LAUNCHING,
+    }
+    assert 'INIT' in status_utils._get_status_colored(launching_record)
+
+    # A record without init_kind (e.g. from an older server) falls back to
+    # INIT.
+    legacy_record = {'status': status_lib.ClusterStatus.INIT}
+    assert 'INIT' in status_utils._get_status_colored(legacy_record)
+
+    # Non-INIT statuses are unaffected even if init_kind is somehow set.
+    up_record = {
+        'status': status_lib.ClusterStatus.UP,
+        'init_kind': status_lib.INIT_KIND_UNHEALTHY,
+    }
+    colored = status_utils._get_status_colored(up_record)
+    assert 'UP' in colored
+    assert 'UNHEALTHY' not in colored

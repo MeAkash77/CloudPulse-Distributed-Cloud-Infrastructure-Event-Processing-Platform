@@ -1,0 +1,648 @@
+"""Unit tests for JWT token service functionality."""
+
+import datetime
+import secrets
+import threading
+import time
+from unittest import mock
+
+import pytest
+import sqlalchemy.exc
+
+from sky.users import token_service
+
+
+class TestTokenService:
+    """Test cases for JWT token service."""
+
+    def test_token_service_initialization(self):
+        """Test TokenService initialization with secret generation."""
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = None
+            mock_global_state.get_or_set_system_config.side_effect = (
+                lambda _key, value: value)
+            mock_global_state.count_service_account_tokens.return_value = 0
+
+            service = token_service.TokenService()
+
+            assert service.secret_key is None
+
+            service._lazy_initialize()
+            assert service.secret_key is not None
+            assert len(service.secret_key) >= 32  # Ensure sufficient entropy
+            mock_global_state.get_or_set_system_config.assert_called_once()
+            # Bootstrap must never take the overwriting path.
+            mock_global_state.set_system_config.assert_not_called()
+
+    def test_token_service_existing_secret(self):
+        """Test TokenService initialization with existing secret."""
+        existing_secret = secrets.token_urlsafe(32)
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = existing_secret
+
+            service = token_service.TokenService()
+            service._lazy_initialize()
+            assert service.secret_key == existing_secret
+
+    def test_create_token_basic(self):
+        """Test basic token creation without expiration."""
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'test_secret_key'
+
+            service = token_service.TokenService()
+            result = service.create_token(creator_user_id='creator123',
+                                          service_account_user_id='sa123',
+                                          token_name='test-token')
+
+            assert result['token'].startswith('sky_')
+            assert result['token_id'] is not None
+            assert result['token_hash'] is not None
+            assert result['creator_user_id'] == 'creator123'
+            assert result['service_account_user_id'] == 'sa123'
+            assert result['token_name'] == 'test-token'
+            assert result['expires_at'] is None
+
+    def test_create_token_with_expiration(self):
+        """Test token creation with expiration."""
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'test_secret_key'
+
+            service = token_service.TokenService()
+            result = service.create_token(creator_user_id='creator123',
+                                          service_account_user_id='sa123',
+                                          token_name='test-token',
+                                          expires_in_days=30)
+
+            assert result['token'].startswith('sky_')
+            assert result['expires_at'] is not None
+            # Check that expiration is approximately 30 days from now
+            now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+            assert result['expires_at'] > now + (29 * 24 * 3600
+                                                )  # At least 29 days
+            assert result['expires_at'] < now + (31 * 24 * 3600
+                                                )  # Less than 31 days
+
+    def test_create_token_writes_both_e_and_exp(self):
+        """New tokens must carry both the legacy 'e' claim and the
+        standard 'exp' claim with the same value.
+
+        'exp' is what makes PyJWT enforce expiration automatically; 'e'
+        is kept so that the verify_token backward-compat branch still
+        catches tokens issued before this change.
+        """
+        import jwt as pyjwt
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'test_secret_key'
+
+            service = token_service.TokenService()
+            result = service.create_token(creator_user_id='creator123',
+                                          service_account_user_id='sa123',
+                                          token_name='test-token',
+                                          expires_in_days=30)
+
+            raw = pyjwt.decode(result['token'][4:],
+                               'test_secret_key',
+                               algorithms=['HS256'])
+            assert 'e' in raw and 'exp' in raw
+            assert raw['e'] == raw['exp'] == result['expires_at']
+
+    def test_create_token_without_expiration_has_no_exp(self):
+        """No expiration → neither 'e' nor 'exp' should be present."""
+        import jwt as pyjwt
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'test_secret_key'
+
+            service = token_service.TokenService()
+            result = service.create_token(creator_user_id='creator123',
+                                          service_account_user_id='sa123',
+                                          token_name='test-token')
+
+            raw = pyjwt.decode(result['token'][4:],
+                               'test_secret_key',
+                               algorithms=['HS256'])
+            assert 'e' not in raw
+            assert 'exp' not in raw
+            assert result['expires_at'] is None
+
+    def test_verify_expired_token_via_pyjwt_only(self):
+        """For tokens that carry the standard 'exp' claim, PyJWT raises
+        ExpiredSignatureError on its own -- the manual 'e' check in
+        verify_token is not needed for new tokens.
+
+        This documents the deprecation path: once all legacy 'e'-only
+        tokens have expired, the manual check can be removed and this
+        test still passes (it doesn't depend on the manual check).
+        """
+        import jwt as pyjwt
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'test_secret_key'
+
+            # Hand-craft a JWT that has only 'exp' (no 'e'), expired.
+            past = int((datetime.datetime.now(datetime.timezone.utc) -
+                        datetime.timedelta(days=1)).timestamp())
+            payload = {
+                'i': 'sky',
+                't': past,
+                'u': 'sa123',
+                'k': 'tok',
+                'y': 'sa',
+                'exp': past,  # standard claim only
+            }
+            jwt_token = 'sky_' + pyjwt.encode(
+                payload, 'test_secret_key', algorithm='HS256')
+
+            service = token_service.TokenService()
+            assert service.verify_token(jwt_token) is None
+
+    def test_verify_valid_token(self):
+        """Test verifying a valid token."""
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'test_secret_key'
+
+            service = token_service.TokenService()
+
+            # Create a token
+            token_data = service.create_token(creator_user_id='creator123',
+                                              service_account_user_id='sa123',
+                                              token_name='test-token')
+
+            # Verify the token
+            payload = service.verify_token(token_data['token'])
+
+            assert payload is not None
+            assert payload['sub'] == 'sa123'  # service account user ID
+            assert payload['token_id'] == token_data['token_id']
+            assert payload['type'] == 'service_account'  # token type
+
+    def test_verify_invalid_token(self):
+        """Test verifying an invalid token."""
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'test_secret_key'
+
+            service = token_service.TokenService()
+
+            # Test invalid token format
+            payload = service.verify_token('invalid_token')
+            assert payload is None
+
+            # Test token without sky_ prefix
+            payload = service.verify_token('jwt_token_here')
+            assert payload is None
+
+    def test_verify_expired_token(self):
+        """Test verifying an expired token returns None.
+
+        The JWT payload uses the non-standard claim name 'e' for the
+        expiration timestamp. PyJWT only auto-validates the standard 'exp'
+        claim, so verify_token must perform the expiration check manually.
+        Without that manual check, this test would pass with a non-None
+        payload (the historical bug).
+        """
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'test_secret_key'
+
+            service = token_service.TokenService()
+
+            # Mock datetime to create an expired token
+            past_time = datetime.datetime.now(
+                datetime.timezone.utc) - datetime.timedelta(days=1)
+            with mock.patch('datetime.datetime') as mock_datetime:
+                mock_datetime.now.return_value = past_time
+                mock_datetime.timezone = datetime.timezone
+                mock_datetime.timedelta = datetime.timedelta
+
+                token_data = service.create_token(
+                    creator_user_id='creator123',
+                    service_account_user_id='sa123',
+                    token_name='test-token',
+                    expires_in_days=0.5  # Half day, so it's expired
+                )
+
+            payload = service.verify_token(token_data['token'])
+            assert payload is None
+
+    def test_verify_token_wrong_secret(self):
+        """Test verifying a token with wrong secret key."""
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'original_secret'
+
+            service1 = token_service.TokenService()
+            token_data = service1.create_token(creator_user_id='creator123',
+                                               service_account_user_id='sa123',
+                                               token_name='test-token')
+
+            # Create another service with different secret
+            mock_global_state.get_system_config.return_value = 'different_secret'
+            service2 = token_service.TokenService()
+
+            payload = service2.verify_token(token_data['token'])
+            assert payload is None
+
+    def test_verify_token_wrong_issuer(self):
+        """Test verifying a token with wrong issuer."""
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'test_secret_key'
+
+            # Mock JWT to return payload with wrong issuer
+            with mock.patch('sky.users.token_service.jwt') as mock_jwt:
+                mock_jwt.encode.return_value = 'mocked_jwt'
+                mock_jwt.decode.return_value = {
+                    'i': 'wrong_issuer',  # Wrong issuer
+                    't': 1234567890,
+                    'u': 'sa123',
+                    'k': 'token123',
+                    'y': 'sa'
+                }
+
+                service = token_service.TokenService()
+                payload = service.verify_token('sky_mocked_jwt')
+
+                assert payload is None
+
+    def test_verify_token_wrong_type(self):
+        """Test verifying a token with wrong type.
+
+        Uses the correct issuer ('sky') so the issuer branch passes;
+        otherwise the wrong-type branch is never reached.
+        """
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'test_secret_key'
+
+            with mock.patch('sky.users.token_service.jwt') as mock_jwt:
+                mock_jwt.encode.return_value = 'mocked_jwt'
+                mock_jwt.decode.return_value = {
+                    'i': token_service.JWT_ISSUER,  # correct issuer
+                    't': 1234567890,
+                    'u': 'sa123',
+                    'k': 'token123',
+                    'y': 'wrong_type'  # Wrong type
+                }
+
+                service = token_service.TokenService()
+                payload = service.verify_token('sky_mocked_jwt')
+
+                assert payload is None
+
+    def test_verify_legacy_token_with_only_e_claim_expired(self):
+        """Cover the manual 'e' expiration check for legacy tokens that
+        predate the 'exp' claim. Hand-crafts a JWT that carries only
+        the shortened 'e' claim (no standard 'exp'), expired one day
+        ago.
+
+        PyJWT does NOT auto-validate the non-standard 'e' claim, so
+        without the manual check verify_token would return a payload
+        instead of None.
+        """
+        import jwt as pyjwt
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'test_secret_key'
+
+            past = int(time.time()) - 24 * 3600  # one day ago
+            payload = {
+                'i': token_service.JWT_ISSUER,
+                't': past,
+                'u': 'sa123',
+                'k': 'tok',
+                'y': 'sa',
+                'e': past,  # legacy short-name claim only, no 'exp'
+            }
+            jwt_token = 'sky_' + pyjwt.encode(
+                payload, 'test_secret_key', algorithm='HS256')
+
+            # Sanity: confirm the test setup truly is "legacy only".
+            raw = pyjwt.decode(jwt_token[4:],
+                               'test_secret_key',
+                               algorithms=['HS256'])
+            assert 'exp' not in raw
+            assert raw['e'] == past
+
+            service = token_service.TokenService()
+            assert service.verify_token(jwt_token) is None
+
+    def test_token_service_singleton(self):
+        """Test that token_service is properly initialized as singleton."""
+        # Test that the global token_service instance exists
+        assert hasattr(token_service, 'token_service')
+        assert isinstance(token_service.token_service,
+                          token_service.TokenService)
+
+    def test_token_preserves_user_identity_for_nested_jobs(self):
+        """Test that a token created for a managed job preserves user identity.
+
+        When api_server_access is set, _create_job_api_token creates a token
+        where both creator_user_id and service_account_user_id are the same
+        user. This ensures nested jobs launched via the token authenticate as
+        the original user.
+        """
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'test_secret_key'
+
+            service = token_service.TokenService()
+
+            # Mirror _create_job_api_token: both IDs are the same user
+            user_hash = 'user_abc123'
+            token_data = service.create_token(
+                creator_user_id=user_hash,
+                service_account_user_id=user_hash,
+                token_name='managed-job-test-12345678',
+                expires_in_days=7)
+
+            # Verify the token carries the original user's identity
+            payload = service.verify_token(token_data['token'])
+            assert payload is not None
+            assert payload['sub'] == user_hash, (
+                'Token subject should be the original user so nested jobs '
+                'authenticate with the same identity')
+            assert payload['token_id'] == token_data['token_id']
+            assert payload['type'] == 'service_account'
+
+    def test_jwt_payload_format(self):
+        """Test that JWT payload uses correct format."""
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = 'test_secret_key'
+
+            service = token_service.TokenService()
+
+            # Mock JWT encode to capture the payload
+            original_encode = token_service.jwt.encode
+            captured_payload = None
+
+            def capture_payload(payload, key, algorithm):
+                nonlocal captured_payload
+                captured_payload = payload
+                return original_encode(payload, key, algorithm)
+
+            with mock.patch('sky.users.token_service.jwt.encode',
+                            side_effect=capture_payload):
+                service.create_token(creator_user_id='creator123',
+                                     service_account_user_id='sa123',
+                                     token_name='test-token')
+
+            # Verify payload format uses single-character keys for compactness
+            assert captured_payload['i'] == 'sky'  # issuer
+            assert 't' in captured_payload  # issued at
+            assert captured_payload['u'] == 'sa123'  # service account user ID
+            assert 'k' in captured_payload  # token ID
+            assert captured_payload['y'] == 'sa'  # type
+
+
+class TestSecretBootstrap:
+    """The signing secret must survive a database failure.
+
+    A read that raised used to be indistinguishable from "no secret yet", so
+    the server minted a replacement and overwrote the live one, permanently
+    invalidating every token already issued.
+    """
+
+    @staticmethod
+    def _db_error() -> Exception:
+        # What pgbouncer pool starvation looks like from SQLAlchemy.
+        return sqlalchemy.exc.OperationalError(
+            'SELECT config_value FROM system_config', {},
+            Exception('server closed the connection unexpectedly'))
+
+    def test_read_error_never_generates(self):
+        """A failed read must not write anything, and must not be cached."""
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.side_effect = self._db_error()
+
+            service = token_service.TokenService()
+            with pytest.raises(token_service.JWTSecretUnavailableError):
+                service.ensure_secret_loaded()
+
+            mock_global_state.get_or_set_system_config.assert_not_called()
+            mock_global_state.set_system_config.assert_not_called()
+            # Nothing cached, so a later call retries instead of the process
+            # being stuck on a secret nobody else knows.
+            assert service.secret_key is None
+
+    def test_transient_read_error_recovers(self):
+        """One blip then success adopts the persisted secret, writing nothing."""
+        existing = secrets.token_urlsafe(32)
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.side_effect = [
+                self._db_error(), existing
+            ]
+
+            service = token_service.TokenService()
+            with mock.patch('sky.utils.db.retries.time.sleep'):
+                service.ensure_secret_loaded()
+
+            assert service.secret_key == existing
+            mock_global_state.get_or_set_system_config.assert_not_called()
+
+    def test_write_error_is_not_cached_in_memory(self):
+        """A failed write must raise, not leave an unpersisted secret behind.
+
+        Signing with a secret no other process (nor this one after a restart)
+        can read produces tokens that are permanently unverifiable.
+        """
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = None
+            mock_global_state.get_or_set_system_config.side_effect = (
+                self._db_error())
+
+            service = token_service.TokenService()
+            with pytest.raises(token_service.JWTSecretUnavailableError):
+                service.ensure_secret_loaded()
+            assert service.secret_key is None
+
+    def test_lost_race_adopts_the_stored_secret(self):
+        """Another replica won the insert; we must use its value, not ours."""
+        winner = secrets.token_urlsafe(32)
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = None
+            mock_global_state.get_or_set_system_config.return_value = winner
+
+            service = token_service.TokenService()
+            service.ensure_secret_loaded()
+
+            assert service.secret_key == winner
+            # The candidate we generated is discarded, not written anywhere.
+            mock_global_state.set_system_config.assert_not_called()
+
+    @staticmethod
+    def _bootstrap_with_existing_tokens(existing_token_count):
+        """Bootstrap a secret against a DB holding that many token rows."""
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = None
+            mock_global_state.get_or_set_system_config.side_effect = (
+                lambda _key, value: value)
+            mock_global_state.count_service_account_tokens.return_value = (
+                existing_token_count)
+            with mock.patch.object(token_service, 'logger') as mock_logger:
+                token_service.TokenService().ensure_secret_loaded()
+            return mock_logger
+
+    def test_generating_over_existing_tokens_logs_error(self):
+        """The alertable case: a new secret orphans tokens that already exist."""
+        mock_logger = self._bootstrap_with_existing_tokens(1)
+        mock_logger.error.assert_called_once()
+        assert ('NEW JWT signing secret while 1 service'
+                in mock_logger.error.call_args[0][0])
+
+    def test_first_time_bootstrap_does_not_log_error(self):
+        """A brand-new deployment generating the secret is routine."""
+        mock_logger = self._bootstrap_with_existing_tokens(0)
+        mock_logger.error.assert_not_called()
+
+    def test_waiting_on_a_stuck_load_gives_up(self):
+        """A load stuck on a degraded DB must release its waiters.
+
+        Waiters park on `init_lock` while holding an auth executor thread, so
+        an unbounded wait convoys authentication for every other request.
+
+        Driven from a worker thread and joined with a deadline: an unbounded
+        wait would otherwise hang the suite instead of failing it, and a hang
+        is not a usable failure signal.
+        """
+        service = token_service.TokenService()
+        outcome = {}
+
+        def waiter():
+            try:
+                service.ensure_secret_loaded()
+                outcome['returned'] = True
+            except BaseException as e:  # pylint: disable=broad-except
+                outcome['raised'] = e
+
+        service.init_lock.acquire()
+        try:
+            with mock.patch.object(token_service,
+                                   '_SECRET_LOAD_LOCK_TIMEOUT_SECONDS', 0.05):
+                thread = threading.Thread(target=waiter, daemon=True)
+                thread.start()
+                thread.join(timeout=5)
+
+            assert not thread.is_alive(), (
+                'A waiter blocked on init_lock for 5s while the lock was held. '
+                'Acquire it with a timeout so a stuck load cannot park auth '
+                'executor threads for its whole duration.')
+            assert isinstance(outcome.get('raised'),
+                              token_service.JWTSecretUnavailableError)
+        finally:
+            service.init_lock.release()
+
+    def test_waiter_uses_a_secret_that_landed_during_its_wait(self):
+        """Timing out on the lock must not fail a caller that can be served.
+
+        The holder can finish in the last instant of the wait; answering 503
+        then rejects a request the server is able to serve. A stub lock pins
+        that interleaving instead of racing two threads for it.
+        """
+        service = token_service.TokenService()
+
+        class _TimesOutAfterTheHolderFinished:
+            """acquire() fails, but the secret landed while we waited."""
+
+            def acquire(self, timeout=None):  # pylint: disable=unused-argument
+                service.secret_key = 'loaded-by-the-holder'
+                return False
+
+            def release(self):
+                raise AssertionError('released a lock that was never acquired')
+
+        service.init_lock = _TimesOutAfterTheHolderFinished()
+        service.ensure_secret_loaded()
+
+        assert service.secret_key == 'loaded-by-the-holder'
+
+    def test_a_refused_secret_is_never_announced_as_healthy(self):
+        """Validation must precede the log line, not follow it.
+
+        Announcing an adopted secret and then refusing it leaves an operator
+        debugging exactly this corruption reading a success line first.
+        """
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = None
+            mock_global_state.get_or_set_system_config.return_value = ''
+
+            service = token_service.TokenService()
+            with mock.patch.object(token_service, 'logger') as mock_logger:
+                with pytest.raises(token_service.JWTSecretUnavailableError):
+                    service.ensure_secret_loaded()
+
+            assert not any(
+                'Adopted' in str(c) for c in mock_logger.info.mock_calls)
+
+    def test_empty_secret_adopted_from_a_race_is_rejected_too(self):
+        """The guard must cover the adopt exit, not only the read exit.
+
+        The read says "no row", then the insert loses to a writer that stored
+        an empty value, so the read-back hands one back. Caching it would sign
+        and verify with a key PyJWT rejects on every request.
+        """
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = None
+            mock_global_state.get_or_set_system_config.return_value = ''
+
+            service = token_service.TokenService()
+            with pytest.raises(token_service.JWTSecretUnavailableError):
+                service.ensure_secret_loaded()
+            assert service.secret_key is None
+
+    def test_empty_stored_secret_is_corruption_not_absence(self):
+        """An empty row must not be treated as "no secret yet".
+
+        Generating would clobber whatever belongs there, and adopting it hands
+        PyJWT a key it rejects on every request, surfacing as a bogus 401.
+        """
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = ''
+
+            service = token_service.TokenService()
+            with pytest.raises(token_service.JWTSecretUnavailableError):
+                service.ensure_secret_loaded()
+
+            mock_global_state.get_or_set_system_config.assert_not_called()
+            assert service.secret_key is None
+
+    def test_secret_loaded_predicate_tracks_the_cache(self):
+        """The request path gates its executor dispatch on this."""
+        existing = secrets.token_urlsafe(32)
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = existing
+
+            service = token_service.TokenService()
+            assert not service.secret_loaded()
+            service.ensure_secret_loaded()
+            assert service.secret_loaded()
+
+    def test_loaded_secret_needs_no_further_db_calls(self):
+        """The steady state stays off the database."""
+        existing = secrets.token_urlsafe(32)
+        with mock.patch('sky.users.token_service.global_user_state'
+                       ) as mock_global_state:
+            mock_global_state.get_system_config.return_value = existing
+
+            service = token_service.TokenService()
+            service.ensure_secret_loaded()
+            mock_global_state.get_system_config.reset_mock()
+            service.ensure_secret_loaded()
+
+            mock_global_state.get_system_config.assert_not_called()

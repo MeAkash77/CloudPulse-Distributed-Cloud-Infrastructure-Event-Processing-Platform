@@ -1,0 +1,88 @@
+# Ensure this configuration aligns with format.sh and requirements.txt
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+    -   id: trailing-whitespace
+    -   id: end-of-file-fixer
+    -   id: check-yaml
+        args: ['--allow-multiple-documents']
+        exclude: ^charts/
+    -   id: check-added-large-files
+
+-   repo: https://github.com/pycqa/isort
+    rev: 5.12.0  # Match the version from requirements
+    hooks:
+    -   id: isort
+        name: isort (general)
+        exclude: "(build/.*|sky/schemas/generated/.*)"  # Matches "${ISORT_YAPF_EXCLUDES[@]}"
+
+-   repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.19.1  # Match the version from requirements
+    hooks:
+    -   id: mypy
+        args:            # Match tests/mypy_files.txt - check sky and examples/admin_policy/example_policy
+            - "sky"
+            - "examples/admin_policy/example_policy"
+            - "--exclude"
+            - "sky/backends/monkey_patches"
+            - "--exclude"
+            - "examples/admin_policy/example_policy/build"
+            - "--check-untyped-defs"
+        pass_filenames: false
+        additional_dependencies:
+            - types-aiofiles
+            - types-PyYAML
+            - types-requests<2.31  # Match the condition in requirements.txt
+            - types-setuptools<80.9  # Match the condition in requirements-dev.txt
+            - types-cachetools
+            - types-pyvmomi
+            - types-paramiko
+            - types-protobuf
+            - types-python-dateutil
+
+-   repo: https://github.com/google/yapf
+    rev: v0.32.0  # Match the version from requirements
+    hooks:
+    -   id: yapf
+        name: yapf
+        exclude: (build/.*|sky/schemas/generated/.*|tests/unit_tests/test_sky/backends/testdata/.*)  # Matches format.sh
+        args: ['--recursive', '--parallel', '--in-place']  # Only necessary flags
+        additional_dependencies: [toml==0.10.2] # Match the version from requirements
+
+-   repo: https://github.com/pylint-dev/pylint
+    rev: v2.14.5  # Match the version from requirements
+    hooks:
+    -   id: pylint
+        language_version: python3.11 # pylint doesn't support python 3.12 until v3.0.0
+        additional_dependencies:
+            - pylint-quotes==0.2.3  # Match the version from requirements
+        name: pylint
+        args:
+            - --rcfile=.pylintrc  # Use your custom pylint configuration
+            - --load-plugins=pylint_quotes  # Load the pylint-quotes plugin
+        files: ^sky/  # Only include files from the 'sky/' directory
+        exclude: (^sky/skylet/providers/ibm/|^sky/schemas/generated/)
+
+-   repo: https://github.com/gruntwork-io/pre-commit
+    rev: v0.1.30  # Match the version from requirements
+    hooks:
+    -   id: helmlint
+
+-   repo: local
+    hooks:
+    -   id: dashboard-lint
+        name: dashboard lint
+        entry: bash -c 'cd sky/dashboard && npm run lint'
+        language: node
+        language_version: 24.12.0
+        files: ^sky/dashboard/
+        pass_filenames: false
+
+    -   id: dashboard-format
+        name: dashboard format
+        entry: bash -c 'cd sky/dashboard && npm run format -- --log-level warn'
+        language: node
+        language_version: 24.12.0
+        files: ^sky/dashboard/
+        pass_filenames: false

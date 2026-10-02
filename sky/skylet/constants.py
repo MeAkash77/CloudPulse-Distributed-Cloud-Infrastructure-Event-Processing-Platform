@@ -1,0 +1,1024 @@
+"""Constants for SkyPilot."""
+import enum
+import os
+from typing import List, Tuple
+
+from packaging import version
+
+import sky
+from sky.setup_files import dependencies
+
+# The base directory for all SkyPilot runtime artifacts.
+# Historically, we have always used $HOME, but we couldn't
+# do that for Slurm, because $HOME typically points to a NFS
+# mounted directory, which does not work well with SQLite.
+# https://sqlite.org/faq.html#q5
+# Additionally, having the skypilot-runtime python venv be
+# on an NFS makes things very slow.
+SKY_RUNTIME_DIR = '${SKY_RUNTIME_DIR:-$HOME}'
+# Same as above but for use within python code instead of shell commands.
+# Example usage:
+# os.path.join(
+#    os.path.expanduser(os.environ.get(SKY_RUNTIME_DIR_ENV_VAR_KEY, '~')),
+#    '.sky/jobs.db')
+SKY_RUNTIME_DIR_ENV_VAR_KEY = 'SKY_RUNTIME_DIR'
+SKY_CLUSTER_NAME_ENV_VAR_KEY = 'SKY_CLUSTER_NAME'
+# We keep sky_logs and sky_workdir in $HOME, because
+# these are artifacts that users can access, and having
+# them be in $HOME makes it more convenient.
+SKY_LOGS_DIRECTORY = '~/sky_logs'
+SKY_REMOTE_WORKDIR = '~/sky_workdir'
+SKY_TEMPLATES_DIRECTORY = '~/sky_templates'
+SKY_IGNORE_FILE = '.skyignore'
+GIT_IGNORE_FILE = '.gitignore'
+
+# Default Ray port is 6379. Default Ray dashboard port is 8265.
+# Default Ray tempdir is /tmp/ray.
+# We change them to avoid conflicts with user's Ray clusters.
+# We note down the ports in ~/.sky/ray_port.json for backward compatibility.
+SKY_REMOTE_RAY_PORT = 6380
+SKY_REMOTE_RAY_DASHBOARD_PORT = 8266
+# Note we can not use json.dumps which will add a space between ":" and its
+# value which causes the yaml parser to fail.
+# The os.environ.get(...) calls stay unevaluated here on purpose: this
+# string is executed remotely on the pod, where the hostNetwork probe
+# (sky.provision.kubernetes.host_network_probe) may have set the port env
+# vars. It falls back to the SkyPilot defaults otherwise.
+SKY_REMOTE_RAY_PORT_DICT_STR = (
+    '{'
+    f'"ray_port":int(os.environ.get("SKYPILOT_RAY_PORT",'
+    f'{SKY_REMOTE_RAY_PORT})), '
+    f'"ray_dashboard_port":int(os.environ.get('
+    f'"SKYPILOT_RAY_DASHBOARD_PORT",{SKY_REMOTE_RAY_DASHBOARD_PORT}))'
+    '}')
+# The file contains the ports of the Ray cluster that SkyPilot launched,
+# i.e. the PORT_DICT_STR above.
+SKY_REMOTE_RAY_PORT_FILE = '.sky/ray_port.json'
+SKY_REMOTE_RAY_TEMPDIR = '/tmp/ray_skypilot'
+SKY_REMOTE_RAY_VERSION = '2.9.3'
+
+# To avoid user image causing issue with the SkyPilot runtime, we run SkyPilot
+# commands the following prefix:
+# 1. env -u PYTHONPATH: unset PYTHONPATH to avoid any package specified in
+# PYTHONPATH interfering with the SkyPilot runtime.
+# 2. env -C $HOME: set the execution directory to $HOME to avoid the case when
+# a user's WORKDIR in Dockerfile is a Python site-packages directory. Python
+# adds CWD to the beginning of sys.path, so if WORKDIR contains packages (e.g.,
+# compiled for a different Python version), imports will fail with errors like
+# "ModuleNotFoundError: No module named 'rpds.rpds'".
+#
+# TODO(zhwu): Switch -C $HOME to PYTHONSAFEPATH=1, once we moved our runtime to
+# Python 3.11 for a more robust setup.
+SKY_UNSET_PYTHONPATH_AND_SET_CWD = 'env -u PYTHONPATH -C $HOME'
+# We store the absolute path of the python executable (/opt/conda/bin/python3)
+# in this file, so that any future internal commands that need to use python
+# can use this path. This is useful for the case where the user has a custom
+# conda environment as a default environment, which is not the same as the one
+# used for installing SkyPilot runtime (ray and skypilot).
+SKY_PYTHON_PATH_FILE = f'{SKY_RUNTIME_DIR}/.sky/python_path'
+SKY_RAY_PATH_FILE = f'{SKY_RUNTIME_DIR}/.sky/ray_path'
+SKY_GET_PYTHON_PATH_CMD = (
+    f'[ -s {SKY_PYTHON_PATH_FILE} ] && '
+    f'cat {SKY_PYTHON_PATH_FILE} 2> /dev/null || '
+    # POSIX builtin, present even when the `which` binary
+    # is not (e.g. minimal RHEL/Rocky images ship no which).
+    'command -v python3')
+# Python executable, e.g., /opt/conda/bin/python3
+SKY_PYTHON_CMD = (f'{SKY_UNSET_PYTHONPATH_AND_SET_CWD} '
+                  f'$({SKY_GET_PYTHON_PATH_CMD})')
+# Prefer SKY_UV_PIP_CMD, which is faster.
+# TODO(cooperc): remove remaining usage (GCP TPU setup).
+SKY_PIP_CMD = f'{SKY_PYTHON_CMD} -m pip'
+# Ray executable, e.g., /opt/conda/bin/ray
+# We need to add SKY_PYTHON_CMD before ray executable because:
+# The ray executable is a python script with a header like:
+#   #!/opt/conda/bin/python3
+SKY_RAY_CMD = (f'{SKY_PYTHON_CMD} $([ -s {SKY_RAY_PATH_FILE} ] && '
+               f'cat {SKY_RAY_PATH_FILE} 2> /dev/null || command -v ray)')
+
+# Resolve `env` by preferring the absolute path /usr/bin/env when it is an
+# executable file, then falling back to bash's `type -P env` (a PATH search
+# returning only an on-disk executable, ignoring functions/aliases/builtins),
+# then to a literal /usr/bin/env. `type -P` is a bashism, but it is safe here:
+# both consumers run this command under bash (task_codegen.py's
+# `build_task_runner_cmd` and slurm/instance.py's `_srun_on_node`, each
+# `bash -c ...`), and on standard layouts the `[ -x /usr/bin/env ]` branch
+# short-circuits before `type -P` is ever evaluated, so a non-bash shell never
+# reaches it. This avoids three failure modes:
+#   1. A non-executable $HOME/.local/bin/env (left by a uv installation)
+#      shadowing /usr/bin/env on PATH: `[ -x /usr/bin/env ]` selects the real
+#      binary first, and `type -P` only reports executables anyway, whereas a
+#      Slurm srun execvp() would pick the shadow without an exec check.
+#   2. A `which` bash function re-imported into a container by
+#      `srun --export=ALL` (Debian/Ubuntu export one calling `/usr/bin/which`
+#      with GNU-only flags); a minimal image's `/usr/bin/which` rejects them
+#      and prints "Usage: ..." to stdout, which would poison `$(which env ...)`
+#      -> the run command begins with `Usage:` -> exit 127. This never calls
+#      `which`.
+#   3. An exported `env` *function*: the common branch expands to the literal
+#      path /usr/bin/env; and if that is absent, `type -P` returns only the
+#      on-disk executable, never the function (whereas `command -v env` would
+#      return the bare name `env` and invoke the function).
+SKY_SLURM_UNSET_PYTHONPATH = (
+    '$([ -x /usr/bin/env ] && echo /usr/bin/env || type -P env 2>/dev/null || '
+    'echo /usr/bin/env) -u PYTHONPATH')
+SKY_SLURM_PYTHON_CMD = (f'{SKY_SLURM_UNSET_PYTHONPATH} '
+                        f'$({SKY_GET_PYTHON_PATH_CMD})')
+
+# Separate env for SkyPilot runtime dependencies.
+SKY_REMOTE_PYTHON_ENV_NAME = 'skypilot-runtime'
+SKY_REMOTE_PYTHON_ENV: str = f'{SKY_RUNTIME_DIR}/{SKY_REMOTE_PYTHON_ENV_NAME}'
+ACTIVATE_SKY_REMOTE_PYTHON_ENV = f'source {SKY_REMOTE_PYTHON_ENV}/bin/activate'
+# Default user-facing Python environment, baked into the container image (see
+# Dockerfile_k8s{,_gpu}) and created on VMs by SKY_USER_ENV_CREATION_COMMANDS.
+# It replaces the role conda's base env used to play:
+# user setup/run commands activate it so `pip`/`uv` install into a writable
+# location instead of a non-writable system site-packages. Kept separate from
+# the SkyPilot runtime env above. Only activated when conda is not active (an
+# opt-in conda base takes precedence). Keep the path in sync with the venv
+# created in the Dockerfiles.
+SKY_USER_ENV_PATH = '~/sky-user-env'
+ACTIVATE_SKY_USER_ENV = ('if [ -z "${CONDA_PREFIX:-}" ] && '
+                         f'[ -f {SKY_USER_ENV_PATH}/bin/activate ]; then '
+                         f'source {SKY_USER_ENV_PATH}/bin/activate; fi')
+# Place the conda root in the runtime directory, as installing to $HOME
+# on an NFS takes too long (1-2m slower).
+SKY_CONDA_ROOT = f'{SKY_RUNTIME_DIR}/miniconda3'
+# uv is used for venv and pip, much faster than python implementations.
+SKY_UV_INSTALL_DIR = '"$HOME/.local/bin"'
+# set UV_SYSTEM_PYTHON to false in case the
+# user provided docker image set it to true.
+# unset PYTHONPATH in case the user provided docker image set it.
+# UV_LINK_MODE=copy avoids a uv >=0.10.5 bug where clone/reflink mode
+# strips execute permissions on XFS filesystems, breaking Ray binaries.
+SKY_UV_CMD = ('UV_LINK_MODE=copy UV_SYSTEM_PYTHON=false '
+              f'{SKY_UNSET_PYTHONPATH_AND_SET_CWD} {SKY_UV_INSTALL_DIR}/uv')
+# This won't reinstall uv if it's already installed, so it's safe to re-run.
+SKY_UV_INSTALL_CMD = (f'{SKY_UV_CMD} -V >/dev/null 2>&1 || '
+                      'curl -LsSf https://astral.sh/uv/install.sh '
+                      f'| UV_INSTALL_DIR={SKY_UV_INSTALL_DIR} sh')
+SKY_UV_PIP_CMD: str = (f'VIRTUAL_ENV={SKY_REMOTE_PYTHON_ENV} {SKY_UV_CMD} pip')
+SKY_UV_RUN_CMD: str = (f'VIRTUAL_ENV={SKY_REMOTE_PYTHON_ENV} {SKY_UV_CMD} run '
+                       '--no-project --no-config')
+# Deleting the SKY_REMOTE_PYTHON_ENV_NAME from the PATH and unsetting relevant
+# VIRTUAL_ENV envvars to deactivate the environment. `deactivate` command does
+# not work when conda is used.
+DEACTIVATE_SKY_REMOTE_PYTHON_ENV = (
+    'export PATH='
+    f'$(echo $PATH | sed "s|$(echo {SKY_REMOTE_PYTHON_ENV})/bin:||") && '
+    'unset VIRTUAL_ENV && unset VIRTUAL_ENV_PROMPT')
+
+# Prefix for SkyPilot environment variables
+SKYPILOT_ENV_VAR_PREFIX = 'SKYPILOT_'
+SKYPILOT_SERVER_ENV_VAR_PREFIX = 'SKYPILOT_SERVER_'
+
+# The name for the environment variable that stores the unique ID of the
+# current task. This will stay the same across multiple recoveries of the
+# same managed task.
+TASK_ID_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}TASK_ID'
+# This environment variable stores a '\n'-separated list of task IDs that
+# are within the same managed job (DAG). This can be used by the user to
+# retrieve the task IDs of any tasks that are within the same managed job.
+# This environment variable is pre-assigned before any task starts
+# running within the same job, and will remain constant throughout the
+# lifetime of the job.
+TASK_ID_LIST_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}TASK_IDS'
+
+# The integer managed job ID assigned by the jobs controller.
+MANAGED_JOB_ID_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}MANAGED_JOB_ID'
+# Set only on tasks that are part of a job tree: a job group's tasks (the
+# group's own id) and a dynamic member's tasks (the member's root). A job
+# launched from such a task joins that tree. Absent on plain top-level jobs.
+ROOT_JOB_ID_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}ROOT_JOB_ID'
+
+# The version of skylet. MUST bump this version whenever we need the skylet to
+# be restarted on existing clusters updated with the new version of SkyPilot,
+# e.g., when we add new events to skylet, we fix a bug in skylet, or skylet
+# needs to load the new version of SkyPilot code to handle the autostop when the
+# cluster yaml is updated.
+#
+# TODO(zongheng,zhanghao): make the upgrading of skylet automatic?
+SKYLET_VERSION = '43'  # managed job table query takes include_tree.
+# The version of the lib files that skylet/jobs use. Whenever there is an API
+# change for the job_lib or log_lib, we need to bump this version, so that the
+# user can be notified to update their SkyPilot version on the remote cluster.
+SKYLET_LIB_VERSION = 7  # Generalized lifecycle-hooks framework.
+SKYLET_VERSION_FILE = '.sky/skylet_version'
+SKYLET_LOG_FILE = '.sky/skylet.log'
+SKYLET_PID_FILE = '.sky/skylet_pid'
+SKYLET_PORT_FILE = '.sky/skylet_port'
+# The Slurm skylet keeper consumes this start spec.
+SKYLET_START_FILE = '.sky/skylet_start'
+SKYLET_GRPC_PORT = 46590
+SKYLET_GRPC_TIMEOUT_SECONDS = 10
+# TODO(zpoint): legacy autostop-hook log path, kept so the new
+# tail_hook_logs(event='stop') can fall back to it on clusters
+# launched before the lifecycle-hooks framework. Remove after v0.15.0
+# (aligned with the autostop.hook removal pinned at v0.15.0 in
+# sky/utils/schemas.py:_AUTOSTOP_SCHEMA).
+AUTOSTOP_HOOK_LOG_FILE = '.sky/autostop_hook.log'
+
+# Lifecycle-hooks framework — per-event log directory on cluster nodes.
+HOOK_LOG_DIR = '.sky/hooks'
+
+
+class LifecycleEvent(str, enum.Enum):
+    """The three lifecycle events that can trigger a hook.
+
+    Subclasses ``str`` so direct equality comparisons against the
+    canonical string spellings keep working (e.g.,
+    ``LifecycleEvent.STOP == 'stop'``). Use this enum at
+    callsites that handle events as identifiers; user-facing surfaces
+    (YAML, CLI help, log messages) continue to use the string forms.
+
+    Naming convention follows k8s: events describe lifecycle position
+    (``stop``, ``down``), not trigger. Autodown (idle timer with
+    ``autostop.down: true``) fires ``down`` — not ``stop`` — because
+    the outcome is teardown, not pause.
+    """
+    STOP = 'stop'
+    PREEMPTION = 'preemption'
+    DOWN = 'down'
+
+
+# Backwards-compatible tuple of the three event strings.
+HOOK_EVENTS = tuple(e.value for e in LifecycleEvent)
+
+# Autostop hook timeout default (1 hour in seconds)
+DEFAULT_HOOK_TIMEOUT_SECONDS = 3600
+
+# Docker default options
+DEFAULT_DOCKER_CONTAINER_NAME = 'sky_container'
+DEFAULT_DOCKER_PORT = 10022
+DOCKER_USERNAME_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}DOCKER_USERNAME'
+DOCKER_PASSWORD_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}DOCKER_PASSWORD'
+DOCKER_SERVER_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}DOCKER_SERVER'
+DOCKER_LOGIN_ENV_VARS = {
+    DOCKER_USERNAME_ENV_VAR,
+    DOCKER_PASSWORD_ENV_VAR,
+    DOCKER_SERVER_ENV_VAR,
+}
+
+RUNPOD_DOCKER_USERNAME_ENV_VAR = 'SKYPILOT_RUNPOD_DOCKER_USERNAME'
+
+# Commands for disable GPU ECC, which can improve the performance of the GPU
+# for some workloads by 30%. This will only be applied when a user specify
+# `nvidia_gpus.disable_ecc: true` in ~/.sky/config.yaml.
+# Running this command will reboot the machine, introducing overhead for
+# provisioning the machine.
+# https://portal.nutanix.com/page/documents/kbs/details?targetId=kA00e000000LKjOCAW
+DISABLE_GPU_ECC_COMMAND = (
+    # Check if the GPU ECC is enabled. We use `sudo which` to check nvidia-smi
+    # because in some environments, nvidia-smi is not in path for sudo and we
+    # should skip disabling ECC in this case.
+    'sudo which nvidia-smi && echo "Checking Nvidia ECC Mode" && '
+    'out=$(nvidia-smi -q | grep "ECC Mode" -A2) && '
+    'echo "$out" && echo "$out" | grep Current | grep Enabled && '
+    'echo "Disabling Nvidia ECC" && '
+    # Disable the GPU ECC.
+    'sudo nvidia-smi -e 0 && '
+    # Reboot the machine to apply the changes.
+    '{ sudo reboot || echo "Failed to reboot. ECC mode may not be disabled"; } '
+    '|| true; ')
+
+SETUP_SKY_DIRS_COMMANDS = (f'mkdir -p ~/sky_workdir && '
+                           f'mkdir -p ~/.sky/sky_app && '
+                           f'mkdir -p {SKY_RUNTIME_DIR}/.sky;')
+
+# Install conda on the remote cluster if it is not already installed. This is
+# only used when the user opts in with `provision.install_conda: true` (conda is
+# not installed by default). We use Miniforge (conda-forge as the default and
+# only channel) rather than Miniconda: it avoids the Anaconda `defaults` channel
+# Terms-of-Service gate that makes non-interactive `conda create`/`install`
+# fail on recent conda.
+# The base python version (Miniforge ships a recent 3.x) does not matter here:
+# the SkyPilot runtime lives in a separate uv venv, and conda is user-facing.
+# https://github.com/ray-project/ray/issues/31606
+CONDA_INSTALLATION_COMMANDS = (
+    'command -v conda > /dev/null 2>&1 || '
+    '{ '
+    # Use uname -m to get the architecture of the machine and download the
+    # corresponding Miniforge installer. `-L` is required to follow the GitHub
+    # release redirect. Download to /tmp to ensure write access for non-root
+    # users.
+    'curl -L https://github.com/conda-forge/miniforge/releases/download/26.3.2-3/Miniforge3-26.3.2-3-Linux-$(uname -m).sh -o /tmp/Miniconda3-Linux.sh && '  # pylint: disable=line-too-long
+    # We do not use && for installation of conda and the following init commands
+    # because for some images, conda is already installed, but not initialized.
+    # In this case, we need to initialize conda and set auto_activate_base to
+    # true.
+    '{ '
+    f'bash /tmp/Miniconda3-Linux.sh -b -p "{SKY_CONDA_ROOT}" || true; '
+    f'eval "$({SKY_CONDA_ROOT}/bin/conda shell.bash hook)" && conda init && '
+    # Caller should replace {conda_auto_activate} with either true or false.
+    'conda config --set auto_activate_base {conda_auto_activate} && '
+    'conda activate base; }; '
+    # If conda was not installed and the image is a docker image,
+    # we deactivate any active conda environment we set.
+    # Caller should replace {is_custom_docker} with either true or false.
+    'if [ "{is_custom_docker}" = "true" ]; then '
+    'conda deactivate;'
+    'fi;'
+    '}; '
+    # run this command only if the image is not a docker image assuming
+    # that if a user is using a docker image, they know what they are doing
+    # in terms of conda setup/activation.
+    # Caller should replace {is_custom_docker} with either true or false.
+    'if [ "{is_custom_docker}" = "false" ]; then '
+    'grep "# >>> conda initialize >>>" ~/.bashrc || '
+    '{ conda init && source ~/.bashrc; };'
+    'fi;')
+
+UV_INSTALLATION_COMMANDS = (
+    # Install uv for venv management and pip installation.
+    f'{SKY_UV_INSTALL_CMD};'
+    # Create a separate python environment for SkyPilot dependencies.
+    f'[ -d {SKY_REMOTE_PYTHON_ENV} ] || '
+    # Do NOT use --system-site-packages here, because if users upgrade any
+    # packages in the base env, they interfere with skypilot dependencies.
+    # Reference: https://github.com/skypilot-org/skypilot/issues/4097
+    # --seed will include pip and setuptools, which are present in venvs created
+    # with python -m venv.
+    # --python 3.10 will ensure the specific python version is downloaded
+    # and installed in the venv. SkyPilot requires Python<3.12, and 3.10 is
+    # preferred. We have to always pass in `--python` to avoid the issue when a
+    # user has `.python_version` file in their home directory, which will cause
+    # uv to use the python version specified in the `.python_version` file.
+    # TODO(zhwu): consider adding --python-preference only-managed to avoid
+    # using the system python, if a user report such issue.
+    f'{SKY_UV_CMD} venv --seed {SKY_REMOTE_PYTHON_ENV} --python 3.10;'
+    f'echo "$(echo {SKY_REMOTE_PYTHON_ENV})/bin/python" > {SKY_PYTHON_PATH_FILE};'  # pylint: disable=line-too-long
+)
+
+# Create the default user environment (SKY_USER_ENV_PATH) on VM images that do
+# not ship one. Since conda is no longer installed by default, bare images
+# (e.g. plain Ubuntu 24.04) otherwise leave user tasks with no `python`/`pip`
+# and an externally managed (PEP 668), non-writable system Python. Must run
+# after uv is installed. Best effort and idempotent: skipped if a usable env
+# (with both `python` and `pip`) already exists, or if there is no python3. It
+# is created even when conda is installed: ACTIVATE_SKY_USER_ENV only activates
+# it when no conda env is active in the task shell.
+# --system-site-packages keeps packages preinstalled in the image's system
+# Python importable, while new installs go into the writable venv.
+# Safe to run concurrently against a shared $HOME (e.g. all nodes of a Slurm
+# cluster): each run builds a --relocatable env in its own temporary
+# directory and only installs it with an atomic rename, so the env path only
+# ever holds a complete env and no run deletes a directory another run is
+# building. An incomplete env left at the path (e.g. by a failed `--seed` of
+# an older version) is renamed aside before the install instead of being
+# deleted in place.
+_SKY_USER_ENV_USABLE = (f'{{ [ -x {SKY_USER_ENV_PATH}/bin/python ] && '
+                        f'[ -x {SKY_USER_ENV_PATH}/bin/pip ]; }}')
+SKY_USER_ENV_CREATION_COMMANDS = (
+    f'{_SKY_USER_ENV_USABLE} || '
+    '! command -v python3 > /dev/null 2>&1 || '
+    '{ '
+    '_sky_env_sfx="$(hostname 2>/dev/null).$$.$RANDOM"; '
+    f'_sky_env_tmp={SKY_USER_ENV_PATH}.tmp.$_sky_env_sfx; '
+    f'if {SKY_UV_CMD} venv --seed --relocatable --system-site-packages '
+    '--python "$(command -v python3)" "$_sky_env_tmp" > /dev/null 2>&1 && '
+    '[ -x "$_sky_env_tmp/bin/pip" ]; then '
+    f'if ! {_SKY_USER_ENV_USABLE} && [ -e {SKY_USER_ENV_PATH} ]; then '
+    f'mv -T {SKY_USER_ENV_PATH} {SKY_USER_ENV_PATH}.stale.$_sky_env_sfx '
+    f'2> /dev/null; rm -rf {SKY_USER_ENV_PATH}.stale.$_sky_env_sfx; '
+    'fi; '
+    f'mv -T "$_sky_env_tmp" {SKY_USER_ENV_PATH} 2> /dev/null; '
+    'fi; '
+    'rm -rf "$_sky_env_tmp"; '
+    f'{_SKY_USER_ENV_USABLE} || '
+    'echo "Failed to create the default user Python environment; skipping."; '
+    '};')
+
+_sky_version = str(version.parse(sky.__version__))
+RAY_STATUS = f'RAY_ADDRESS=127.0.0.1:{SKY_REMOTE_RAY_PORT} {SKY_RAY_CMD} status'
+RAY_INSTALLATION_COMMANDS = (
+    f'{SKY_UV_INSTALL_CMD};'
+    f'{SETUP_SKY_DIRS_COMMANDS}'
+    # Print the PATH in provision.log to help debug PATH issues.
+    'echo PATH=$PATH; '
+    # Install setuptools<=69.5.1 to avoid the issue with the latest setuptools
+    # causing the error:
+    #   ImportError: cannot import name 'packaging' from 'pkg_resources'"
+    f'{SKY_UV_PIP_CMD} install "setuptools<70"; '
+    # Always pin click<8.3.0: click 8.3.0+ breaks Ray CLI due to deepcopy
+    # issues with Sentinel values. We force this even when ray is already
+    # installed (e.g. baked into the SkyPilot AMI), since the ray-version
+    # idempotency guard below would otherwise skip the install and leave
+    # click at whatever the AMI shipped.
+    # See: https://github.com/ray-project/ray/issues/56747
+    f'{SKY_UV_PIP_CMD} install "click<8.3.0"; '
+    # Backward compatibility for ray upgrade (#3248): do not upgrade ray if the
+    # ray cluster is already running, to avoid the ray cluster being restarted.
+    #
+    # We do this guard to avoid any Ray client-server version mismatch.
+    # Specifically: If existing ray cluster is an older version say 2.4, and we
+    # pip install new version say 2.9 wheels here, then subsequent sky exec
+    # (ray job submit) will have v2.9 vs. 2.4 mismatch, similarly this problem
+    # exists for sky status -r (ray status).
+    #
+    # NOTE: RAY_STATUS will only work for the cluster with ray cluster on our
+    # latest ray port 6380, but those existing cluster launched before #1790
+    # that has ray cluster on the default port 6379 will be upgraded and
+    # restarted.
+    f'{SKY_UV_PIP_CMD} list | grep "ray " | '
+    f'grep {SKY_REMOTE_RAY_VERSION} 2>&1 > /dev/null '
+    f'|| {RAY_STATUS} || '
+    # The pydantic-core==2.41.3 for arm seems corrupted
+    # so we need to avoid that specific version.
+    # Pin click<8.3.0: click 8.3.0+ breaks Ray CLI due to deepcopy issues
+    # with Sentinel values. See https://github.com/ray-project/ray/issues/56747.
+    f'{SKY_UV_PIP_CMD} install -U "ray[default]=={SKY_REMOTE_RAY_VERSION}" "pydantic-core==2.41.1" "click<8.3.0"; '  # pylint: disable=line-too-long
+    # In some envs, e.g. pip does not have permission to write under /opt/conda
+    # ray package will be installed under ~/.local/bin. If the user's PATH does
+    # not include ~/.local/bin (the pip install will have the output: `WARNING:
+    # The scripts ray, rllib, serve and tune are installed in '~/.local/bin'
+    # which is not on PATH.`), causing an empty SKY_RAY_PATH_FILE later.
+    #
+    # Here, we add ~/.local/bin to the end of the PATH to make sure the issues
+    # mentioned above are resolved.
+    f'export PATH=$PATH:{SKY_RUNTIME_DIR}/.local/bin; '
+    # Writes ray path to file if it does not exist or the file is empty.
+    # Run `command -v` under `sh -c`: SKY_UV_RUN_CMD ends in `uv run`, which
+    # spawns its first arg as an executable -- `command` is a shell builtin, not
+    # a binary, so bare `uv run command -v ray` fails to spawn on the default
+    # image's uv. `sh` is a real binary uv can spawn; `command -v` then resolves
+    # ray's path as a builtin (and needs no external `which`, unlike before).
+    f'[ -s {SKY_RAY_PATH_FILE} ] || '
+    f'{{ {SKY_UV_RUN_CMD} '
+    f'sh -c "command -v ray" > {SKY_RAY_PATH_FILE} || exit 1; }}; ')
+
+# Copy SkyPilot templates from the installed wheel to ~/sky_templates.
+# This must run after the skypilot wheel is installed.
+# Note: We remove ~/sky_templates first to avoid import conflicts where Python
+# would import from ~/sky_templates instead of site-packages (because
+# sky_templates itself is a package), leading to src == dst error when
+# launching on an existing cluster.
+COPY_SKYPILOT_TEMPLATES_COMMANDS = (
+    f'rm -rf {SKY_TEMPLATES_DIRECTORY}; '
+    f'{ACTIVATE_SKY_REMOTE_PYTHON_ENV}; '
+    f'{SKY_PYTHON_CMD} -c \''
+    'import sky_templates, shutil, os; '
+    'src = os.path.dirname(sky_templates.__file__); '
+    f'dst = os.path.expanduser(\"{SKY_TEMPLATES_DIRECTORY}\"); '
+    'print(f\"Copying templates from {src} to {dst}...\"); '
+    'shutil.copytree(src, dst); '
+    'print(f\"Templates copied successfully\")\'; '
+    # Make scripts executable.
+    f'find {SKY_TEMPLATES_DIRECTORY} -type f ! -name "*.py" ! -name "*.md" '
+    '-exec chmod +x {} + ; ')
+
+SKYPILOT_WHEEL_INSTALLATION_COMMANDS = (
+    f'{SKY_UV_INSTALL_CMD};'
+    f'{{ {SKY_UV_PIP_CMD} list | grep "skypilot " && '
+    '[ "$(cat ~/.sky/wheels/current_sky_wheel_hash)" == "{sky_wheel_hash}" ]; } || '  # pylint: disable=line-too-long
+    f'{{ {SKY_UV_PIP_CMD} uninstall skypilot; '
+    # uv cannot install azure-cli normally, since it depends on pre-release
+    # packages. Manually install azure-cli with the --prerelease=allow flag
+    # first. This will allow skypilot to successfully install. See
+    # https://docs.astral.sh/uv/pip/compatibility/#pre-release-compatibility.
+    # We don't want to use --prerelease=allow for all packages, because it will
+    # cause uv to use pre-releases for some other packages that have sufficient
+    # stable releases.
+    'if [ "{cloud}" = "azure" ]; then '
+    f'{SKY_UV_PIP_CMD} install --prerelease=allow "{dependencies.AZURE_CLI}";'
+    'fi;'
+    # Install skypilot from wheel
+    f'{SKY_UV_PIP_CMD} install "$(echo ~/.sky/wheels/{{sky_wheel_hash}}/'
+    f'skypilot-{_sky_version}*.whl)[{{cloud}}, remote]" && '
+    'echo "{sky_wheel_hash}" > ~/.sky/wheels/current_sky_wheel_hash || '
+    'exit 1; }; ')
+
+# Install ray and skypilot on the remote cluster if they are not already
+# installed. {var} will be replaced with the actual value in
+# backend_utils.write_cluster_config.
+RAY_SKYPILOT_INSTALLATION_COMMANDS = (
+    f'{RAY_INSTALLATION_COMMANDS} '
+    f'{SKYPILOT_WHEEL_INSTALLATION_COMMANDS} '
+    # Only patch ray when the ray version is the same as the expected version.
+    # The ray installation above can be skipped due to the existing ray cluster
+    # for backward compatibility. In this case, we should not patch the ray
+    # files.
+    f'{SKY_UV_PIP_CMD} list | grep "ray " | '
+    f'grep {SKY_REMOTE_RAY_VERSION} 2>&1 > /dev/null && '
+    f'{{ {SKY_PYTHON_CMD} -c '
+    '"from sky.skylet.ray_patches import patch; patch()" || exit 1; }; ')
+
+# The name for the environment variable that stores SkyPilot user hash, which
+# is mainly used to make sure sky commands runs on a VM launched by SkyPilot
+# will be recognized as the same user (e.g., jobs controller or sky serve
+# controller).
+USER_ID_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}USER_ID'
+
+# The name for the environment variable that stores SkyPilot user name.
+# Similar to USER_ID_ENV_VAR, this is mainly used to make sure sky commands
+# runs on a VM launched by SkyPilot will be recognized as the same user.
+USER_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}USER'
+
+# The name for the environment variable that stores the client user hash.
+# This captures the machine-local identity of the actual client user, used to
+# aggregate usage across multiple API servers when basic auth is enabled.
+CLIENT_USER_HASH_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}CLIENT_USER_HASH'
+
+# SSH configuration to allow more concurrent sessions and connections.
+# Default MaxSessions is 10.
+# Default MaxStartups is 10:30:60, meaning:
+#   - Up to 10 unauthenticated connections are allowed without restriction.
+#   - From 11 to 60 connections, 30% are randomly dropped.
+#   - Above 60 connections, all are dropped.
+# These defaults are too low for submitting many parallel jobs (e.g., 150),
+# which can easily exceed the limits and cause connection failures.
+# The new values (MaxSessions 200, MaxStartups 150:30:200) increase these
+# limits significantly.
+# TODO(zeping): Bake this configuration in SkyPilot default images.
+SET_SSH_MAX_SESSIONS_CONFIG_CMD = (
+    'sudo bash -c \''
+    'echo "MaxSessions 200" >> /etc/ssh/sshd_config; '
+    'echo "MaxStartups 150:30:200" >> /etc/ssh/sshd_config; '
+    # Make the live reload best-effort. On containers with no systemd (all K8s
+    # pods) `systemctl reload sshd` fails, and on non-Debian images (RHEL/UBI)
+    # there is also no `service` command, so this line exited 127 and failed the
+    # whole runtime setup even though sshd is already running. A failed live
+    # reload must not abort the launch.
+    #
+    # Which link actually applies the setting matters, because this command is
+    # rendered into setup_commands -- it runs over SSH, i.e. AFTER the pod's
+    # sshd is already up. There is no "next sshd start" for a K8s pod: the
+    # container does not restart, and if it did, the writable layer (and these
+    # appended lines) would be gone. So on RHEL/UBI, where systemctl and
+    # service are both unavailable, `kill -HUP` is what applies it -- sshd
+    # re-execs on SIGHUP and re-reads the config. That works because the pod
+    # starts sshd via a bare `sshd`/`/usr/sbin/sshd`, which writes
+    # /var/run/sshd.pid. If every link fails, the setting is simply never
+    # applied for that pod's lifetime; the cluster still comes up, just with
+    # sshd's default limits.
+    #
+    # Verified on a live docker:rockylinux:9 launch: `kill -HUP` was the link
+    # that won, and the running listener reported our values (its process title
+    # read "0 of 150-200 startups" against a default of 10-100).
+    '(systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null || '
+    'service sshd reload 2>/dev/null || '
+    'kill -HUP $(cat /var/run/sshd.pid 2>/dev/null) 2>/dev/null || true); '
+    '\'')
+
+# Internal: Env var indicating the system is running with a remote API server.
+# It is used for internal purposes, including the jobs controller to mark
+# clusters as launched with a remote API server.
+USING_REMOTE_API_SERVER_ENV_VAR = (
+    f'{SKYPILOT_ENV_VAR_PREFIX}USING_REMOTE_API_SERVER')
+
+# In most clouds, cluster names can only contain lowercase letters, numbers
+# and hyphens. We use this regex to validate the cluster name.
+CLUSTER_NAME_VALID_REGEX = '[a-zA-Z]([-_.a-zA-Z0-9]*[a-zA-Z0-9])?'
+
+# Recipe names: letters, numbers, and dashes only (no underscores or dots).
+# Must start with a letter, end with an alphanumeric character.
+RECIPE_NAME_VALID_REGEX = r'[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?'
+RECIPE_NAME_MAX_LENGTH = 40
+
+# Workspace names: lowercase letters, numbers, dashes, and underscores.
+# Must start with a lowercase letter, end with a lowercase letter or digit.
+WORKSPACE_NAME_VALID_REGEX = r'[a-z]([-_a-z0-9]*[a-z0-9])?'
+WORKSPACE_NAME_MAX_LENGTH = 63
+
+# Used for translate local file mounts to cloud storage. Please refer to
+# sky/execution.py::_maybe_translate_local_file_mounts_and_sync_up for
+# more details.
+FILE_MOUNTS_BUCKET_NAME = 'skypilot-filemounts-{username}-{user_hash}-{id}'
+FILE_MOUNTS_LOCAL_TMP_DIR = 'skypilot-filemounts-files-{id}'
+FILE_MOUNTS_REMOTE_TMP_DIR = '/tmp/sky-{}-filemounts-files'
+# For API server, the use a temporary directory in the same path as the upload
+# directory to avoid using a different block device, which may not allow hard
+# linking. E.g., in our API server deployment on k8s, ~/.sky/ is mounted from a
+# persistent volume, so any contents in ~/.sky/ cannot be hard linked elsewhere.
+FILE_MOUNTS_LOCAL_TMP_BASE_PATH = '~/.sky/tmp/'
+# Base path for two-hop file mounts translation. See
+# controller_utils.translate_local_file_mounts_to_two_hop().
+FILE_MOUNTS_CONTROLLER_TMP_BASE_PATH = '~/.sky/tmp/controller'
+
+# For passing in CPU and memory limits to the controller pod when running
+# in k8s. Right now, we only use this for the jobs controller, but we may
+# use this for the serve controller as well in the future.
+# These files are written to disk by the skylet, who reads it from env vars
+# passed by the backend when starting the skylet (start_skylet_on_head_node).
+CONTROLLER_K8S_CPU_FILE = '~/.sky/_internal_k8s_pod_cpu'
+CONTROLLER_K8S_MEMORY_FILE = '~/.sky/_internal_k8s_pod_memory'
+
+# Used when an managed jobs are created and
+# files are synced up to the cloud.
+FILE_MOUNTS_WORKDIR_SUBPATH = 'job-{run_id}/workdir'
+FILE_MOUNTS_SUBPATH = 'job-{run_id}/local-file-mounts/{i}'
+FILE_MOUNTS_TMP_SUBPATH = 'job-{run_id}/tmp-files'
+
+# Due to the CPU/memory usage of the controller process launched with sky jobs (
+# use ray job under the hood), we need to reserve some CPU/memory for each jobs/
+# serve controller process.
+# Jobs: A default controller with 8 vCPU and 32 GB memory can manage up to 32
+# managed jobs.
+# Serve: A default controller with 4 vCPU and 16 GB memory can run up to 16
+# services.
+CONTROLLER_PROCESS_CPU_DEMAND = 0.25
+# The log for SkyPilot API server.
+API_SERVER_LOGS = '~/.sky/api_server/server.log'
+# The lock for creating the SkyPilot API server.
+API_SERVER_CREATION_LOCK_PATH = '~/.sky/api_server/.creation.lock'
+
+# The name for the environment variable that stores the URL of the SkyPilot
+# API server.
+SKY_API_SERVER_URL_ENV_VAR = f'{SKYPILOT_ENV_VAR_PREFIX}API_SERVER_ENDPOINT'
+
+# The name for the environment variable that overrides the port of the local
+# SkyPilot API server (default: 46580). Both the server and the client honor
+# it, so exporting it in a shell yields a self-consistent environment. Useful
+# together with SKY_RUNTIME_DIR to run multiple isolated API servers on one
+# machine (e.g., for development).
+SKY_API_SERVER_LOCAL_PORT_ENV_VAR = (
+    f'{SKYPILOT_ENV_VAR_PREFIX}API_SERVER_LOCAL_PORT')
+
+# The name for the environment variable that stores the SkyPilot service
+# account token on client side.
+SERVICE_ACCOUNT_TOKEN_ENV_VAR = (
+    f'{SKYPILOT_ENV_VAR_PREFIX}SERVICE_ACCOUNT_TOKEN')
+
+# SkyPilot environment variables
+SKYPILOT_NUM_NODES = f'{SKYPILOT_ENV_VAR_PREFIX}NUM_NODES'
+SKYPILOT_NODE_IPS = f'{SKYPILOT_ENV_VAR_PREFIX}NODE_IPS'
+SKYPILOT_SETUP_NUM_GPUS_PER_NODE = (
+    f'{SKYPILOT_ENV_VAR_PREFIX}SETUP_NUM_GPUS_PER_NODE')
+SKYPILOT_NUM_GPUS_PER_NODE = f'{SKYPILOT_ENV_VAR_PREFIX}NUM_GPUS_PER_NODE'
+SKYPILOT_NODE_RANK = f'{SKYPILOT_ENV_VAR_PREFIX}NODE_RANK'
+
+# Placeholder for the SSH user in proxy command, replaced when the ssh_user is
+# known after provisioning.
+SKY_SSH_USER_PLACEHOLDER = 'skypilot:ssh_user'
+
+RCLONE_CONFIG_DIR = '~/.config/rclone'
+RCLONE_CONFIG_PATH = f'{RCLONE_CONFIG_DIR}/rclone.conf'
+RCLONE_MOUNT_CACHED_LOG_DIR = '~/.sky/rclone_log'
+RCLONE_CACHE_DIR = '~/.cache/rclone'
+RCLONE_CACHE_REFRESH_INTERVAL = 10
+
+# The keys that can be overridden in the `~/.sky/config.yaml` file. The
+# overrides are specified in task YAMLs.
+OVERRIDEABLE_CONFIG_KEYS_IN_TASK: List[Tuple[str, ...]] = [
+    ('docker', 'run_options'),
+    ('nvidia_gpus', 'disable_ecc'),
+    ('ssh', 'custom_metadata'),
+    ('ssh', 'pod_config'),
+    ('ssh', 'provision_timeout'),
+    ('kubernetes', 'custom_metadata'),
+    ('kubernetes', 'pod_config'),
+    ('kubernetes', 'provision_timeout'),
+    ('kubernetes', 'dws'),
+    ('kubernetes', 'kueue'),
+    ('kubernetes', 'quota'),
+    ('kubernetes', 'remote_identity'),
+    ('kubernetes', 'enable_docker'),
+    ('kubernetes', 'set_pod_resource_limits'),
+    ('azure', 'remote_identity'),
+    ('azure', 'vpc_name'),
+    ('gcp', 'vpc_name'),
+    ('gcp', 'subnet_names'),
+    ('gcp', 'managed_instance_group'),
+    ('gcp', 'enable_gvnic'),
+    ('gcp', 'enable_gpu_direct'),
+    ('gcp', 'placement_policy'),
+    ('vast', 'datacenter_only'),
+    ('vast', 'create_instance_kwargs'),
+    ('slurm', 'sbatch_options'),
+    ('slurm', 'quota'),
+    ('slurm', 'cpu_partition'),
+    ('active_workspace',),
+]
+# When overriding the SkyPilot configs on the API server with the client one,
+# we skip the following keys because they are meant to be client-side configs.
+# Also, we skip the consolidation mode config as those should be only set on
+# the API server side.
+SKIPPED_CLIENT_OVERRIDE_KEYS: List[Tuple[str, ...]] = [
+    ('api_server',),
+    ('allowed_clouds',),
+    ('workspaces',),
+    ('db',),
+    ('daemons',),
+    ('metrics',),
+    # TODO(kevin,tian): Override the whole controller config once our test
+    # infrastructure supports setting dynamic server side configs.
+    # Tests that are affected:
+    # - test_managed_jobs_ha_kill_starting
+    # - test_managed_jobs_ha_kill_running
+    # - all tests that use LOW_CONTROLLER_RESOURCE_ENV or
+    #   LOW_CONTROLLER_RESOURCE_OVERRIDE_CONFIG (won't cause test failure,
+    #   but the configs won't be applied)
+    ('jobs', 'controller', 'consolidation_mode'),
+    ('serve', 'controller', 'consolidation_mode'),
+    ('jobs', 'controller', 'controller_logs_gc_retention_hours'),
+    ('jobs', 'controller', 'task_logs_gc_retention_hours'),
+    # Slurm submit identity and cluster settings are managed server-side.
+    ('slurm', 'cluster_configs'),
+    ('slurm', 'submit_as_user'),
+    ('slurm', 'username_map'),
+]
+
+# Constants for Azure blob storage
+WAIT_FOR_STORAGE_ACCOUNT_CREATION = 60
+# Observed time for new role assignment to propagate was ~45s
+WAIT_FOR_STORAGE_ACCOUNT_ROLE_ASSIGNMENT = 180
+RETRY_INTERVAL_AFTER_ROLE_ASSIGNMENT = 10
+ROLE_ASSIGNMENT_FAILURE_ERROR_MSG = (
+    'Failed to assign Storage Blob Data Owner role to the '
+    'storage account {storage_account_name}.')
+
+# Constants for path in K8S pod to store persistent setup and run scripts
+# so that we can run them again after the pod restarts.
+# Path within user home. For HA controller, assumes home directory is
+# persistent through PVC. See kubernetes-ray.yml.j2.
+PERSISTENT_SETUP_SCRIPT_PATH = '~/.sky/.controller_recovery_setup_commands.sh'
+PERSISTENT_RUN_SCRIPT_DIR = '~/.sky/.controller_recovery_task_run'
+# Signal file to indicate that the controller is recovering from a failure.
+# See sky/jobs/utils.py::update_managed_jobs_statuses for more details.
+PERSISTENT_RUN_RESTARTING_SIGNAL_FILE = (
+    '~/.sky/.controller_recovery_restarting_signal')
+
+HA_PERSISTENT_RECOVERY_LOG_PATH = '/tmp/{}ha_recovery.log'
+
+# The placeholder for the local skypilot config path in file mounts for
+# controllers.
+LOCAL_SKYPILOT_CONFIG_PATH_PLACEHOLDER = 'skypilot:local_skypilot_config_path'
+
+# Path to the generated cluster config yamls and ssh configs.
+SKY_USER_FILE_PATH = '~/.sky/generated'
+
+# TODO(cooperc): Update all env vars to begin with SKYPILOT_ or SKYPILOT_SERVER_
+# Environment variable that is set to 'true' if this is a skypilot server.
+ENV_VAR_IS_SKYPILOT_SERVER = 'IS_SKYPILOT_SERVER'
+OVERRIDE_CONSOLIDATION_MODE = 'IS_SKYPILOT_JOB_CONTROLLER'
+IS_SKYPILOT_SERVE_CONTROLLER = 'IS_SKYPILOT_SERVE_CONTROLLER'
+# Environment variable that is set to 'true' if rolling update strategy is
+# enabled for the API server deployment.
+SKYPILOT_ROLLING_UPDATE_ENABLED = 'SKYPILOT_ROLLING_UPDATE_ENABLED'
+# Environment variable that is set to 'true' if persistent storage is enabled
+# for the API server deployment (via Helm storage.enabled=true).
+# This enables persistence of managed job logs and file mounts across rolling
+# updates.
+SKYPILOT_API_SERVER_STORAGE_ENABLED = 'SKYPILOT_API_SERVER_STORAGE_ENABLED'
+
+SERVE_OVERRIDE_CONCURRENT_LAUNCHES = (
+    f'{SKYPILOT_ENV_VAR_PREFIX}SERVE_OVERRIDE_CONCURRENT_LAUNCHES')
+
+# Environment variable that is set to 'true' if metrics are enabled.
+ENV_VAR_SERVER_METRICS_ENABLED = 'SKY_API_SERVER_METRICS_ENABLED'
+
+
+def server_metrics_enabled() -> bool:
+    """Whether the API server's metrics machinery should run.
+
+    One predicate for every consumer, because there used to be four over the
+    same variable: two `== 'true'` comparisons and two bare truthiness
+    checks. `=1` therefore installed the metrics middleware and served
+    /metrics while every instrument behind it stayed off, and `=false`
+    installed them too. Spelled the way the rest of the repo spells a boolean
+    environment variable (`sky/utils/env_options.py`).
+    """
+    return os.environ.get(ENV_VAR_SERVER_METRICS_ENABLED,
+                          'false').lower() in ('true', '1')
+
+
+# If set, overrides the header that we can use to get the user name.
+ENV_VAR_SERVER_AUTH_USER_HEADER = f'{SKYPILOT_ENV_VAR_PREFIX}AUTH_USER_HEADER'
+
+# Environment variable that is used as the DB connection string for the
+# skypilot server.
+ENV_VAR_DB_CONNECTION_URI = (f'{SKYPILOT_ENV_VAR_PREFIX}DB_CONNECTION_URI')
+
+# Optional: route the state DB through a transaction-mode connection pooler
+# (e.g. PgBouncer). When set, regular state-DB engines connect through the
+# pooler while session-scoped advisory locks keep a direct connection (see
+# `sky.utils.db.db_utils.get_engine`). Both are unset by default, in which
+# case the state DB is reached directly via ENV_VAR_DB_CONNECTION_URI.
+#
+# ENV_VAR_DB_POOL_CONNECTION_URI: a full replacement connection URI for the
+# pooled engines, used verbatim (escape hatch, e.g. an entirely separate
+# pooler endpoint or a TLS-terminating/remote pooler).
+# ENV_VAR_DB_POOL_HOSTPORT: a `host:port` that replaces just the host:port of
+# ENV_VAR_DB_CONNECTION_URI, preserving user/password/dbname and non-ssl query
+# params — so no DB credentials need re-plumbing when the pooler runs as a
+# local loopback sidecar. Because such a sidecar (e.g. PgBouncer on
+# 127.0.0.1) typically does not terminate client TLS, the rewrite drops any
+# ssl* libpq query params from the direct URI and forces `sslmode=disable`
+# toward the pooler; a pooler that requires client TLS must be configured via
+# ENV_VAR_DB_POOL_CONNECTION_URI instead.
+ENV_VAR_DB_POOL_CONNECTION_URI = (
+    f'{SKYPILOT_ENV_VAR_PREFIX}DB_POOL_CONNECTION_URI')
+ENV_VAR_DB_POOL_HOSTPORT = (f'{SKYPILOT_ENV_VAR_PREFIX}DB_POOL_HOSTPORT')
+
+# Number of persistent Postgres connections each server process keeps in its
+# state-DB connection pool (SQLAlchemy `QueuePool`), overriding the budget the
+# server derives at runtime (`sky.server.config.compute_server_config`).
+# Unset by default, in which case nothing changes: the derived budget decides,
+# and it asks for a pool only when the database reports more connections than
+# the server can occupy.
+#
+# Why an override exists: the derived budget compares the server's worker count
+# against the database's own `max_connections`, which is a property of the
+# database, not of this server's share of it -- the same database may serve
+# other replicas, other tenants and ad-hoc clients, so that number is neither
+# an upper bound this server may take nor, behind a connection pooler, the
+# number of backends a pool would actually hold. A deployment that knows its
+# own share states it here instead.
+#
+# Also unlike the derived budget, this value needs no coordination with server
+# startup: it is read whenever an engine is built
+# (`sky.utils.db.db_utils.get_db_connection_pool_size`), so it applies to
+# engines built before a process sets its budget -- e.g. the one
+# `skypilot_config` builds while it is being imported -- as well as after.
+#
+# Set it to N > 0 to keep N connections open per process, on top of which the
+# process may burst (see ENV_VAR_SERVER_DB_CONNECTION_POOL_MAX_OVERFLOW). Size
+# N from what the deployment may hold open when idle:
+# N x (uvicorn workers + executor workers + 1). 0 disables pooling explicitly
+# (every state query opens its own connection, `NullPool`).
+#
+# Server-side only: the SKYPILOT_SERVER_ prefix keeps clients from forwarding
+# it (`sky.server.requests.payloads.request_body_env_vars`).
+ENV_VAR_SERVER_DB_CONNECTION_POOL_SIZE = (
+    f'{SKYPILOT_SERVER_ENV_VAR_PREFIX}DB_CONNECTION_POOL_SIZE')
+
+# Burst connections a server process may open beyond the pooled ones
+# (SQLAlchemy's `max_overflow`), each closed when it is returned rather than
+# kept. A process therefore holds `pool_size` connections open when idle and
+# uses at most `pool_size + max_overflow` at once; a query that arrives when
+# all of them are busy waits for one instead of opening its own.
+#
+# Unset by default, in which case a process bursts up to
+# DEFAULT_DB_CONNECTION_POOL_MAX_CONCURRENCY concurrent connections, so a
+# process that pools only a couple of connections does not serialize its
+# queries behind them. That default reaches 0 once the pool alone is that
+# wide, which is why a deployment that pools more than a handful of
+# connections and still wants burst room states the value here.
+ENV_VAR_SERVER_DB_CONNECTION_POOL_MAX_OVERFLOW = (
+    f'{SKYPILOT_SERVER_ENV_VAR_PREFIX}DB_CONNECTION_POOL_MAX_OVERFLOW')
+
+# Concurrent state-DB connections a server process uses before it starts
+# queueing queries, when the burst size is left to the default.
+DEFAULT_DB_CONNECTION_POOL_MAX_CONCURRENCY = 5
+
+# Total deadline, in seconds, on each DB lookup the API server's
+# authentication middlewares make (`sky.server.auth.db_lookup`). The users
+# upsert derives the server-side timeouts it sets on its own transaction
+# from the same value (`sky.global_user_state.add_or_update_user`), so read
+# it through `sky.utils.db.db_utils.get_auth_db_timeout_seconds()` rather
+# than from the environment directly: that keeps the two from drifting
+# apart. Server-side only: it is stripped from client request payloads and
+# from the per-request environment overlay on the server.
+ENV_VAR_AUTH_DB_TIMEOUT_SECONDS = (
+    f'{SKYPILOT_ENV_VAR_PREFIX}AUTH_DB_TIMEOUT_SECONDS')
+DEFAULT_AUTH_DB_TIMEOUT_SECONDS = 5.0
+
+# How long a managed-job task may sit in each of the two stall phases before
+# `sky.jobs.stall` reports it. Overridable so a deployment that disagrees with
+# the defaults can say so through its helm values instead of waiting for a
+# release; read through `sky.jobs.stall`, which validates them, rather than
+# from the environment directly.
+#
+# Under SKYPILOT_SERVER_ so a client cannot supply them: `request_body_env_vars`
+# forwards SKYPILOT_ variables except those carrying this prefix.
+ENV_VAR_MANAGED_JOBS_NEVER_CLAIMED_SECONDS = (
+    f'{SKYPILOT_SERVER_ENV_VAR_PREFIX}MANAGED_JOBS_NEVER_CLAIMED_SECONDS')
+# A fully drained controller pool is only topped up on the managed-job daemon
+# tick (~300s), and the replacement then has to start and claim on its own
+# ~10s poll, so anything much shorter fires on routine pool churn.
+DEFAULT_MANAGED_JOBS_NEVER_CLAIMED_SECONDS = 10 * 60
+
+ENV_VAR_MANAGED_JOBS_UNATTENDED_SECONDS = (
+    f'{SKYPILOT_SERVER_ENV_VAR_PREFIX}MANAGED_JOBS_UNATTENDED_SECONDS')
+# Above the launch retry backoff, which caps at five times its 60s base plus
+# jitter.
+DEFAULT_MANAGED_JOBS_UNATTENDED_SECONDS = 15 * 60
+
+# Environment variable that is set to 'true' if basic
+# authentication is enabled in the API server.
+ENV_VAR_ENABLE_BASIC_AUTH = 'ENABLE_BASIC_AUTH'
+SKYPILOT_INITIAL_BASIC_AUTH = 'SKYPILOT_INITIAL_BASIC_AUTH'
+SKYPILOT_INGRESS_BASIC_AUTH_ENABLED = 'SKYPILOT_INGRESS_BASIC_AUTH_ENABLED'
+SKYPILOT_DISABLE_BASIC_AUTH_MIDDLEWARE = (
+    'SKYPILOT_DISABLE_BASIC_AUTH_MIDDLEWARE')
+ENV_VAR_ENABLE_SERVICE_ACCOUNTS = 'ENABLE_SERVICE_ACCOUNTS'
+
+# Enable debug logging for requests.
+ENV_VAR_ENABLE_REQUEST_DEBUG_LOGGING = (
+    f'{SKYPILOT_SERVER_ENV_VAR_PREFIX}ENABLE_REQUEST_DEBUG_LOGGING')
+
+# When set to a truthy value, each API server worker binds its own listening
+# socket with SO_REUSEPORT so the kernel load-balances new connections across
+# workers, instead of all workers sharing a single inherited socket. Only takes
+# effect on Linux and with more than one worker.
+ENV_VAR_SERVER_REUSE_PORT = (f'{SKYPILOT_SERVER_ENV_VAR_PREFIX}REUSE_PORT')
+
+SKYPILOT_DEFAULT_WORKSPACE = 'default'
+
+# BEGIN constants used for service catalog.
+HOSTED_CATALOG_DIR_URL = 'https://raw.githubusercontent.com/skypilot-org/skypilot-catalog/master/catalogs'  # pylint: disable=line-too-long
+HOSTED_CATALOG_DIR_URL_S3_MIRROR = 'https://skypilot-catalog.s3.us-east-1.amazonaws.com/catalogs'  # pylint: disable=line-too-long
+CATALOG_SCHEMA_VERSION = 'v8'
+CATALOG_DIR = '~/.sky/catalogs'
+ALL_CLOUDS = ('aws', 'azure', 'gcp', 'ibm', 'lambda', 'scp', 'oci',
+              'kubernetes', 'runpod', 'vast', 'vsphere', 'cudo', 'fluidstack',
+              'paperspace', 'primeintellect', 'do', 'nebius', 'ssh', 'slurm',
+              'hyperbolic', 'seeweb', 'shadeform', 'yotta', 'mithril', 'verda')
+# END constants used for service catalog.
+
+# The user ID of the SkyPilot system.
+SKYPILOT_SYSTEM_USER_ID = 'skypilot-system'
+
+# A built-in viewer-role counterpart to SKYPILOT_SYSTEM_USER_ID.
+SKYPILOT_SYSTEM_VIEWER_USER_ID = 'skypilot-system-viewer'
+
+# The directory to store the logging configuration.
+LOGGING_CONFIG_DIR = '~/.sky/logging'
+
+# Resources constants
+TIME_UNITS = {
+    'm': 1,
+    'h': 60,
+    'd': 24 * 60,
+    'w': 7 * 24 * 60,
+}
+
+# Time units for seconds-based duration parsing (for termination_delay, etc.)
+# This includes 's' for seconds, which is not in TIME_UNITS (minutes-based).
+TIME_UNITS_SECONDS = {
+    's': 1,
+    'm': 60,
+    'h': 3600,
+    'd': 86400,
+    'w': 604800,
+}
+
+
+def _make_time_pattern(units: dict) -> str:
+    """Create a regex pattern for time duration strings."""
+    unit_pattern = '|'.join([unit.lower() for unit in units] +
+                            [unit.upper() for unit in units])
+    return f'^[0-9]+({unit_pattern})?$'
+
+
+TIME_PATTERN: str = _make_time_pattern(TIME_UNITS)
+TIME_PATTERN_SECONDS: str = _make_time_pattern(TIME_UNITS_SECONDS)
+
+MEMORY_SIZE_UNITS = {
+    'kb': 2**10,
+    'ki': 2**10,
+    'mb': 2**20,
+    'mi': 2**20,
+    'gb': 2**30,
+    'gi': 2**30,
+    'tb': 2**40,
+    'ti': 2**40,
+    'pb': 2**50,
+    'pi': 2**50,
+}
+
+SUB_PATH_PATTERN = '^[a-zA-Z0-9._-][a-zA-Z0-9./_-]*$'
+
+MEMORY_SIZE_PATTERN = (
+    '^[0-9]+('
+    f'{"|".join([unit.lower() for unit in MEMORY_SIZE_UNITS])}|'
+    f'{"|".join([unit.upper() for unit in MEMORY_SIZE_UNITS])}|'
+    f'{"|".join([unit[0].upper() + unit[1:] for unit in MEMORY_SIZE_UNITS if len(unit) > 1])}'  # pylint: disable=line-too-long
+    ')?$')
+
+LAST_USE_TRUNC_LENGTH = 25
+USED_BY_TRUNC_LENGTH = 25
+ERROR_MESSAGE_TRUNC_LENGTH = 60
+
+MIN_PRIORITY = -1000
+MAX_PRIORITY = 1000
+DEFAULT_PRIORITY = 0
+
+GRACE_PERIOD_SECONDS_ENV_VAR = SKYPILOT_ENV_VAR_PREFIX + 'GRACE_PERIOD_SECONDS'
+COST_REPORT_DEFAULT_DAYS = 30
+
+ENV_VAR_LOOP_LAG_THRESHOLD_MS = (SKYPILOT_ENV_VAR_PREFIX +
+                                 'DEBUG_LOOP_LAG_THRESHOLD_MS')
+
+# Lag above which the event loop stall watchdog dumps the loop thread's stack
+# to attribute the stall. Unlike the debug variable above this is on by
+# default, because its cost falls on the stall path only; set it to 0 to turn
+# the watchdog off.
+ENV_VAR_LOOP_STALL_THRESHOLD_MS = (SKYPILOT_ENV_VAR_PREFIX +
+                                   'LOOP_STALL_THRESHOLD_MS')
+DEFAULT_LOOP_STALL_THRESHOLD_MS = 1000.0
+
+ARM64_ARCH = 'arm64'
+X86_64_ARCH = 'x86_64'
+
+# Slurm marker file for proctrack type detection.
+# Used by the executor to conditionally apply multi-node barrier.
+SLURM_PROCTRACK_TYPE_FILE = '.sky_proctrack_type'
+
+SSH_DISABLE_LATENCY_MEASUREMENT_ENV_VAR = (
+    f'{SKYPILOT_ENV_VAR_PREFIX}SSH_DISABLE_LATENCY_MEASUREMENT')
+
+# Maximum number of node name entries to keep per node in the lineage.
+MAX_NODE_NAME_LINEAGE = 10
+
+# Clouds that provide storage only (no compute).
+STORAGE_ONLY_CLOUDS = ['cloudflare', 'coreweave', 'vastdata', 'huggingface']

@@ -1,0 +1,228 @@
+"""Constants for the API servers."""
+
+import os
+
+from sky.skylet import constants
+from sky.skylet import runtime_utils
+
+# pylint: disable=line-too-long
+# The SkyPilot API version that the code currently use.
+# Bump this version when the API is changed and special compatibility handling
+# based on version info is needed.
+# For more details and code guidelines, refer to:
+# https://docs.skypilot.co/en/latest/developers/CONTRIBUTING.html#backward-compatibility-guidelines
+API_VERSION = 64  # managed jobs: depends_on on launch
+
+# The minimum peer API version that the code should still work with.
+# Notes (dev):
+# - This value is maintained by the CI pipeline, DO NOT EDIT this manually.
+# - Compatibility code for versions lower than this can be safely removed.
+# Refer to API_VERSION for more details.
+MIN_COMPATIBLE_API_VERSION = 24
+
+# The semantic version of the minimum compatible API version.
+# Refer to MIN_COMPATIBLE_API_VERSION for more details.
+# Note (dev): DO NOT EDIT this constant manually.
+MIN_COMPATIBLE_VERSION = '0.11.0'
+
+# The HTTP header name for the API version of the sender.
+API_VERSION_HEADER = 'X-SkyPilot-API-Version'
+
+# The HTTP header name for the SkyPilot version of the sender.
+VERSION_HEADER = 'X-SkyPilot-Version'
+
+# Minimum client API version required to launch recipes.
+MIN_RECIPE_LAUNCH_API_VERSION = 33
+
+# Minimum API version that supports upload API v2.
+UPLOAD_API_V2_VERSION = 41
+
+# Minimum server API version required for api_server_access in managed jobs.
+MIN_API_ACCESS_API_VERSION = 42
+
+# Minimum API version that supports the SSH redirect first-frame protocol.
+MIN_SSH_REDIRECT_PROTOCOL_VERSION = 47
+
+# Minimum server API version that supports filtering the managed jobs queue by
+# infra (`infra_match`, surfaced as the CLI `--infra` flag and the dashboard's
+# Infra filter). An older server drops the field and answers with jobs on every
+# infra, so the client refuses to ask rather than mislabel that as filtered.
+MIN_JOBS_INFRA_FILTER_API_VERSION = 58
+# Minimum API version for attaching a managed job to a parent job (dynamic
+# job group members): `parent_job_id`/`parent_task_id` on jobs launch.
+MIN_JOBS_PARENT_LINK_API_VERSION = 61
+# Minimum server API version whose managed-jobs queue knows
+# dynamic_task_index (a dynamic task's ordinal within its job group).
+MIN_JOBS_DYNAMIC_TASK_INDEX_API_VERSION = 62
+# Minimum server API version whose managed-jobs queue takes `include_tree`
+# (with `job_ids`, also return the jobs launched under those jobs). An older
+# server ignores the field and returns only the requested jobs' rows, and the
+# client cannot tell, so the client refuses to send it.
+MIN_JOBS_INCLUDE_TREE_API_VERSION = 63
+# Minimum server API version that accepts `depends_on` on a managed jobs
+# launch.
+MIN_JOBS_DEPENDS_ON_API_VERSION = 64
+
+# Minimum API version that supports Sky Batch (sky.batch module).
+MIN_BATCH_API_VERSION = 49
+
+# Minimum API version that supports bundling cluster credentials with the
+# launch response. Lets the CLI skip the follow-up /status round-trip that
+# only exists to fetch credentials for SSH config setup.
+MIN_LAUNCH_CREDENTIALS_API_VERSION = 50
+MIN_SLURM_HOST_PATH_VOLUME_API_VERSION = 57
+
+# Servers >= this version omit the bulky pickled `handle` from each replica
+# in serve/pool status responses, shipping pre-computed `infra` /
+# `resources_str` / `resources_str_full` strings instead. Older clients are
+# still served the full handle on the wire so existing SDK code that reads
+# `record['handle']` keeps working.
+MIN_LAZY_REPLICA_HANDLE_API_VERSION = 51
+
+# Minimum ReplicaInfo._VERSION that supports Sky Batch workers.
+MIN_BATCH_REPLICA_INFO_VERSION = 3
+
+# Minimum server API version that exposes /users/me/workspace and runs the
+# server-side launch-path resolver when the client does not specify an
+# active workspace. Older servers don't have the endpoint and fall back to
+# the literal 'default' workspace, so the client must skip features that
+# depend on per-user preferred workspace when talking to such servers.
+MIN_PREFERRED_WORKSPACE_API_VERSION = 53
+
+# Minimum server API version that supports filtering the managed jobs queue by
+# submission time (submitted_after / submitted_before, surfaced as the CLI
+# --since / --after / --before flags). Older servers silently ignore these
+# fields, so the client warns and shows all jobs.
+MIN_JOBS_SUBMITTED_AT_FILTER_API_VERSION = 54
+
+# Servers >= this version may report the WAITING request status (a request
+# parked off its worker while waiting for a retry/resume condition). Older
+# clients don't know the value and would crash parsing it, so the server
+# downgrades WAITING to RUNNING on the wire for clients below this version.
+MIN_WAITING_STATUS_API_VERSION = 55
+
+# Prefix for API request names.
+REQUEST_NAME_PREFIX = 'sky.'
+# The memory (GB) that SkyPilot tries to not use to prevent OOM.
+MIN_AVAIL_MEM_GB = 2
+MIN_AVAIL_MEM_GB_CONSOLIDATION_MODE = 4
+# Default encoder/decoder handler name.
+DEFAULT_HANDLER_NAME = 'default'
+# The path to the API request database. Anchored at SKY_RUNTIME_DIR when set,
+# so that multiple API servers on one machine keep separate request state.
+API_SERVER_REQUEST_DB_PATH = runtime_utils.runtime_tilde_path(
+    '~/.sky/api_server/requests.db')
+
+# The interval (seconds) for the cluster status to be refreshed in the
+# background.
+CLUSTER_REFRESH_DAEMON_INTERVAL_SECONDS = 60
+
+# The interval (seconds) for the volume status to be refreshed in the
+# background.
+VOLUME_REFRESH_DAEMON_INTERVAL_SECONDS = 60
+
+# Environment variable for a file path to the API cookie file.
+# Keep in sync with websocket_proxy.py
+API_COOKIE_FILE_ENV_VAR = f'{constants.SKYPILOT_ENV_VAR_PREFIX}API_COOKIE_FILE'
+# Default file if unset.
+# Keep in sync with websocket_proxy.py
+API_COOKIE_FILE_DEFAULT_LOCATION = '~/.sky/cookies.txt'
+
+# The path to the dashboard build output
+DASHBOARD_DIR = os.path.join(os.path.dirname(__file__), '..', 'dashboard',
+                             'out')
+
+# The interval (seconds) for the event to be restarted in the background.
+DAEMON_RESTART_INTERVAL_SECONDS = 20
+
+# Timeout for CLI authentication sessions (polling-based auth flow).
+# Used by both client (polling timeout) and server (session expiration).
+AUTH_SESSION_TIMEOUT_SECONDS = 300  # 5 minutes
+
+# Cookie header for stream request id.
+STREAM_REQUEST_HEADER = 'X-SkyPilot-Stream-Request-ID'
+
+# Valid empty values for pickled fields (base64-encoded pickled None)
+# base64.b64encode(pickle.dumps(None)).decode('utf-8')
+EMPTY_PICKLED_VALUE = 'gAROLg=='
+
+# We do not support setting these in config.yaml because:
+# 1. config.yaml can be updated dynamically, but auth middleware does not
+#    support hot reload yet.
+# 2. If we introduce hot reload for auth middleware, bad config might
+#    invalidate all authenticated sessions and thus cannot be rolled back
+#    by API users.
+# TODO(aylei): we should introduce server.yaml for static server admin config,
+# which is more structured than multiple environment variables and can be less
+# confusing to users.
+OAUTH2_PROXY_BASE_URL_ENV_VAR = 'SKYPILOT_AUTH_OAUTH2_PROXY_BASE_URL'
+OAUTH2_PROXY_ENABLED_ENV_VAR = 'SKYPILOT_AUTH_OAUTH2_PROXY_ENABLED'
+
+# The websockets library (used by uvicorn for WebSocket upgrades) defaults to
+# MAX_LINE_LENGTH=8192 bytes per header line. Enterprise SSO cookies from
+# oauth2proxy (Azure AD, Okta, etc.) commonly exceed 8KB, causing WebSocket
+# upgrade requests to be rejected with HTTP 400. Regular HTTP requests (parsed
+# by h11 with a 16KB default) are unaffected. These constants raise the limit
+# so that WebSocket upgrades succeed with large auth cookies.
+# The env vars are read by websockets at import time.
+WEBSOCKETS_MAX_HEADER_LINE_LENGTH = '65536'
+WEBSOCKETS_MAX_NUM_HEADERS = '256'
+
+# Request ID for the on-boot sky check request.
+ON_BOOT_CHECK_REQUEST_ID = 'skypilot-server-on-boot-check'
+
+# Request logs are stored in ~/.sky/api_server/request_logs/ to avoid NFS
+# performance issues in Kubernetes deployments where ~/sky_logs/ may be on
+# shared storage. Anchored at SKY_RUNTIME_DIR when set, since this dir is
+# wiped on every server startup.
+REQUEST_LOG_PATH_PREFIX = runtime_utils.runtime_tilde_path(
+    '~/.sky/api_server/request_logs')
+
+# Default maximum size of a daemon log file before rotation (bytes).
+# When a daemon log exceeds this threshold, it is backed up to .log.1 and
+# then truncated. One backup is kept per daemon.
+# Configurable via api_server.daemon_log_max_bytes in ~/.sky/config.yaml.
+DEFAULT_DAEMON_LOG_MAX_BYTES = 128 * 1024 * 1024  # 128 MB
+
+# Default retention for per-operation artifacts under ~/sky_logs on the API
+# server. Configurable via api_server.logs_retention_hours; negative disables.
+DEFAULT_LOGS_RETENTION_HOURS = 720  # 30 days
+
+# Interval for the server-side heartbeat daemon that sends fleet-wide GPU
+# counts to Loki, plus plugin metrics when a plugin registered a provider
+# (e.g., GPU inventory from billing plugin).
+SERVER_HEARTBEAT_INTERVAL_SECONDS = 600  # 10 minutes
+
+# The chunk size for the zip file to be uploaded to the API server. We split
+# the zip file into chunks to avoid network issues for large request body that
+# can be caused by NGINX's client_max_body_size or Cloudflare's upload limit.
+# As of 09/25/2025, the upload limit for Cloudflare's free plan is 100MB
+# (not 100MiB; 100MB = 100,000,000 bytes):
+# https://developers.cloudflare.com/support/troubleshooting/http-status-codes/4xx-client-error/error-413/
+# We use 95MB to leave headroom for HTTP headers and request overhead.
+UPLOAD_CHUNK_BYTES = 95 * 1000 * 1000
+
+# Largest total upload the server accepts, as an integer number of bytes.
+# Unset or non-positive means no limit. Checked independently of how much
+# local disk is free: an upload is extracted later, so the space available
+# at extraction time cannot be known while its chunks arrive.
+MAX_UPLOAD_TOTAL_BYTES_ENV_VAR = 'SKYPILOT_MAX_UPLOAD_TOTAL_BYTES'
+
+# Ceiling on the storage the blob backend keeps file mounts on, as an
+# integer number of bytes. Unset or non-positive means no limit. Bounds
+# what the server holds across uploads, where MAX_UPLOAD_TOTAL_BYTES
+# bounds any one of them; an upload already admitted still lands, so set
+# both to bound how far one can carry the store past this.
+MAX_STORED_FILE_MOUNTS_BYTES_ENV_VAR = 'SKYPILOT_MAX_STORED_FILE_MOUNTS_BYTES'
+
+# Interval for the daemon that sweeps expired managed-job API access tokens
+# from the service_account_tokens table. These tokens are normally revoked
+# by the jobs controller on completion, but the daemon ensures any tokens
+# that leak (e.g., due to controller crash mid-cleanup) are eventually
+# removed once their TTL has passed.
+EXPIRED_TOKEN_CLEANUP_DAEMON_INTERVAL_SECONDS = 3600  # 1 hour
+
+# How often finished launch attempts are turned into phase metrics. Short
+# enough that a launch shows up on the dashboard while someone is still
+# watching it, long enough that the sweep is negligible next to provisioning.
+LAUNCH_METRICS_DAEMON_INTERVAL_SECONDS = 60

@@ -1,0 +1,454 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="CloudPulse — Distributed Cloud Infrastructure & Event Processing Platform. Interactive engineering portfolio project.">
+<title>CloudPulse — Distributed Cloud Infrastructure & Event Processing Platform</title>
+<style>
+:root{
+  --bg:#05070d;--panel:rgba(12,17,28,.78);--panel2:rgba(18,25,40,.72);
+  --line:rgba(139,166,204,.18);--text:#edf4ff;--muted:#8e9bb0;
+  --cyan:#62e6ff;--violet:#9c7cff;--green:#5df2a5;--amber:#ffcb6b;--red:#ff6b7a;
+  --shadow:0 25px 90px rgba(0,0,0,.45);--radius:22px;
+}
+*{box-sizing:border-box}html{scroll-behavior:smooth}
+body{margin:0;background:
+radial-gradient(circle at 75% 8%,rgba(98,230,255,.12),transparent 26rem),
+radial-gradient(circle at 15% 30%,rgba(156,124,255,.10),transparent 28rem),
+var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;overflow-x:hidden}
+body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background-image:linear-gradient(rgba(255,255,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.035) 1px,transparent 1px);background-size:70px 70px;mask-image:linear-gradient(to bottom,black,transparent 85%);z-index:-1}
+a{color:inherit;text-decoration:none}.wrap{width:min(1180px,92vw);margin:auto}
+nav{height:76px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:50;background:rgba(5,7,13,.68);backdrop-filter:blur(18px);border-bottom:1px solid var(--line)}
+.logo{display:flex;align-items:center;gap:11px;font-weight:800;letter-spacing:-.04em}.logo-mark{width:31px;height:31px;border:1px solid rgba(98,230,255,.5);border-radius:9px;position:relative;box-shadow:0 0 30px rgba(98,230,255,.18)}
+.logo-mark:before,.logo-mark:after{content:"";position:absolute;border-radius:50%;background:var(--cyan);box-shadow:0 0 14px var(--cyan)}
+.logo-mark:before{width:6px;height:6px;left:7px;top:12px}.logo-mark:after{width:6px;height:6px;right:7px;top:7px}
+.logo-mark{background:linear-gradient(145deg,rgba(98,230,255,.13),rgba(156,124,255,.08))}
+.navlinks{display:flex;gap:24px;color:#aab6c9;font-size:13px}.navlinks a:hover{color:white}
+.btn{border:1px solid var(--line);background:rgba(255,255,255,.045);color:#fff;padding:11px 16px;border-radius:12px;font-weight:700;cursor:pointer;transition:.2s;display:inline-flex;align-items:center;gap:8px}.btn:hover{transform:translateY(-2px);border-color:rgba(98,230,255,.45);box-shadow:0 10px 35px rgba(98,230,255,.09)}.btn.primary{background:linear-gradient(135deg,rgba(98,230,255,.18),rgba(156,124,255,.18));border-color:rgba(98,230,255,.36)}
+.hero{min-height:calc(100vh - 76px);display:grid;grid-template-columns:1.03fr .97fr;gap:35px;align-items:center;padding:75px 0 65px}
+.eyebrow{color:var(--cyan);font-size:12px;text-transform:uppercase;letter-spacing:.18em;font-weight:800;margin-bottom:17px}
+h1{font-size:clamp(44px,6.5vw,84px);line-height:.95;letter-spacing:-.065em;margin:0 0 24px;max-width:850px}
+.gradient{background:linear-gradient(100deg,#fff 15%,#aeefff 52%,#b7a5ff 90%);-webkit-background-clip:text;background-clip:text;color:transparent}
+.lead{font-size:18px;line-height:1.7;color:#a9b5c7;max-width:690px}.hero-actions{display:flex;gap:12px;flex-wrap:wrap;margin:29px 0 30px}
+.metrics{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;max-width:650px}.metric{padding:15px 17px;border:1px solid var(--line);background:rgba(255,255,255,.025);border-radius:16px}.metric b{display:block;font-size:22px}.metric span{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em}
+#scene{height:530px;position:relative;border:1px solid var(--line);border-radius:30px;background:radial-gradient(circle at 50% 45%,rgba(98,230,255,.09),transparent 44%),rgba(6,10,18,.66);overflow:hidden;box-shadow:var(--shadow)}
+#three{position:absolute;inset:0}.scene-label{position:absolute;left:20px;top:18px;font-size:11px;color:#718096;letter-spacing:.15em;text-transform:uppercase}.scene-live{position:absolute;right:20px;top:18px;font-size:10px;color:var(--green);border:1px solid rgba(93,242,165,.28);padding:6px 9px;border-radius:999px;background:rgba(93,242,165,.06)}
+section{padding:105px 0}.section-head{max-width:760px;margin-bottom:42px}.kicker{color:var(--violet);font-weight:800;font-size:11px;letter-spacing:.18em;text-transform:uppercase}.section-head h2{font-size:clamp(31px,4vw,53px);line-height:1.03;letter-spacing:-.05em;margin:11px 0 16px}.section-head p{color:var(--muted);line-height:1.7;font-size:16px}
+.arch{display:grid;grid-template-columns:repeat(4,1fr);gap:13px}.card{border:1px solid var(--line);border-radius:var(--radius);padding:23px;background:linear-gradient(145deg,rgba(255,255,255,.05),rgba(255,255,255,.018));box-shadow:0 15px 50px rgba(0,0,0,.18)}.card:hover{border-color:rgba(98,230,255,.25)}
+.card .icon{width:37px;height:37px;border-radius:11px;display:grid;place-items:center;background:rgba(98,230,255,.08);border:1px solid rgba(98,230,255,.16);color:var(--cyan);font-weight:900;margin-bottom:20px}.card h3{margin:0 0 9px;font-size:17px}.card p{margin:0;color:#8491a6;line-height:1.6;font-size:13px}
+.pipeline{border:1px solid var(--line);border-radius:28px;padding:26px;background:linear-gradient(150deg,rgba(12,18,31,.92),rgba(7,10,17,.9));overflow:hidden}.pipeline-grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}.flow{display:flex;align-items:center;gap:10px;min-width:0}.node{min-width:112px;text-align:center;padding:14px 10px;border:1px solid var(--line);background:rgba(255,255,255,.035);border-radius:15px;font-size:12px;font-weight:750;position:relative}.node small{display:block;color:#68758a;font-weight:500;margin-top:5px}.arrow{color:#56657a;font-size:20px}.flowline{height:2px;background:linear-gradient(90deg,transparent,var(--cyan),transparent);opacity:.35;flex:1;animation:pulseLine 1.6s infinite}.terminal{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.8;background:#03050a;border:1px solid var(--line);border-radius:16px;padding:18px;color:#9eb0c9;min-height:190px}.terminal .ok{color:var(--green)}.terminal .cyan{color:var(--cyan)}.terminal .warn{color:var(--amber)}
+@keyframes pulseLine{0%,100%{opacity:.18}50%{opacity:.7}}
+.demo-shell{border:1px solid rgba(98,230,255,.22);border-radius:30px;background:rgba(6,10,18,.8);box-shadow:0 30px 110px rgba(0,0,0,.5);overflow:hidden}.demo-top{padding:18px 20px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:15px}.window-dots{display:flex;gap:6px}.window-dots i{width:9px;height:9px;border-radius:50%;background:#263143}.demo-title{font-size:13px;font-weight:750}.demo-body{display:grid;grid-template-columns:1.3fr .7fr;min-height:590px}.dashboard{padding:20px;border-right:1px solid var(--line)}.side{padding:20px;background:rgba(255,255,255,.018)}
+.livebar{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:14px}.livepill{font-size:10px;color:var(--green);letter-spacing:.12em;text-transform:uppercase}.eventcount{font-size:13px;color:#98a5b9}
+.chart{height:150px;border:1px solid var(--line);border-radius:17px;background:linear-gradient(180deg,rgba(98,230,255,.04),transparent);position:relative;overflow:hidden;margin-bottom:13px}.chart svg{width:100%;height:100%}.chart-grid{stroke:rgba(155,177,209,.12);stroke-width:1}.chart-line{fill:none;stroke:var(--cyan);stroke-width:2.5;filter:drop-shadow(0 0 7px rgba(98,230,255,.5));stroke-linecap:round}.chart-area{fill:url(#area)}.statgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-bottom:13px}.stat{border:1px solid var(--line);border-radius:14px;padding:13px;background:rgba(255,255,255,.025)}.stat span{display:block;color:#6f7c91;font-size:10px;text-transform:uppercase;letter-spacing:.1em}.stat b{display:block;margin-top:6px;font-size:17px}
+.eventlog{border:1px solid var(--line);border-radius:16px;overflow:hidden}.eventlog-head{display:flex;justify-content:space-between;padding:12px 14px;background:rgba(255,255,255,.025);font-size:11px;color:#8c99ad;text-transform:uppercase;letter-spacing:.1em}.events{height:220px;overflow:hidden}.event{display:grid;grid-template-columns:76px 1fr auto;gap:10px;padding:10px 14px;border-top:1px solid rgba(255,255,255,.045);font-family:ui-monospace,monospace;font-size:10px;color:#8896ab}.event b{color:#d8e2f1;font-weight:500}.tag{padding:3px 6px;border-radius:6px;background:rgba(93,242,165,.08);color:var(--green);height:max-content}.tag.retry{color:var(--amber);background:rgba(255,203,107,.08)}.side h3{font-size:13px;margin:0 0 14px}.cluster{height:210px;border:1px solid var(--line);border-radius:17px;position:relative;overflow:hidden;background:radial-gradient(circle at 50% 55%,rgba(156,124,255,.11),transparent 48%)}.pods{display:flex;justify-content:center;gap:8px;align-items:end;height:100%;padding:30px 15px}.pod{width:38px;height:95px;border:1px solid rgba(98,230,255,.3);border-radius:10px 10px 8px 8px;background:linear-gradient(180deg,rgba(98,230,255,.15),rgba(156,124,255,.05));box-shadow:0 0 20px rgba(98,230,255,.08);position:relative;animation:podFloat 2.4s ease-in-out infinite}.pod:before{content:"";position:absolute;left:7px;right:7px;top:10px;height:3px;background:var(--cyan);box-shadow:0 13px 0 rgba(98,230,255,.3),0 26px 0 rgba(98,230,255,.18)}.pod:nth-child(2){height:120px;animation-delay:.3s}.pod:nth-child(3){height:78px;animation-delay:.6s}.pod:nth-child(4){height:110px;animation-delay:.9s}.pod:nth-child(5){height:90px;animation-delay:1.2s}.pod.off{opacity:.18;filter:grayscale(1)}@keyframes podFloat{50%{transform:translateY(-6px)}}
+.control{margin-top:13px;display:grid;grid-template-columns:1fr 1fr;gap:9px}.control button{font:inherit;padding:11px;border-radius:11px;background:rgba(255,255,255,.035);border:1px solid var(--line);color:#c8d2e0;cursor:pointer}.control button:hover{border-color:rgba(98,230,255,.4);color:white}.control button.active{background:rgba(98,230,255,.1);border-color:rgba(98,230,255,.35);color:var(--cyan)}
+.stack{display:flex;flex-wrap:wrap;gap:7px;margin-top:15px}.chip{font-size:10px;padding:7px 9px;border:1px solid var(--line);border-radius:999px;color:#9aa8bc;background:rgba(255,255,255,.025)}
+.failure{margin-top:13px;border:1px solid rgba(255,107,122,.22);background:rgba(255,107,122,.035);border-radius:15px;padding:13px}.failure b{font-size:11px;color:#ff8d9a}.failure p{font-size:11px;color:#778499;line-height:1.5;margin:7px 0 0}
+.results{display:grid;grid-template-columns:1fr 1fr;gap:15px}.result-card{border:1px solid var(--line);border-radius:20px;padding:22px;background:rgba(255,255,255,.025)}.result-card h3{margin:0 0 8px;font-size:16px}.result-card p{color:#8390a4;line-height:1.65;font-size:13px;margin:0}.result-card strong{color:#eaf2ff}
+.tech{display:flex;flex-wrap:wrap;gap:10px}.tech .chip{font-size:12px;padding:10px 13px}
+.recruiter{border:1px solid rgba(156,124,255,.24);background:linear-gradient(135deg,rgba(156,124,255,.08),rgba(98,230,255,.04));border-radius:26px;padding:30px;display:grid;grid-template-columns:1fr .8fr;gap:30px}.recruiter h2{margin:0 0 12px;font-size:30px;letter-spacing:-.04em}.recruiter p{color:#9ba8ba;line-height:1.7}.proof{display:grid;grid-template-columns:1fr 1fr;gap:10px}.proof div{border:1px solid var(--line);padding:14px;border-radius:14px;background:rgba(0,0,0,.16)}.proof b{display:block;font-size:20px}.proof span{color:#758196;font-size:11px}
+footer{padding:55px 0 80px;color:#68758a;font-size:12px;border-top:1px solid var(--line)}
+.modal{position:fixed;inset:0;z-index:100;display:none;place-items:center;background:rgba(0,0,0,.75);backdrop-filter:blur(13px);padding:20px}.modal.open{display:grid}.modal-card{width:min(1100px,96vw);height:min(760px,92vh);background:#070b13;border:1px solid rgba(98,230,255,.25);border-radius:24px;box-shadow:0 50px 150px #000;overflow:hidden;display:flex;flex-direction:column}.modal-head{padding:15px 18px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}.close{cursor:pointer;border:1px solid var(--line);background:rgba(255,255,255,.04);color:#fff;border-radius:9px;padding:7px 10px}.modal-content{padding:18px;overflow:auto;display:grid;grid-template-columns:1fr 310px;gap:15px}.sim{min-height:550px;border:1px solid var(--line);border-radius:18px;position:relative;overflow:hidden;background:radial-gradient(circle at 50% 50%,rgba(98,230,255,.08),transparent 50%),#04070c}.sim canvas{position:absolute;inset:0;width:100%;height:100%}.sim-overlay{position:absolute;inset:0;padding:18px;pointer-events:none}.sim-title{font-weight:800}.sim-caption{color:#7f8da1;font-size:11px;margin-top:4px}.sim-status{position:absolute;left:18px;bottom:18px;right:18px;border:1px solid var(--line);background:rgba(4,7,12,.72);backdrop-filter:blur(12px);border-radius:14px;padding:12px;font-family:ui-monospace,monospace;font-size:10px;color:#9aabc1}.sim-controls{border:1px solid var(--line);border-radius:18px;padding:16px;background:rgba(255,255,255,.025)}.sim-controls h3{font-size:13px;margin:0 0 12px}.sim-controls button{width:100%;margin-bottom:8px;text-align:left}.step{font-size:11px;color:#758298;line-height:1.5;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.05)}.step.done{color:var(--green)}.step.current{color:var(--cyan)}
+.reveal{opacity:0;transform:translateY(18px);transition:.7s}.reveal.visible{opacity:1;transform:none}
+@media(max-width:900px){.hero,.demo-body,.recruiter,.modal-content{grid-template-columns:1fr}.hero{padding-top:45px}.arch{grid-template-columns:1fr 1fr}.pipeline-grid,.results{grid-template-columns:1fr}.dashboard{border-right:0}.side{border-top:1px solid var(--line)}.navlinks{display:none}.metrics{grid-template-columns:1fr}.statgrid{grid-template-columns:1fr 1fr}#scene{height:390px}}
+@media(max-width:560px){.arch{grid-template-columns:1fr}.hero h1{font-size:48px}.hero{min-height:auto}.modal-card{height:96vh}.sim{min-height:450px}.proof{grid-template-columns:1fr}.statgrid{grid-template-columns:1fr 1fr}}
+
+/* ===== CLOUDPULSE ULTRA EXPERIENCE ===== */
+:root{
+  --electric:#62e6ff;--purple:#9c7cff;--mint:#5df2a5;--hot:#ff7190;
+  --glass:rgba(8,13,24,.62);--glass2:rgba(13,20,35,.74);
+}
+body{background:
+ radial-gradient(ellipse at 50% -15%,rgba(98,230,255,.17),transparent 35rem),
+ radial-gradient(ellipse at 90% 32%,rgba(156,124,255,.13),transparent 31rem),
+ radial-gradient(ellipse at 5% 65%,rgba(93,242,165,.07),transparent 27rem),#03050a}
+body:after{content:"";position:fixed;inset:0;pointer-events:none;z-index:60;opacity:.035;
+background-image:url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.5'/%3E%3C/svg%3E")}
+.ambient-canvas{position:fixed;inset:0;z-index:-2;pointer-events:none;opacity:.7}
+.hero{position:relative}
+.hero:before{content:"";position:absolute;inset:-18% -12%;background:radial-gradient(circle at 68% 45%,rgba(98,230,255,.11),transparent 23%),radial-gradient(circle at 80% 60%,rgba(156,124,255,.11),transparent 25%);filter:blur(25px);z-index:-1}
+.hero-kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:12px}
+.hero-kpi{border:1px solid rgba(255,255,255,.09);border-radius:14px;padding:10px 12px;background:rgba(255,255,255,.025);backdrop-filter:blur(14px)}
+.hero-kpi span{display:block;color:#6f7c91;font-size:9px;letter-spacing:.12em;text-transform:uppercase}
+.hero-kpi b{font-size:13px;display:block;margin-top:4px}
+.scanline{position:absolute;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,var(--electric),transparent);box-shadow:0 0 18px var(--electric);opacity:.3;animation:scan 5s linear infinite;pointer-events:none}
+@keyframes scan{0%{top:10%}100%{top:92%}}
+.orbit-ui{position:absolute;inset:0;pointer-events:none}
+.orbit-ui .ring{position:absolute;border:1px solid rgba(98,230,255,.09);border-radius:50%;left:50%;top:50%;transform:translate(-50%,-50%);animation:spin 22s linear infinite}
+.orbit-ui .r1{width:280px;height:280px}.orbit-ui .r2{width:420px;height:420px;animation-direction:reverse;animation-duration:30s}.orbit-ui .r3{width:560px;height:560px;animation-duration:42s}
+@keyframes spin{to{transform:translate(-50%,-50%) rotate(360deg)}}
+.holo-badge{position:absolute;padding:8px 10px;border:1px solid rgba(98,230,255,.2);border-radius:9px;background:rgba(3,8,15,.62);backdrop-filter:blur(12px);font:10px ui-monospace,monospace;color:#8da5bc;box-shadow:0 0 30px rgba(98,230,255,.06);animation:floaty 4s ease-in-out infinite}
+.holo-badge b{color:var(--electric)}.holo-a{left:5%;top:28%}.holo-b{right:4%;top:38%;animation-delay:1s}.holo-c{left:10%;bottom:12%;animation-delay:2s}
+@keyframes floaty{50%{transform:translateY(-8px)}}
+.marquee{border-top:1px solid var(--line);border-bottom:1px solid var(--line);overflow:hidden;background:rgba(255,255,255,.015);white-space:nowrap}
+.marquee-track{display:inline-flex;gap:45px;padding:13px 0;animation:marquee 28s linear infinite;color:#64738a;font:10px ui-monospace,monospace;letter-spacing:.12em;text-transform:uppercase}
+.marquee-track b{color:#9eafc6}@keyframes marquee{to{transform:translateX(-50%)}}
+.ultra-grid{display:grid;grid-template-columns:1.4fr .6fr;gap:15px}
+.glass-panel{border:1px solid rgba(145,170,205,.14);border-radius:24px;background:linear-gradient(145deg,rgba(18,27,44,.66),rgba(5,9,17,.72));backdrop-filter:blur(20px);box-shadow:0 35px 100px rgba(0,0,0,.25);overflow:hidden}
+.panel-head{padding:16px 18px;border-bottom:1px solid rgba(145,170,205,.1);display:flex;justify-content:space-between;align-items:center}
+.panel-head span{font:10px ui-monospace,monospace;color:#6f7f96;letter-spacing:.12em;text-transform:uppercase}.panel-head b{font-size:12px}
+.command-map{height:410px;position:relative;overflow:hidden;background:
+ radial-gradient(circle at 50% 50%,rgba(98,230,255,.08),transparent 32%),
+ linear-gradient(rgba(98,230,255,.035) 1px,transparent 1px),
+ linear-gradient(90deg,rgba(98,230,255,.035) 1px,transparent 1px);background-size:auto,42px 42px,42px 42px}
+.map-node{position:absolute;transform:translate(-50%,-50%);width:96px;height:96px;border-radius:50%;display:grid;place-items:center;text-align:center;border:1px solid rgba(98,230,255,.28);background:radial-gradient(circle,rgba(98,230,255,.14),rgba(3,8,15,.8) 65%);box-shadow:0 0 45px rgba(98,230,255,.08);font-size:10px;z-index:2}
+.map-node:after{content:"";position:absolute;inset:-9px;border:1px dashed rgba(98,230,255,.13);border-radius:50%;animation:spin 12s linear infinite}
+.map-node b{display:block;color:#dce9f7}.map-node small{color:#65768e}.map-node.n1{left:13%;top:48%}.map-node.n2{left:37%;top:26%}.map-node.n3{left:60%;top:52%}.map-node.n4{left:84%;top:32%}.map-node.n5{left:80%;top:76%}.map-node.n6{left:45%;top:82%}
+.map-svg{position:absolute;inset:0;width:100%;height:100%;z-index:1}.map-path{fill:none;stroke:rgba(98,230,255,.22);stroke-width:1;stroke-dasharray:5 8;animation:dash 4s linear infinite}.map-packet{fill:#62e6ff;filter:drop-shadow(0 0 6px #62e6ff)}@keyframes dash{to{stroke-dashoffset:-80}}
+.telemetry{padding:15px}.telemetry-row{display:flex;justify-content:space-between;align-items:end;padding:12px 0;border-bottom:1px solid rgba(255,255,255,.05)}.telemetry-row:last-child{border:0}.telemetry-row span{color:#6e7d94;font-size:10px;text-transform:uppercase;letter-spacing:.1em}.telemetry-row b{font-size:19px}.meter{height:4px;border-radius:99px;background:#101928;margin-top:7px;overflow:hidden}.meter i{display:block;height:100%;width:var(--w);background:linear-gradient(90deg,var(--electric),var(--purple));box-shadow:0 0 12px rgba(98,230,255,.5);animation:meterPulse 2.2s ease-in-out infinite}@keyframes meterPulse{50%{filter:brightness(1.45)}}
+.story{display:grid;grid-template-columns:100px 1fr;gap:25px;position:relative}.story:before{content:"";position:absolute;left:49px;top:0;bottom:0;width:1px;background:linear-gradient(var(--electric),rgba(156,124,255,.1),transparent)}.story-step{position:relative;min-height:170px}.story-num{width:48px;height:48px;border-radius:50%;display:grid;place-items:center;border:1px solid rgba(98,230,255,.28);background:#070d17;color:var(--electric);box-shadow:0 0 30px rgba(98,230,255,.1);position:relative;z-index:2;font:11px ui-monospace,monospace}.story-content{border:1px solid var(--line);border-radius:20px;padding:22px;background:rgba(255,255,255,.025)}.story-content h3{margin:0 0 8px}.story-content p{margin:0;color:#8290a6;line-height:1.7;font-size:13px}.story-content code{display:block;margin-top:13px;padding:10px;border-radius:10px;background:#03060b;color:#8297b0;font:10px ui-monospace,monospace;overflow:auto}
+.slo-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.slo{padding:20px;border:1px solid var(--line);border-radius:19px;background:linear-gradient(145deg,rgba(255,255,255,.04),rgba(255,255,255,.015));position:relative;overflow:hidden}.slo:after{content:"";position:absolute;inset:auto -20% -70% -20%;height:120px;background:radial-gradient(circle,rgba(98,230,255,.12),transparent 65%)}.slo b{font-size:29px;letter-spacing:-.05em}.slo span{display:block;color:#718097;font-size:10px;text-transform:uppercase;letter-spacing:.12em;margin-top:6px}.slo p{color:#7d8ba1;font-size:12px;line-height:1.55}
+.interview{display:grid;grid-template-columns:.8fr 1.2fr;gap:15px}.question{padding:25px}.question .q{font-size:22px;line-height:1.25;letter-spacing:-.03em;margin:12px 0}.answer{padding:25px;border-left:1px solid var(--line)}.answer-row{padding:13px 0;border-bottom:1px solid rgba(255,255,255,.06);font-size:12px;color:#8795a9;line-height:1.6}.answer-row b{color:#dce7f4}
+.footer-grid{display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:30px}.footer-grid h4{color:#dce6f2;margin:0 0 12px}.footer-grid p,.footer-grid li{color:#66758c;font-size:11px;line-height:1.7}.footer-grid ul{list-style:none;padding:0;margin:0}
+.recruiter-glow{position:relative;overflow:hidden}.recruiter-glow:before{content:"";position:absolute;width:300px;height:300px;border-radius:50%;right:-90px;top:-150px;background:rgba(156,124,255,.16);filter:blur(40px)}
+@media(max-width:900px){.hero-kpis{grid-template-columns:1fr 1fr}.ultra-grid,.interview{grid-template-columns:1fr}.story{grid-template-columns:65px 1fr}.story:before{left:24px}.slo-grid{grid-template-columns:1fr}.footer-grid{grid-template-columns:1fr}.command-map{height:360px}}
+@media(max-width:560px){.hero-kpis{grid-template-columns:1fr}.holo-badge{display:none}.story{grid-template-columns:1fr}.story:before{display:none}}
+
+</style>
+</head>
+<body><canvas id="ambientCanvas" class="ambient-canvas"></canvas>
+<nav>
+  <div class="wrap" style="display:flex;width:92vw;align-items:center;justify-content:space-between">
+    <a class="logo" href="#"><span class="logo-mark"></span>CloudPulse</a>
+    <div class="navlinks"><a href="#architecture">Architecture</a><a href="#demo">Live Demo</a><a href="#engineering">Engineering</a><a href="#stack">Stack</a></div>
+    <button class="btn primary" onclick="openDemo()">▶ Run live demo</button>
+  </div>
+</nav>
+
+<main>
+<section class="hero wrap">
+  <div>
+    <div class="eyebrow">Distributed systems · Cloud infrastructure · Event processing</div>
+    <h1><span class="gradient">CloudPulse</span><br>turns cloud events into resilient workflows.</h1>
+    <p class="lead">A production-minded distributed backend built around four services, asynchronous event processing, PostgreSQL, Redis, AWS SQS and Kubernetes. This portfolio experience makes the system understandable to both engineers and non-technical recruiters.</p>
+    <div class="hero-actions"><button class="btn primary" onclick="openDemo()">▶ Open interactive system</button><a class="btn" href="#architecture">Explore architecture ↓</a></div>
+    <div class="metrics">
+      <div class="metric"><b>10K+</b><span>events / day</span></div>
+      <div class="metric"><b>&lt;200 ms</b><span>API latency target</span></div>
+      <div class="metric"><b>2 → 8</b><span>Kubernetes pods</span></div>
+    </div><div class="hero-kpis">
+      <div class="hero-kpi"><span>Architecture</span><b>4-service backend</b></div>
+      <div class="hero-kpi"><span>Reliability</span><b>Retries + idempotency</b></div>
+      <div class="hero-kpi"><span>Deployment</span><b>AWS + Kubernetes</b></div>
+      <div class="hero-kpi"><span>Validation</span><b>3 chaos scenarios</b></div>
+    </div>
+  </div>
+  <div id="scene">
+    <div class="scene-label">CloudPulse / system topology</div><div class="scene-live">● SIMULATION LIVE</div><div id="three"></div>
+    <div class="orbit-ui"><div class="ring r1"></div><div class="ring r2"></div><div class="ring r3"></div>
+      <div class="holo-badge holo-a"><b>API</b> 137ms p95</div>
+      <div class="holo-badge holo-b"><b>SQS</b> queue healthy</div>
+      <div class="holo-badge holo-c"><b>K8S</b> 4/8 pods</div>
+    </div>
+  </div>
+</section>
+
+<section id="architecture" class="wrap reveal">
+  <div class="section-head"><div class="kicker">01 · Architecture</div><h2>Four services. One observable event pipeline.</h2><p>The visual model below is intentionally simple: an HTTP request enters the platform, state is persisted, an event is queued, a worker processes it, and telemetry tells operators what happened.</p></div>
+  <div class="arch">
+    <article class="card"><div class="icon">01</div><h3>API Gateway</h3><p>Receives REST traffic, validates requests, exposes health endpoints and hands work into the asynchronous workflow.</p></article>
+    <article class="card"><div class="icon">02</div><h3>Event Service</h3><p>Coordinates event creation and delivery with retry-aware processing and idempotency protections.</p></article>
+    <article class="card"><div class="icon">03</div><h3>Worker Service</h3><p>Consumes queued work concurrently, executes business processing and safely retries transient failures.</p></article>
+    <article class="card"><div class="icon">04</div><h3>Data + Cache</h3><p>PostgreSQL provides durable state while Redis supports low-latency data access and coordination.</p></article>
+  </div>
+</section>
+
+<section class="wrap reveal">
+  <div class="section-head"><div class="kicker">02 · Request lifecycle</div><h2>What happens when a user clicks “send”?</h2><p>No distributed-systems knowledge required. Follow the signal from request to durable state, queue, worker and observability.</p></div>
+  <div class="pipeline">
+    <div class="pipeline-grid">
+      <div>
+        <div class="flow"><div class="node">Client<small>REST request</small></div><div class="arrow">→</div><div class="node">API<small>validate</small></div><div class="arrow">→</div><div class="node">PostgreSQL<small>persist</small></div></div>
+        <div style="height:22px;border-left:1px dashed rgba(98,230,255,.3);margin-left:56px"></div>
+        <div class="flow"><div class="node">SQS<small>buffer</small></div><div class="arrow">→</div><div class="node">Worker<small>process</small></div><div class="arrow">→</div><div class="node">Redis<small>fast state</small></div></div>
+      </div>
+      <div class="terminal" id="terminal">
+        <div class="cyan">$ cloudpulse simulate --event payment.created</div>
+        <div>gateway  request accepted</div>
+        <div>postgres event persisted</div>
+        <div class="ok">sqs      message queued ✓</div>
+        <div>worker   processing message...</div>
+        <div class="ok">worker   completed idempotently ✓</div>
+        <div class="warn">metrics  latency=137ms</div>
+        <div class="ok">health   all services healthy ✓</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="demo" class="wrap reveal">
+  <div class="section-head"><div class="kicker">03 · Live demo</div><h2>See the system behave, not just read about it.</h2><p>Launch the embedded simulation to watch events move through the platform, see throughput change, trigger a worker failure, and observe the recovery workflow.</p></div>
+  <div class="demo-shell">
+    <div class="demo-top"><div style="display:flex;gap:12px;align-items:center"><span class="window-dots"><i></i><i></i><i></i></span><span class="demo-title">CloudPulse Control Plane / demo environment</span></div><span class="livepill">● LIVE SIMULATION</span></div>
+    <div class="demo-body">
+      <div class="dashboard">
+        <div class="livebar"><span class="eventcount">Event stream <b id="eventCount">1,284</b> processed</span><span class="livepill">HEALTHY</span></div>
+        <div class="chart"><svg viewBox="0 0 800 150" preserveAspectRatio="none"><defs><linearGradient id="area" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#62e6ff" stop-opacity=".24"/><stop offset="1" stop-color="#62e6ff" stop-opacity="0"/></linearGradient></defs><g class="chart-grid"><path d="M0 30H800M0 75H800M0 120H800"/></g><path id="areaPath" class="chart-area" d=""></path><path id="chartPath" class="chart-line" d=""></path></svg></div>
+        <div class="statgrid">
+          <div class="stat"><span>p95 latency</span><b id="latency">137 ms</b></div>
+          <div class="stat"><span>throughput</span><b id="throughput">118 /s</b></div>
+          <div class="stat"><span>retries</span><b id="retries">3</b></div>
+          <div class="stat"><span>pods</span><b id="podsText">4 / 8</b></div>
+        </div>
+        <div class="eventlog"><div class="eventlog-head"><span>Recent events</span><span>streaming</span></div><div class="events" id="events"></div></div>
+      </div>
+      <aside class="side">
+        <h3>Cluster state</h3>
+        <div class="cluster"><div class="pods" id="pods"><div class="pod"></div><div class="pod"></div><div class="pod"></div><div class="pod"></div></div></div>
+        <div class="control"><button onclick="burst()">⚡ Traffic burst</button><button onclick="failWorker()">☄ Fail worker</button><button onclick="recover()">↻ Recover</button><button onclick="toggleStream()" id="streamBtn">Ⅱ Pause stream</button></div>
+        <div class="failure"><b>FAULT-TOLERANCE LAB</b><p>Trigger a simulated worker failure. The demo marks the worker unhealthy, increases retry activity, then recovers the workload without losing the event.</p></div>
+        <h3 style="margin-top:18px">Technology</h3>
+        <div class="stack"><span class="chip">Go</span><span class="chip">REST</span><span class="chip">PostgreSQL</span><span class="chip">Redis</span><span class="chip">AWS SQS</span><span class="chip">Docker</span><span class="chip">Kubernetes</span><span class="chip">Helm</span><span class="chip">Prometheus</span><span class="chip">Grafana</span><span class="chip">GitHub Actions</span></div>
+      </aside>
+    </div>
+  </div>
+</section>
+
+<section id="engineering" class="wrap reveal">
+  <div class="section-head"><div class="kicker">04 · Engineering story</div><h2>The recruiter view and the engineer view are both here.</h2><p>Instead of making the visitor decode infrastructure terminology, the page connects every technical decision to an observable system behavior.</p></div>
+  <div class="results">
+    <article class="result-card"><h3>Concurrency</h3><p><strong>What it means:</strong> multiple independent events can be processed at the same time. <strong>Why it matters:</strong> throughput can grow without turning every request into a sequential bottleneck.</p></article>
+    <article class="result-card"><h3>Retries + idempotency</h3><p><strong>What it means:</strong> transient failures can be retried while duplicate delivery does not create duplicate business effects.</p></article>
+    <article class="result-card"><h3>Health checks</h3><p><strong>What it means:</strong> the platform continuously exposes service health so orchestration can distinguish healthy capacity from unhealthy instances.</p></article>
+    <article class="result-card"><h3>Autoscaling</h3><p><strong>What it means:</strong> Kubernetes can move the worker fleet from a small baseline toward more replicas when workload increases.</p></article>
+    <article class="result-card"><h3>Observability</h3><p><strong>What it means:</strong> Prometheus metrics and Grafana dashboards make latency, throughput, failures and recovery visible rather than guessing from logs.</p></article>
+    <article class="result-card"><h3>Chaos testing</h3><p><strong>What it means:</strong> controlled failures were used to validate recovery behavior across three failure scenarios.</p></article>
+  </div>
+</section>
+
+<section id="stack" class="wrap reveal">
+  <div class="section-head"><div class="kicker">05 · Stack</div><h2>Built as a cloud-native systems project.</h2><p>Each technology has a visible job in the architecture rather than appearing as a keyword list.</p></div>
+  <div class="tech">
+    <span class="chip">Go — services & concurrency</span><span class="chip">Python — tooling / automation</span><span class="chip">REST APIs — service boundary</span><span class="chip">PostgreSQL — durable state</span><span class="chip">Redis — low-latency state/cache</span><span class="chip">AWS SQS — async queue</span><span class="chip">AWS API — cloud integration</span><span class="chip">AWS EC2 — compute</span><span class="chip">Docker — containers</span><span class="chip">Kubernetes — orchestration</span><span class="chip">Helm — deployments</span><span class="chip">Prometheus — metrics</span><span class="chip">Grafana — dashboards</span><span class="chip">GitHub Actions — CI/CD</span>
+  </div>
+</section>
+
+<section class="wrap reveal">
+  <div class="recruiter">
+    <div><div class="kicker">Recruiter summary</div><h2>CloudPulse is a distributed backend you can actually watch.</h2><p>Engineered a 4-service distributed backend with Go, REST APIs, PostgreSQL, Redis and asynchronous event processing, implementing concurrency, retries, idempotency, health checks and fault-tolerant workflows to process <strong>10K+ events/day</strong> with <strong>sub-200 ms API latency</strong>.</p><p>Deployed containerized services to <strong>AWS + Kubernetes</strong> with Docker, Helm, SQS and horizontal autoscaling; added Prometheus/Grafana observability and chaos testing, validating recovery from <strong>3 failure scenarios</strong> and scaling from <strong>2 to 8 pods</strong> under load.</p></div>
+    <div class="proof"><div><b>4</b><span>distributed services</span></div><div><b>10K+</b><span>events/day</span></div><div><b>&lt;200ms</b><span>API latency</span></div><div><b>3</b><span>failure scenarios tested</span></div><div><b>2 → 8</b><span>pod scale range</span></div><div><b>AWS + K8s</b><span>deployment model</span></div></div>
+  </div>
+</section>
+</main>
+
+
+<div class="marquee"><div class="marquee-track">
+  <b>CLOUDPULSE</b> DISTRIBUTED INFRASTRUCTURE <span>◆</span> ASYNC EVENT PROCESSING <span>◆</span> FAULT TOLERANCE <span>◆</span> KUBERNETES AUTOSCALING <span>◆</span> OBSERVABILITY <span>◆</span> <b>10K+ EVENTS / DAY</b> <span>◆</span> SUB-200MS API LATENCY <span>◆</span>
+  <b>CLOUDPULSE</b> DISTRIBUTED INFRASTRUCTURE <span>◆</span> ASYNC EVENT PROCESSING <span>◆</span> FAULT TOLERANCE <span>◆</span> KUBERNETES AUTOSCALING <span>◆</span> OBSERVABILITY <span>◆</span>
+</div></div>
+
+<section class="wrap reveal" id="command-center">
+  <div class="section-head">
+    <div class="kicker">06 · Command center</div>
+    <h2>A cinematic view of the infrastructure while it is alive.</h2>
+    <p>This layer is designed for the first 30 seconds of a portfolio visit: a recruiter can see the platform's moving parts before reading a single technical paragraph.</p>
+  </div>
+  <div class="ultra-grid">
+    <div class="glass-panel">
+      <div class="panel-head"><span>Global topology / event plane</span><b style="color:var(--mint)">● NOMINAL</b></div>
+      <div class="command-map">
+        <svg class="map-svg" viewBox="0 0 1000 410" preserveAspectRatio="none">
+          <path class="map-path" d="M130 197 C230 120 260 110 370 107 S530 190 600 213 S720 145 840 131"/>
+          <path class="map-path" d="M370 107 C420 170 450 270 450 335 S590 330 800 312"/>
+          <path class="map-path" d="M600 213 C640 260 710 300 800 312"/>
+          <circle class="map-packet" r="4"><animateMotion dur="2.8s" repeatCount="indefinite" path="M130 197 C230 120 260 110 370 107 S530 190 600 213 S720 145 840 131"/></circle>
+          <circle class="map-packet" r="3"><animateMotion dur="3.5s" begin="1s" repeatCount="indefinite" path="M370 107 C420 170 450 270 450 335 S590 330 800 312"/></circle>
+        </svg>
+        <div class="map-node n1"><div><b>CLIENT</b><small>REST</small></div></div>
+        <div class="map-node n2"><div><b>API</b><small>Go service</small></div></div>
+        <div class="map-node n3"><div><b>POSTGRES</b><small>durable</small></div></div>
+        <div class="map-node n4"><div><b>SQS</b><small>async queue</small></div></div>
+        <div class="map-node n5"><div><b>WORKERS</b><small>2 → 8 pods</small></div></div>
+        <div class="map-node n6"><div><b>REDIS</b><small>fast state</small></div></div>
+        <div class="scanline"></div>
+      </div>
+    </div>
+    <div class="glass-panel">
+      <div class="panel-head"><span>Live telemetry</span><b>STREAM</b></div>
+      <div class="telemetry">
+        <div class="telemetry-row"><div><span>Request health</span><div class="meter"><i style="--w:98%"></i></div></div><b>99.98%</b></div>
+        <div class="telemetry-row"><div><span>API p95</span><div class="meter"><i style="--w:72%"></i></div></div><b>137ms</b></div>
+        <div class="telemetry-row"><div><span>Queue depth</span><div class="meter"><i style="--w:31%"></i></div></div><b>31</b></div>
+        <div class="telemetry-row"><div><span>Worker utilization</span><div class="meter"><i style="--w:64%"></i></div></div><b>64%</b></div>
+        <div class="telemetry-row"><div><span>Pod fleet</span><div class="meter"><i style="--w:50%"></i></div></div><b>4 / 8</b></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="wrap reveal">
+  <div class="section-head">
+    <div class="kicker">07 · The story in motion</div>
+    <h2>From one request to a resilient distributed workflow.</h2>
+    <p>Each step has a human-readable explanation and an engineering reason behind it.</p>
+  </div>
+  <div class="story">
+    <div class="story-step"><div class="story-num">01</div></div>
+    <div class="story-content"><h3>A request arrives</h3><p>A user or another service sends a REST request. The API layer validates it and returns quickly instead of waiting for every downstream task.</p><code>POST /events → 202 Accepted · event_id=evt_42</code></div>
+    <div class="story-step"><div class="story-num">02</div></div>
+    <div class="story-content"><h3>State becomes durable</h3><p>The event is recorded in PostgreSQL so the platform has a durable source of truth even if a process or container disappears.</p><code>postgres → INSERT event(status="queued")</code></div>
+    <div class="story-step"><div class="story-num">03</div></div>
+    <div class="story-content"><h3>The queue absorbs the spike</h3><p>AWS SQS separates incoming traffic from background processing. Sudden bursts can wait safely instead of overwhelming workers.</p><code>sqs.send(message) → queue_depth=31</code></div>
+    <div class="story-step"><div class="story-num">04</div></div>
+    <div class="story-content"><h3>Workers process concurrently</h3><p>Multiple worker instances can process independent events in parallel. Kubernetes gives the workload a scalable execution environment.</p><code>worker-01 · worker-02 · worker-03 · worker-04</code></div>
+    <div class="story-step"><div class="story-num">05</div></div>
+    <div class="story-content"><h3>Failure becomes a recoverable event</h3><p>If a worker fails, retry logic and idempotency protect the workflow from losing work or producing duplicate business effects.</p><code>attempt=2 → retry → idempotency_key=evt_42 → safe</code></div>
+    <div class="story-step"><div class="story-num">06</div></div>
+    <div class="story-content"><h3>Observability closes the loop</h3><p>Prometheus metrics and Grafana dashboards expose latency, throughput, health and recovery behavior so the system can be operated rather than guessed at.</p><code>latency=137ms · throughput=118/s · healthy=true</code></div>
+  </div>
+</section>
+
+<section class="wrap reveal">
+  <div class="section-head">
+    <div class="kicker">08 · Reliability targets</div>
+    <h2>Numbers that explain the engineering.</h2>
+  </div>
+  <div class="slo-grid">
+    <article class="slo"><b>&lt;200ms</b><span>API latency</span><p>Targeted sub-200 ms API response behavior keeps the synchronous user-facing path responsive.</p></article>
+    <article class="slo"><b>10K+</b><span>events / day</span><p>The asynchronous architecture is designed around sustained event processing rather than one-off requests.</p></article>
+    <article class="slo"><b>2 → 8</b><span>pods under load</span><p>Horizontal scaling demonstrates that capacity can expand with workload instead of remaining fixed.</p></article>
+  </div>
+</section>
+
+<section class="wrap reveal">
+  <div class="section-head">
+    <div class="kicker">09 · Interview mode</div>
+    <h2>Designed to survive the “why did you build it this way?” question.</h2>
+  </div>
+  <div class="glass-panel interview">
+    <div class="question">
+      <div class="kicker">Architecture decision</div>
+      <div class="q">“Why not process everything synchronously?”</div>
+      <p style="color:#748298;line-height:1.7;font-size:12px">Because the project demonstrates how a distributed platform handles variable workload and transient failure. A queue creates a boundary between fast request handling and slower background work.</p>
+    </div>
+    <div class="answer">
+      <div class="answer-row"><b>Why SQS?</b> To buffer asynchronous work and decouple producers from consumers.</div>
+      <div class="answer-row"><b>Why idempotency?</b> Retries are useful only when repeated delivery cannot accidentally repeat the business effect.</div>
+      <div class="answer-row"><b>Why Kubernetes?</b> To provide health-aware orchestration and horizontal scaling for containerized services.</div>
+      <div class="answer-row"><b>Why Redis?</b> To keep frequently accessed state/cache operations low-latency without replacing durable PostgreSQL state.</div>
+      <div class="answer-row"><b>Why Prometheus/Grafana?</b> To turn system behavior into measurable signals: latency, throughput, health and failures.</div>
+    </div>
+  </div>
+</section>
+
+<section class="wrap reveal">
+  <div class="recruiter recruiter-glow">
+    <div>
+      <div class="kicker">10 · One-screen recruiter brief</div>
+      <h2>CloudPulse demonstrates systems thinking—not just a list of technologies.</h2>
+      <p>The project combines API design, asynchronous processing, persistence, caching, concurrency, reliability, containerization, orchestration, autoscaling, observability and controlled failure testing into one coherent platform.</p>
+      <button class="btn primary" onclick="openDemo()">▶ Show the system in action</button>
+    </div>
+    <div class="proof">
+      <div><b>Go</b><span>distributed services</span></div><div><b>AWS</b><span>cloud deployment</span></div>
+      <div><b>SQS</b><span>async processing</span></div><div><b>K8s</b><span>orchestration</span></div>
+      <div><b>Helm</b><span>repeatable deployment</span></div><div><b>Grafana</b><span>operational visibility</span></div>
+    </div>
+  </div>
+</section>
+
+<footer><div class="wrap footer-grid">
+  <div><h4>CloudPulse</h4><p>Distributed Cloud Infrastructure & Event Processing Platform. An interactive engineering portfolio experience built to explain distributed systems visually.</p></div>
+  <div><h4>Core engineering</h4><ul><li>4-service architecture</li><li>Async event processing</li><li>Retries + idempotency</li><li>Health-aware orchestration</li></ul></div>
+  <div><h4>Cloud operations</h4><ul><li>AWS + Kubernetes</li><li>Docker + Helm</li><li>Prometheus + Grafana</li><li>Chaos testing + autoscaling</li></ul></div>
+</div><div class="wrap" style="margin-top:35px;padding-top:20px;border-top:1px solid var(--line);font-size:10px;color:#4f5d71">CloudPulse · Interactive portfolio demonstration · Simulation UI unless connected to real service telemetry.</div></footer>
+
+<div class="modal" id="demoModal">
+  <div class="modal-card">
+    <div class="modal-head"><div><b>CloudPulse / Live System Walkthrough</b><div style="color:#718097;font-size:10px;margin-top:3px">Interactive simulation — designed for non-technical viewers and engineering interviews</div></div><button class="close" onclick="closeDemo()">✕</button></div>
+    <div class="modal-content">
+      <div class="sim"><canvas id="simCanvas"></canvas><div class="sim-overlay"><div class="sim-title">Event Processing Control Plane</div><div class="sim-caption">Watch an event travel through the distributed system.</div><div class="sim-status" id="simStatus">READY · Click “Send event” to begin.</div></div></div>
+      <div class="sim-controls"><h3>Walkthrough controls</h3><button class="btn primary" onclick="runSimulation()">▶ Send event</button><button class="btn" onclick="runFailureDemo()">☄ Simulate failure + recovery</button><button class="btn" onclick="runScaleDemo()">↗ Simulate autoscaling</button>
+        <div class="step" id="s1">01 · Client sends REST request</div><div class="step" id="s2">02 · API validates and persists</div><div class="step" id="s3">03 · SQS buffers the event</div><div class="step" id="s4">04 · Worker processes concurrently</div><div class="step" id="s5">05 · Metrics confirm outcome</div>
+        <p style="font-size:10px;color:#68768a;line-height:1.55;margin-top:15px">This portfolio demo is a visual simulation. For a true production demo, replace the simulated counters with your backend API, SQS consumer metrics and Prometheus endpoints.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js">
+/* ===== CINEMATIC AMBIENT NETWORK ===== */
+(function(){
+ const c=document.getElementById('ambientCanvas'),x=c.getContext('2d');
+ let W,H,pts=[];
+ function resize(){W=c.width=innerWidth*devicePixelRatio;H=c.height=innerHeight*devicePixelRatio;x.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);pts=Array.from({length:75},()=>({x:Math.random()*innerWidth,y:Math.random()*innerHeight,vx:(Math.random()-.5)*.18,vy:(Math.random()-.5)*.18,r:Math.random()*1.5+.3}))}
+ function draw(){
+   x.clearRect(0,0,innerWidth,innerHeight);
+   for(const p of pts){p.x+=p.vx;p.y+=p.vy;if(p.x<0||p.x>innerWidth)p.vx*=-1;if(p.y<0||p.y>innerHeight)p.vy*=-1;
+     x.beginPath();x.arc(p.x,p.y,p.r,0,Math.PI*2);x.fillStyle='rgba(98,230,255,.38)';x.fill();}
+   for(let i=0;i<pts.length;i++)for(let j=i+1;j<pts.length;j++){let a=pts[i],b=pts[j],dx=a.x-b.x,dy=a.y-b.y,d=Math.hypot(dx,dy);if(d<125){x.beginPath();x.moveTo(a.x,a.y);x.lineTo(b.x,b.y);x.strokeStyle='rgba(98,230,255,'+(0.07*(1-d/125))+')';x.stroke()}}
+   requestAnimationFrame(draw)
+ }
+ addEventListener('resize',resize);resize();draw();
+})();
+
+/* Subtle mouse parallax for hero topology */
+(function(){
+ const hero=document.querySelector('.hero'),scene=document.getElementById('three');
+ if(!hero||!scene)return;
+ hero.addEventListener('mousemove',e=>{
+   const r=hero.getBoundingClientRect(),px=(e.clientX-r.left)/r.width-.5,py=(e.clientY-r.top)/r.height-.5;
+   scene.style.transform='perspective(1000px) rotateY('+(px*2.2)+'deg) rotateX('+(-py*1.5)+'deg)';
+ });
+ hero.addEventListener('mouseleave',()=>scene.style.transform='');
+})();
+
+</script>
+<script>
+/* ---------------- 3D HERO ---------------- */
+const host=document.getElementById('three');
+const renderer=new THREE.WebGLRenderer({alpha:true,antialias:true}); renderer.setPixelRatio(Math.min(devicePixelRatio,2)); renderer.setSize(host.clientWidth,host.clientHeight); host.appendChild(renderer.domElement);
+const scene=new THREE.Scene(), camera=new THREE.PerspectiveCamera(42,host.clientWidth/host.clientHeight,.1,100); camera.position.set(0,3.2,10);
+scene.add(new THREE.AmbientLight(0x557799,.7)); const key=new THREE.PointLight(0x62e6ff,9,30); key.position.set(3,4,5); scene.add(key);
+const violet=new THREE.PointLight(0x9c7cff,8,25); violet.position.set(-4,-2,3); scene.add(violet);
+const group=new THREE.Group(); scene.add(group);
+const mats={cyan:new THREE.MeshStandardMaterial({color:0x62e6ff,emissive:0x124b59,metalness:.55,roughness:.28}),violet:new THREE.MeshStandardMaterial({color:0x9c7cff,emissive:0x28194e,metalness:.5,roughness:.3}),dark:new THREE.MeshStandardMaterial({color:0x10192b,metalness:.8,roughness:.32})};
+function box(x,y,z,sx,sy,sz,mat){let m=new THREE.Mesh(new THREE.BoxGeometry(sx,sy,sz),mat);m.position.set(x,y,z);m.castShadow=true;group.add(m);return m}
+const nodes=[[-3,1,0,mats.cyan],[-1,2.2,0,mats.violet],[1,1.2,0,mats.cyan],[3,2,0,mats.violet],[0,-.7,0,mats.dark]];
+nodes.forEach((n,i)=>{let m=box(n[0],n[1],n[2],1.25,1.05,1.25,n[3]);m.userData.baseY=n[1];m.userData.phase=i*.8});
+const lines=[];
+function line(a,b){let geo=new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(...a),new THREE.Vector3(...b)]);let l=new THREE.Line(geo,new THREE.LineBasicMaterial({color:0x62e6ff,transparent:true,opacity:.35}));group.add(l);lines.push(l)}
+line([-3,1,0],[-1,2.2,0]);line([-1,2.2,0],[1,1.2,0]);line([1,1.2,0],[3,2,0]);line([1,1.2,0],[0,-.7,0]);line([-1,2.2,0],[0,-.7,0]);
+const packets=[]; const sphereGeo=new THREE.SphereGeometry(.07,10,10);
+function packet(a,b){let p=new THREE.Mesh(sphereGeo,mats.cyan);p.userData={a:new THREE.Vector3(...a),b:new THREE.Vector3(...b),t:0};group.add(p);packets.push(p)}
+setInterval(()=>{packet([-3,1,0],[-1,2.2,0]);packet([-1,2.2,0],[1,1.2,0]);packet([1,1.2,0],[3,2,0]);},900);
+let clock=new THREE.Clock();
+function animate(){requestAnimationFrame(animate);let t=clock.getElapsedTime();group.rotation.y=Math.sin(t*.22)*.14;group.rotation.x=Math.sin(t*.17)*.025;group.children.forEach(o=>{if(o.userData.baseY!==undefined)o.position.y=o.userData.baseY+Math.sin(t*1.1+o.userData.phase)*.08});for(let i=packets.length-1;i>=0;i--){let p=packets[i];p.userData.t+=.018;if(p.userData.t>=1){group.remove(p);packets.splice(i,1)}else p.position.lerpVectors(p.userData.a,p.userData.b,p.userData.t)}renderer.render(scene,camera)}
+animate(); window.addEventListener('resize',()=>{renderer.setSize(host.clientWidth,host.clientHeight);camera.aspect=host.clientWidth/host.clientHeight;camera.updateProjectionMatrix()});
+
+/* ---------------- LIVE DASHBOARD ---------------- */
+let streaming=true, count=1284, throughput=118, latency=137, retry=3, podCount=4, failing=false;
+const eventsEl=document.getElementById('events');
+function addEvent(type='event',tag='OK'){let now=new Date().toLocaleTimeString([], {hour12:false});let names=['order.created','payment.created','user.updated','invoice.generated','job.completed','notification.sent'];let name=names[Math.floor(Math.random()*names.length)];let d=document.createElement('div');d.className='event';d.innerHTML='<span>'+now+'</span><b>'+name+' · id_'+Math.floor(Math.random()*9000+1000)+'</b><span class="tag '+(tag==='RETRY'?'retry':'')+'">'+tag+'</span>';eventsEl.prepend(d);while(eventsEl.children.length>10)eventsEl.lastChild.remove()}
+for(let i=0;i<8;i++)addEvent('event',i===2?'RETRY':'OK');
+let series=Array.from({length:36},()=>80+Math.random()*55);
+function updateChart(){series.push(throughput);series.shift();let pts=series.map((v,i)=>[i*800/(series.length-1),140-(v-50)*.9]);let d=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+' '+Math.max(5,Math.min(145,p[1])).toFixed(1)).join(' ');document.getElementById('chartPath').setAttribute('d',d);document.getElementById('areaPath').setAttribute('d',d+' L800 150 L0 150 Z')}
+function sync(){document.getElementById('eventCount').textContent=count.toLocaleString();document.getElementById('latency').textContent=Math.round(latency)+' ms';document.getElementById('throughput').textContent=Math.round(throughput)+' /s';document.getElementById('retries').textContent=retry;document.getElementById('podsText').textContent=podCount+' / 8';updateChart()}
+function setPods(n){podCount=n;const wrap=document.getElementById('pods');wrap.innerHTML='';for(let i=0;i<8;i++){let p=document.createElement('div');p.className='pod'+(i<n?'':' off');wrap.appendChild(p)}}
+setPods(4); sync();
+setInterval(()=>{if(!streaming)return;let bursty=Math.random()<.08;let add=bursty?18:Math.floor(3+Math.random()*9);count+=add;throughput=bursty?Math.min(210,throughput+55):Math.max(80,Math.min(155,throughput+(Math.random()-.5)*18));latency=Math.max(92,Math.min(188,145+(Math.random()-.5)*35+(bursty?20:0)));if(failing){retry+=Math.random()<.4?1:0;latency+=18}else if(retry>2&&Math.random()<.15)retry--;if(Math.random()<.55)addEvent('event',Math.random()<.07?'RETRY':'OK');if(throughput>165&&podCount<8)setPods(podCount+1);if(throughput<115&&podCount>2)setPods(podCount-1);sync()},850);
+function burst(){throughput=Math.min(220,throughput+75);latency+=28;for(let i=0;i<4;i++)addEvent('event','OK');sync()}
+function failWorker(){failing=true;retry+=4;latency=214;addEvent('event','RETRY');addEvent('event','RETRY');document.querySelector('.livepill').textContent='● DEGRADED';}
+function recover(){failing=false;retry=Math.max(1,retry-4);latency=132;document.querySelector('.livepill').textContent='● HEALTHY';addEvent('event','OK');}
+function toggleStream(){streaming=!streaming;document.getElementById('streamBtn').textContent=streaming?'Ⅱ Pause stream':'▶ Resume stream'}
+
+/* ---------------- MODAL 3D SIM ---------------- */
+const modal=document.getElementById('demoModal');let simScene,simCamera,simRenderer,simGroup,simPackets=[],simReady=false;
+function initSim(){if(simReady)return;simReady=true;let c=document.getElementById('simCanvas');simRenderer=new THREE.WebGLRenderer({canvas:c,alpha:true,antialias:true});simRenderer.setPixelRatio(Math.min(devicePixelRatio,2));simRenderer.setSize(c.clientWidth,c.clientHeight,false);simScene=new THREE.Scene();simCamera=new THREE.PerspectiveCamera(45,c.clientWidth/c.clientHeight,.1,100);simCamera.position.set(0,2,11);simScene.add(new THREE.AmbientLight(0x6688aa,.8));let l=new THREE.PointLight(0x62e6ff,12,30);l.position.set(0,4,5);simScene.add(l);simGroup=new THREE.Group();simScene.add(simGroup);
+let pts=[[-4,0,0],[-2,2,0],[0,0,0],[2,2,0],[4,0,0],[0,-2,0]];pts.forEach((p,i)=>{let m=new THREE.Mesh(new THREE.IcosahedronGeometry(.75,1),new THREE.MeshStandardMaterial({color:i%2?0x9c7cff:0x62e6ff,emissive:i%2?0x211449:0x0b3c49,metalness:.55,roughness:.25}));m.position.set(...p);simGroup.add(m)});let pairs=[[0,1],[1,2],[2,3],[3,4],[2,5],[1,5],[3,5]];pairs.forEach(([a,b])=>{let g=new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(...pts[a]),new THREE.Vector3(...pts[b])]);simGroup.add(new THREE.Line(g,new THREE.LineBasicMaterial({color:0x6aa9d9,transparent:true,opacity:.35})))});function loop(){requestAnimationFrame(loop);simGroup.rotation.y+=.002;simGroup.rotation.x=Math.sin(performance.now()*.0004)*.04;for(let i=simPackets.length-1;i>=0;i--){let p=simPackets[i];p.t+=.014;if(p.t>1){simGroup.remove(p.o);simPackets.splice(i,1)}else p.o.position.lerpVectors(p.a,p.b,p.t)}simRenderer.render(simScene,simCamera)}loop();window.addEventListener('resize',()=>{if(!modal.classList.contains('open'))return;let c=document.getElementById('simCanvas');simRenderer.setSize(c.clientWidth,c.clientHeight,false);simCamera.aspect=c.clientWidth/c.clientHeight;simCamera.updateProjectionMatrix()})}
+function openDemo(){modal.classList.add('open');document.body.style.overflow='hidden';initSim()}
+function closeDemo(){modal.classList.remove('open');document.body.style.overflow=''}
+function simPacket(a,b){let o=new THREE.Mesh(new THREE.SphereGeometry(.11,12,12),new THREE.MeshBasicMaterial({color:0x62e6ff}));simGroup.add(o);simPackets.push({o,a:new THREE.Vector3(...a),b:new THREE.Vector3(...b),t:0})}
+function steps(n){for(let i=1;i<=5;i++)document.getElementById('s'+i).className='step'+(i<n?' done':i===n?' current':'')}
+function status(t){document.getElementById('simStatus').textContent=t}
+async function runSimulation(){steps(1);status('01 · Client → API · accepting REST request');simPacket([-4,0,0],[-2,2,0]);await wait(650);steps(2);status('02 · API → PostgreSQL · request persisted');simPacket([-2,2,0],[0,0,0]);await wait(650);steps(3);status('03 · Event → SQS · buffered for asynchronous processing');simPacket([0,0,0],[2,2,0]);await wait(650);steps(4);status('04 · SQS → Worker · concurrent processing');simPacket([2,2,0],[4,0,0]);await wait(650);steps(5);status('05 · Prometheus/Grafana · outcome confirmed · 137 ms');}
+async function runFailureDemo(){steps(3);status('FAULT INJECTED · worker unavailable · queue retains event');await wait(900);status('RETRY · message remains safe because processing is idempotent');await wait(900);steps(4);status('RECOVERY · healthy worker consumes queued message');simPacket([2,2,0],[4,0,0]);await wait(900);steps(5);status('RECOVERED · event completed · no duplicate business effect');}
+async function runScaleDemo(){status('LOAD SPIKE · throughput rises above current worker capacity');await wait(800);status('HPA SIGNAL · Kubernetes requests additional replicas');await wait(900);status('SCALE OUT · 2 → 4 → 6 → 8 worker pods');await wait(900);status('STABLE · queue drains while latency returns toward target');steps(5)}
+const wait=ms=>new Promise(r=>setTimeout(r,ms));
+document.addEventListener('keydown',e=>{if(e.key==='Escape')closeDemo()});
+document.querySelectorAll('.reveal').forEach(el=>{new IntersectionObserver(es=>es.forEach(x=>{if(x.isIntersecting)x.target.classList.add('visible')}),{threshold:.12}).observe(el)});
+</script>
+</body>
+</html>

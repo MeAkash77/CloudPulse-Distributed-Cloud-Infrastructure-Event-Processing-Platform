@@ -1,0 +1,18 @@
+# A minimal example.
+#
+# Runs a task that simply prints a message.
+#
+# Usage:
+#   sky launch -c min minimal.yaml
+#   sky down min
+
+name: minimal
+
+resources:
+  infra: aws
+
+setup: |
+  echo "running setup"
+
+run: |
+  echo "hello, SkyPilot!"

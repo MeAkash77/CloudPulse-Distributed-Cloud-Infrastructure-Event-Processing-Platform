@@ -1,0 +1,690 @@
+"""Utilities for streaming logs from response."""
+
+import asyncio
+import collections
+import pathlib
+from typing import Any, AsyncGenerator, Deque, List, Optional
+import zlib
+
+import aiofiles
+import fastapi
+
+from sky import global_user_state
+from sky import sky_logging
+from sky.server.requests import requests as requests_lib
+from sky.utils import common_utils
+from sky.utils import message_utils
+from sky.utils import rich_utils
+from sky.utils import status_lib
+
+logger = sky_logging.init_logger(__name__)
+
+# When streaming log lines, buffer the lines in memory and flush them in chunks
+# to improve log tailing throughput. Buffer size is the max size bytes of each
+# chunk and the timeout threshold for flushing the buffer to ensure
+# responsiveness.
+_BUFFER_SIZE = 8 * 1024  # 8KB
+_BUFFER_TIMEOUT = 0.02  # 20ms
+_HEARTBEAT_INTERVAL = 30
+_READ_CHUNK_SIZE = 256 * 1024  # 256KB chunks for file reading
+
+# If a SHORT request has been stuck in pending for
+# _SHORT_REQUEST_SPINNER_TIMEOUT seconds, we show the waiting spinner
+_SHORT_REQUEST_SPINNER_TIMEOUT = 2
+
+LONG_REQUEST_POLL_INTERVAL = 1
+DEFAULT_POLL_INTERVAL = 0.1
+
+
+async def _yield_log_file_with_payloads_skipped(
+        log_file) -> AsyncGenerator[str, None]:
+    async for line in log_file:
+        if not line:
+            return
+        is_payload, line_str = message_utils.decode_payload(
+            line.decode('utf-8', errors='replace'), raise_for_mismatch=False)
+        if is_payload:
+            continue
+
+        yield line_str
+
+
+def _waiting_status_chunks(msg: str, plain_logs: bool) -> List[str]:
+    """Chunks that show ``msg`` as the stream's current waiting status.
+
+    For a rich client all three frames matter: INIT creates a status only when
+    the client holds none, START is what actually paints it (an INIT alone
+    leaves the Live stopped, so the message is never drawn), and UPDATE applies
+    the text to a status the client may already have had. START is idempotent,
+    so the trio is safe whatever state the client is in -- the same pairing
+    ``wait_for_request_to_start`` uses below.
+    """
+    if plain_logs:
+        # Padding forces browser rendering of the streamed chunk.
+        return [msg + ' ' * 4096 + '\n']
+    status = rich_utils.EncodedStatusMessage(f'[dim]{msg}[/dim]')
+    return [status.init(), status.enter(), status.update(f'[dim]{msg}[/dim]')]
+
+
+async def wait_for_request_to_start(
+    request_id: str,
+    plain_logs: bool = False,
+    follow: bool = True,
+    polling_interval: float = DEFAULT_POLL_INTERVAL,
+) -> AsyncGenerator[str, None]:
+    """Yield waiting-status feedback until a request reaches RUNNING.
+
+    Used as a prelude to log streaming: polls the request's status and
+    yields either rich spinner payloads (for CLI clients) or plain text
+    waiting messages (for plain-log clients) while the request is still
+    PENDING, so the HTTP stream stays warm and the user sees progress.
+
+    The behavior mirrors the wait loop in ``log_streamer`` and is the
+    source of truth for it — ``log_streamer`` delegates to this helper
+    when given a ``request_id``.
+
+    Args:
+        request_id: The request ID to wait for.
+        plain_logs: If True, yield plain-text waiting messages; otherwise
+            yield rich spinner payloads (SHORT requests stay silent until
+            stuck longer than ``_SHORT_REQUEST_SPINNER_TIMEOUT``).
+        follow: If False, return after one status check even if the
+            request is still PENDING.
+        polling_interval: Initial DB poll interval. Backs off up to 10x.
+
+    Raises:
+        fastapi.HTTPException: 404 if the request does not exist.
+    """
+    start_time = asyncio.get_event_loop().time()
+    status_msg = rich_utils.EncodedStatusMessage(
+        f'[dim]Checking request: {request_id}[/dim]')
+    request_task = await requests_lib.get_request_async(
+        request_id,
+        fields=['request_id', 'name', 'schedule_type', 'status', 'status_msg'])
+    if request_task is None:
+        raise fastapi.HTTPException(status_code=404,
+                                    detail=f'Request {request_id} not found')
+
+    # By default, do not show the waiting spinner for SHORT requests.
+    # If the request has been stuck in pending for
+    # _SHORT_REQUEST_SPINNER_TIMEOUT seconds, we show the waiting spinner
+    show_request_waiting_spinner = (not plain_logs and
+                                    request_task.schedule_type
+                                    == requests_lib.ScheduleType.LONG)
+
+    if show_request_waiting_spinner:
+        yield status_msg.init()
+        yield status_msg.start()
+    last_waiting_msg = ''
+    waiting_msg = (f'Waiting for {request_task.name!r} request to be '
+                   f'scheduled: {request_id}')
+    req_status = request_task.status
+    req_msg = request_task.status_msg
+    del request_task
+    # Slowly back off the database polling up to every 1 second, to avoid
+    # overloading the CPU and DB.
+    backoff = common_utils.Backoff(initial_backoff=polling_interval,
+                                   max_backoff_factor=10,
+                                   multiplier=1.2)
+    while req_status < requests_lib.RequestStatus.RUNNING:
+        current_time = asyncio.get_event_loop().time()
+        # Show the waiting spinner for a SHORT request if it has been stuck
+        # in pending for _SHORT_REQUEST_SPINNER_TIMEOUT seconds
+        if not show_request_waiting_spinner and (
+                current_time - start_time > _SHORT_REQUEST_SPINNER_TIMEOUT):
+            show_request_waiting_spinner = True
+            yield status_msg.init()
+            yield status_msg.start()
+        if req_msg is not None:
+            waiting_msg = req_msg
+        if show_request_waiting_spinner:
+            yield status_msg.update(f'[dim]{waiting_msg}[/dim]')
+        elif plain_logs and waiting_msg != last_waiting_msg:
+            # Only log when waiting message changes.
+            last_waiting_msg = waiting_msg
+            for chunk in _waiting_status_chunks(waiting_msg, plain_logs=True):
+                yield chunk
+        # Sleep shortly to avoid storming the DB and CPU and allow other
+        # coroutines to run.
+        # TODO(aylei): we should use a better mechanism to avoid busy
+        # polling the DB, which can be a bottleneck for high-concurrency
+        # requests.
+        await asyncio.sleep(backoff.current_backoff())
+        status_with_msg = await requests_lib.get_request_status_async(
+            request_id, include_msg=True)
+        if status_with_msg is None:
+            # Request record vanished (e.g. deleted while polling).
+            break
+        req_status = status_with_msg.status
+        req_msg = status_with_msg.status_msg
+        if not follow:
+            break
+    if show_request_waiting_spinner:
+        yield status_msg.stop()
+
+
+async def log_streamer(
+    request_id: Optional[str],
+    log_path: Optional[pathlib.Path] = None,
+    plain_logs: bool = False,
+    tail: Optional[int] = None,
+    follow: bool = True,
+    cluster_name: Optional[str] = None,
+    polling_interval: float = DEFAULT_POLL_INTERVAL
+) -> AsyncGenerator[str, None]:
+    """Streams the logs of a request, and never dies silently doing it.
+
+    Everything below reads bytes a task wrote, and a task writes whatever it
+    likes. An exception raised on one line used to escape this generator: the
+    response then ended mid-body with nothing logged and nothing said, so the
+    reader saw a log that simply stopped -- and a `?compress=gz` download
+    saved a gzip with no trailer, which will not open at all. Three such
+    triggers have been found by being reported; this boundary is what makes
+    the fourth one visible instead of silent.
+
+    Args: see `_log_stream_chunks`, which does the streaming.
+    """
+    yielded_any = False
+    try:
+        async for chunk in _log_stream_chunks(request_id, log_path, plain_logs,
+                                              tail, follow, cluster_name,
+                                              polling_interval):
+            # `bool(chunk)`, not True: `gzipped()` one layer up counts bytes
+            # for the same decision, and an empty chunk would make the two
+            # disagree -- a marker emitted here while gzip still saw nothing,
+            # which is the case this flag exists to prevent.
+            yielded_any = yielded_any or bool(chunk)
+            yield chunk
+    except (asyncio.CancelledError, GeneratorExit):  # pylint: disable=try-except-raise
+        # Both are BaseException, so `except Exception` below would not catch
+        # them anyway; spelled out because a reader should not have to know
+        # that to see that a disconnect is not an error. PEP 525 also forbids
+        # yielding while a GeneratorExit propagates.
+        raise
+    except fastapi.HTTPException:  # pylint: disable=try-except-raise
+        # Control flow, not a streaming failure: `wait_for_request_to_start`
+        # raises 404 for an unknown request id and the client is served that
+        # status. Swallowing it here would answer an empty 200 instead.
+        raise
+    except Exception:  # pylint: disable=broad-except
+        logger.exception('Log streaming failed '
+                         f'(request {request_id}, path {log_path})')
+        if not yielded_any:
+            # End the response cleanly and empty rather than re-raising.
+            # An empty stream is a signal: the SDK falls back to sync-down on
+            # bytes_written == 0. Re-raising aborts the chunked response
+            # instead, and `iter_content` then throws ChunkedEncodingError
+            # before that check is ever reached -- measured, not assumed --
+            # so the caller crashes rather than falling back. A marker line
+            # would equally suppress the signal. `logger.exception` above is
+            # what keeps this visible, and silence was the complaint.
+            #
+            # This is deliberately asymmetric, and only the download path
+            # needs it: `bytes_written == 0` appears once, in
+            # `jobs/client/sdk.py`, and that request hardcodes compress=gz.
+            # An interactive reader therefore gets an unexplained empty log
+            # for an early failure. Accepted rather than threading a flag
+            # from the endpoint: the common cause of an empty log -- an
+            # unknown request id -- is an HTTPException and stays a 404, and
+            # what is left needs a DB or aiofiles failure in the first
+            # moments, which is rare and always in the server log.
+            return
+        # No exception text: it can carry a SQL statement or a server-side
+        # path, and this is a response body. The reader needs to know the log
+        # is incomplete; the reason is in the API server log, which the line
+        # above wrote against this request id.
+        yield ('\n[SkyPilot] Log streaming stopped by an internal error; the '
+               f'log is incomplete. API server request: {request_id}\n')
+
+
+async def gzip_stream(
+        content: AsyncGenerator[Any, None]) -> AsyncGenerator[bytes, None]:
+    """Gzip a log stream as PAYLOAD, so a download saves a real .log.gz.
+
+    Not transport encoding: the browser would decompress that before saving
+    and defeat the point. Lives here rather than inside the endpoint so the
+    trailer behaviour below is reachable from a test -- it is what decides
+    whether a failed download opens at all.
+    """
+    # zlib.MAX_WBITS | 16 = gzip wrapper.
+    compressor = zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+    # Track whether we ever observed a non-empty source chunk so
+    # the empty-stream signal (used by the SDK to fall back to
+    # the rsync path for terminal jobs) survives gzip framing.
+    # The gzip header alone is ~10 bytes; we suppress it
+    # entirely for an empty source by skipping the trailing
+    # flush() in that case.
+    saw_payload = False
+    try:
+        async for chunk in content:
+            if isinstance(chunk, str):
+                chunk_bytes = chunk.encode('utf-8')
+            else:
+                chunk_bytes = chunk
+            if chunk_bytes:
+                saw_payload = True
+                compressed = compressor.compress(chunk_bytes)
+                if compressed:
+                    yield compressed
+    except (asyncio.CancelledError, GeneratorExit):  # pylint: disable=try-except-raise
+        # Client disconnect: PEP 525 forbids yielding while a
+        # GeneratorExit is propagating, so we explicitly do
+        # not run the flush() yield below.
+        raise
+    except Exception:  # pylint: disable=broad-except
+        # An upstream failure still deserves an openable file: close the gzip
+        # member with what we have, then let the error propagate. Without this
+        # the saved file is a header with no trailer, which no tool will open
+        # -- strictly worse than a short log, because it hides the part that
+        # did arrive.
+        #
+        # `log_streamer` handles its own failures, so what reaches here is a
+        # plugin-installed provider (`set_log_provider`) or `compress` itself.
+        # Those end differently from an in-tree failure: a partial gzip and an
+        # aborted response, rather than an empty body and the sync-down
+        # fallback.
+        if saw_payload:
+            tail_bytes = compressor.flush()
+            if tail_bytes:
+                yield tail_bytes
+        raise
+    # Natural EOF only — emit the gzip trailer if we actually
+    # produced anything; otherwise the response stays empty so
+    # the SDK's bytes_written==0 fallback fires.
+    if saw_payload:
+        tail_bytes = compressor.flush()
+        if tail_bytes:
+            yield tail_bytes
+
+
+async def _log_stream_chunks(
+    request_id: Optional[str],
+    log_path: Optional[pathlib.Path],
+    plain_logs: bool,
+    tail: Optional[int],
+    follow: bool,
+    cluster_name: Optional[str],
+    polling_interval: float,
+) -> AsyncGenerator[str, None]:
+    """Streams the logs of a request.
+
+    Args:
+        request_id: The request ID to check whether the log tailing process
+            should be stopped.
+        log_path: The path to the log file or directory containing the log
+        files. If it is a directory, all *.log files in the directory will be
+        streamed.
+        plain_logs: Whether to show plain logs.
+        tail: The number of lines to tail. If None, tail the whole file.
+        follow: Whether to follow the log file.
+        cluster_name: The cluster name to check status for provision logs.
+            If provided and cluster status is UP, streaming will terminate.
+    """
+
+    if request_id is not None:
+        async for chunk in wait_for_request_to_start(
+                request_id,
+                plain_logs=plain_logs,
+                follow=follow,
+                polling_interval=polling_interval):
+            yield chunk
+
+    # worker node provision logs
+    if log_path is not None and log_path.is_dir():
+        # Get all *.log files in the log_path dir
+        log_files = sorted(log_path.glob('*.log'))
+
+        for log_file_path in log_files:
+            # Add header before each file (similar to tail -f behavior)
+            header = f'\n==> {log_file_path} <==\n\n'
+            yield header
+
+            async for chunk in _stream_log_file(log_file_path, request_id,
+                                                plain_logs, tail, follow,
+                                                cluster_name, polling_interval):
+                yield chunk
+
+    # api server request logs (if request_id is provided) or
+    # head node provision logs (if cluster_name is provided)
+    else:
+        assert log_path is not None, (request_id, cluster_name)
+        async for chunk in _stream_log_file(log_path, request_id, plain_logs,
+                                            tail, follow, cluster_name,
+                                            polling_interval):
+            yield chunk
+
+
+async def _stream_log_file(
+    log_path: pathlib.Path,
+    request_id: Optional[str] = None,
+    plain_logs: bool = False,
+    tail: Optional[int] = None,
+    follow: bool = True,
+    cluster_name: Optional[str] = None,
+    polling_interval: float = DEFAULT_POLL_INTERVAL
+) -> AsyncGenerator[str, None]:
+    """Opens one log file and streams it, or says it is gone."""
+    try:
+        log_file = await aiofiles.open(log_path, 'rb')
+    except FileNotFoundError:
+        # The response has already started, so this cannot be a 404.
+        yield (f'Log {log_path.name} is no longer available on the API '
+               'server.\n')
+        return
+    try:
+        async for chunk in _tail_log_file(log_file, request_id, plain_logs,
+                                          tail, follow, cluster_name,
+                                          polling_interval):
+            yield chunk
+    finally:
+        await log_file.close()
+
+
+async def _tail_log_file(
+    f: aiofiles.threadpool.binary.AsyncBufferedReader,
+    request_id: Optional[str] = None,
+    plain_logs: bool = False,
+    tail: Optional[int] = None,
+    follow: bool = True,
+    cluster_name: Optional[str] = None,
+    polling_interval: float = DEFAULT_POLL_INTERVAL
+) -> AsyncGenerator[str, None]:
+    """Tail the opened log file, buffer the lines and flush in chunks."""
+
+    if tail is not None:
+        # Find last n lines of the log file. Do not read the whole file into
+        # memory.
+        # TODO(zhwu): this will include the control lines for rich status,
+        # which may not lead to exact tail lines when showing on the client
+        # side.
+        lines: Deque[str] = collections.deque(maxlen=tail)
+        async for line_str in _yield_log_file_with_payloads_skipped(f):
+            lines.append(line_str)
+        for line_str in lines:
+            yield line_str
+
+    last_heartbeat_time = asyncio.get_event_loop().time()
+    last_status_check_time = asyncio.get_event_loop().time()
+    # The last parked-state message pushed to this stream; see the WAITING
+    # branch in the status check below.
+    last_waiting_msg: Optional[str] = None
+
+    # Buffer the lines in memory and flush them in chunks to improve log
+    # tailing throughput.
+    buffer: List[str] = []
+    buffer_bytes = 0
+    last_flush_time = asyncio.get_event_loop().time()
+
+    # Read file in chunks instead of line-by-line for better performance
+    incomplete_line = b''  # Buffer for incomplete lines across chunks
+
+    async def flush_buffer() -> AsyncGenerator[str, None]:
+        nonlocal buffer, buffer_bytes, last_flush_time
+        if buffer:
+            yield ''.join(buffer)
+            buffer.clear()
+            buffer_bytes = 0
+            last_flush_time = asyncio.get_event_loop().time()
+
+    while True:
+        # Sleep 0 to yield control to allow other coroutines to run,
+        # while keeps the loop tight to make log stream responsive.
+        await asyncio.sleep(0)
+        current_time = asyncio.get_event_loop().time()
+        # Flush the buffer when it is not empty and the buffer is full or the
+        # flush timeout is reached.
+        if buffer and (buffer_bytes >= _BUFFER_SIZE or
+                       (current_time - last_flush_time) >= _BUFFER_TIMEOUT):
+            async for chunk in flush_buffer():
+                yield chunk
+
+        # Read file in chunks for better I/O performance
+        file_chunk: bytes = await f.read(_READ_CHUNK_SIZE)
+        if not file_chunk:
+            # Process any remaining incomplete line
+            if incomplete_line:
+                line_str = incomplete_line.decode('utf-8', errors='replace')
+                if plain_logs:
+                    is_payload, line_str = message_utils.decode_payload(
+                        line_str, raise_for_mismatch=False)
+                    if not is_payload:
+                        buffer.append(line_str)
+                        buffer_bytes += len(line_str.encode('utf-8'))
+                else:
+                    buffer.append(line_str)
+                    buffer_bytes += len(line_str.encode('utf-8'))
+                incomplete_line = b''
+
+            # Avoid checking the status too frequently to avoid overloading the
+            # DB.
+            should_check_status = (current_time -
+                                   last_status_check_time) >= polling_interval
+            if not follow:
+                # We will only hit this path once, but we should make sure to
+                # check the status so that we display the final request status
+                # if the request is complete.
+                should_check_status = True
+            if request_id is not None and should_check_status:
+                last_status_check_time = current_time
+                req_status = await requests_lib.get_request_status_async(
+                    request_id, include_msg=True)
+                if req_status is None:
+                    # The record vanished (e.g. deleted while streaming); the
+                    # loop below dereferences it more than once.
+                    break
+                if req_status.status == requests_lib.RequestStatus.WAITING:
+                    # The request parked mid-execution (e.g. waiting on queue
+                    # admission or a cluster lock): it stops writing to the log,
+                    # so without this the client keeps showing the last line it
+                    # streamed -- frozen for as long as the wait lasts, and
+                    # stale as soon as the reason changes. Push the parked
+                    # message as the live status instead.
+                    waiting_msg = req_status.status_msg
+                    if waiting_msg and waiting_msg != last_waiting_msg:
+                        last_waiting_msg = waiting_msg
+                        buffer.extend(
+                            _waiting_status_chunks(waiting_msg, plain_logs))
+                else:
+                    # Any other status (resumed, queued again, finished): the
+                    # request drives its own status again, and a later park has
+                    # to be able to report the same reason afresh.
+                    last_waiting_msg = None
+                if req_status.status > requests_lib.RequestStatus.RUNNING:
+                    if (req_status.status ==
+                            requests_lib.RequestStatus.CANCELLED):
+                        request_task = await requests_lib.get_request_async(
+                            request_id, fields=['name', 'should_retry'])
+                        if request_task.should_retry:
+                            buffer.append(
+                                message_utils.encode_payload(
+                                    rich_utils.Control.RETRY.encode('')))
+                        else:
+                            buffer.append(
+                                f'{request_task.name!r} request {request_id}'
+                                ' cancelled\n')
+                        del request_task
+                    break
+            if not follow:
+                # The below checks (cluster status, heartbeat) are not needed
+                # for non-follow logs.
+                break
+            # Provision logs pass in cluster_name, check cluster status
+            # periodically to see if provisioning is done.
+            if cluster_name is not None:
+                if should_check_status:
+                    last_status_check_time = current_time
+                    cluster_status = await (
+                        global_user_state.get_status_from_cluster_name_async(
+                            cluster_name))
+                    if cluster_status is None:
+                        logger.debug(
+                            'Stop tailing provision logs for cluster'
+                            f' status for cluster {cluster_name} not found')
+                        break
+                    # if the cluster is not in INIT state (UP or STOPPED),
+                    # stop tailing provision logs
+                    if cluster_status != status_lib.ClusterStatus.INIT:
+                        logger.debug(
+                            f'Stop tailing provision logs for cluster'
+                            f' {cluster_name} has status {cluster_status} '
+                            '(not in INIT state)')
+                        break
+                    req_filter = requests_lib.RequestTaskFilter(
+                        status=[requests_lib.RequestStatus.RUNNING],
+                        cluster_names=[cluster_name],
+                        include_request_names=['sky.launch'],
+                        fields=['cluster_name'])
+                    req_tasks = await requests_lib.get_request_tasks_async(
+                        req_filter)
+                    # if the cluster is in INIT state and there is no ongoing
+                    # launch request, stop tailing provision logs
+                    if len(req_tasks) == 0:
+                        break
+            if current_time - last_heartbeat_time >= _HEARTBEAT_INTERVAL:
+                # Currently just used to keep the connection busy, refer to
+                # https://github.com/skypilot-org/skypilot/issues/5750 for
+                # more details.
+                buffer.append(
+                    message_utils.encode_payload(
+                        rich_utils.Control.HEARTBEAT.encode('')))
+                last_heartbeat_time = current_time
+
+            # Sleep shortly to avoid storming the DB and CPU, this has
+            # little impact on the responsivness here since we are waiting
+            # for a new line to come in.
+            await asyncio.sleep(0.1)
+            continue
+
+        # Refresh the heartbeat time, this is a trivial optimization for
+        # performance but it helps avoid unnecessary heartbeat strings
+        # being printed when the client runs in an old version.
+        last_heartbeat_time = asyncio.get_event_loop().time()
+
+        # Combine with any incomplete line from previous chunk
+        file_chunk = incomplete_line + file_chunk
+        incomplete_line = b''
+
+        # Split chunk into lines, preserving line structure
+        lines_bytes = file_chunk.split(b'\n')
+
+        # If chunk doesn't end with newline, the last element is incomplete
+        if file_chunk and not file_chunk.endswith(b'\n'):
+            incomplete_line = lines_bytes[-1]
+            lines_bytes = lines_bytes[:-1]
+        else:
+            # If ends with \n, split creates an empty last element we should
+            # ignore
+            if lines_bytes and lines_bytes[-1] == b'':
+                lines_bytes = lines_bytes[:-1]
+
+        # Process all complete lines in this chunk
+        for line_bytes in lines_bytes:
+            # Reconstruct line with newline (since split removed it)
+            line_str = line_bytes.decode('utf-8', errors='replace') + '\n'
+
+            if plain_logs:
+                is_payload, line_str = message_utils.decode_payload(
+                    line_str, raise_for_mismatch=False)
+                # TODO(aylei): implement heartbeat mechanism for plain logs,
+                # sending invisible characters might be okay.
+                if is_payload:
+                    continue
+
+            buffer.append(line_str)
+            buffer_bytes += len(line_str.encode('utf-8'))
+
+    # Flush remaining lines in the buffer.
+    async for chunk in flush_buffer():
+        yield chunk
+
+
+async def _discard_log_after_stream(
+        stream: AsyncGenerator[str, None],
+        request_id: str) -> AsyncGenerator[str, None]:
+    """Yields from ``stream``, then discards the request's log.
+
+    For a log tail the request log only bridges the tail and this response,
+    and holds a full copy of the tailed log.
+    """
+    # log_provider imports this module, so this cannot be a top-level import.
+    # pylint: disable=import-outside-toplevel
+    from sky.server.requests import log_provider as lp
+    try:
+        async for chunk in stream:
+            yield chunk
+    finally:
+        # Close first: ``stream`` holds the log file open, and an open fd keeps
+        # its blocks allocated after the unlink. The unlink runs in a thread
+        # because ~/.sky can be on the state volume, where it is a network
+        # round trip.
+        try:
+            await stream.aclose()
+        finally:
+            await asyncio.to_thread(lp.get_log_provider().discard_log,
+                                    request_id)
+
+
+def stream_response_for_long_request(
+    request_id: str,
+    logs_path: pathlib.Path,
+    background_tasks: fastapi.BackgroundTasks,
+    kill_request_on_disconnect: bool = True,
+    discard_log_after_stream: bool = True,
+) -> fastapi.responses.StreamingResponse:
+    """Stream the logs of a long request.
+
+    Every caller streams a tail of a log that lives elsewhere -- a cluster
+    job, a managed job, a service -- so the request log is discarded once the
+    response ends. A request whose own log is the artifact, such as a launch
+    or an exec, is not streamed through here: its client reads /api/stream,
+    which never discards.
+
+    Args:
+        discard_log_after_stream: Set False to keep the request log.
+    """
+    return stream_response(
+        request_id,
+        logs_path,
+        background_tasks,
+        polling_interval=LONG_REQUEST_POLL_INTERVAL,
+        kill_request_on_disconnect=kill_request_on_disconnect,
+        discard_log_after_stream=discard_log_after_stream,
+    )
+
+
+def stream_response(
+    request_id: str,
+    logs_path: pathlib.Path,
+    background_tasks: fastapi.BackgroundTasks,
+    polling_interval: float = DEFAULT_POLL_INTERVAL,
+    kill_request_on_disconnect: bool = True,
+    discard_log_after_stream: bool = False,
+) -> fastapi.responses.StreamingResponse:
+
+    if kill_request_on_disconnect:
+
+        async def on_disconnect():
+            logger.info(f'User terminated the connection for request '
+                        f'{request_id}')
+            await requests_lib.kill_request_async(request_id)
+
+        # The background task will be run after returning a response.
+        # https://fastapi.tiangolo.com/tutorial/background-tasks/
+        background_tasks.add_task(on_disconnect)
+
+    # Route through LogProvider.
+    # pylint: disable=import-outside-toplevel
+    from sky.server.requests import log_provider as lp
+    stream = lp.get_log_provider().log_stream(request_id=request_id,
+                                              log_path=logs_path,
+                                              polling_interval=polling_interval)
+    if discard_log_after_stream:
+        stream = _discard_log_after_stream(stream, request_id)
+    return fastapi.responses.StreamingResponse(
+        stream,
+        media_type='text/plain',
+        headers={
+            'Cache-Control': 'no-cache, no-transform',
+            'X-Accel-Buffering': 'no',
+            'Transfer-Encoding': 'chunked'
+        })

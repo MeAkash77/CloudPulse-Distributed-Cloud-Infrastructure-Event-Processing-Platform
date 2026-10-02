@@ -1,0 +1,1746 @@
+import importlib
+import os
+import pickle
+from typing import Dict
+from unittest import mock
+
+import pytest
+
+from sky import check
+from sky import clouds
+from sky import global_user_state
+from sky import skypilot_config
+from sky.clouds import cloud as sky_cloud
+from sky.resources import Resources
+from sky.skylet import autostop_lib
+from sky.skylet import constants
+from sky.utils import resources_utils
+
+GLOBAL_VALID_LABELS = {
+    'plaintext': 'plainvalue',
+    'numbers123': '123',
+}
+
+GLOBAL_INVALID_LABELS = {
+    'l' * 129: 'value',  # Long key
+    'key': 'v' * 257,  # Long value
+    'spaces in label': 'spaces in value',
+    '': 'emptykey',
+}
+
+
+def test_get_reservations_available_resources():
+    mock_cloud = mock.Mock()
+    r = Resources(cloud=mock_cloud, instance_type="instance_type")
+    r._region = "region"
+    r._zone = "zone"
+    r.get_reservations_available_resources()
+    mock_cloud.get_reservations_available_resources.assert_called_once_with(
+        "instance_type", "region", "zone", set())
+
+
+def test_get_cost_without_region_uses_joint_regional_price():
+    """get_cost() with no region must not mix per-component minimums.
+
+    The cheapest instance price and the cheapest accelerator price can live in
+    different regions; the cost estimate must be the cheapest joint price a
+    single region offers, not the (unachievable) sum of the two minimums.
+    """
+    instance_prices = {'cheap-instance-region': 8.0, 'cheap-accel-region': 9.0}
+    accel_prices = {'cheap-instance-region': 47.0, 'cheap-accel-region': 26.0}
+
+    mock_cloud = mock.Mock()
+    mock_cloud.instance_type_to_hourly_cost.side_effect = (
+        lambda instance_type, use_spot, region, zone: instance_prices[region])
+    mock_cloud.accelerators_to_hourly_cost.side_effect = (
+        lambda accelerators, use_spot, region, zone: accel_prices[region])
+
+    r = Resources(cloud=mock_cloud,
+                  instance_type='instance_type',
+                  accelerators={'A100': 16})
+    regions = [
+        clouds.Region(name=region_name) for region_name in instance_prices
+    ]
+    with mock.patch.object(Resources,
+                           'get_valid_regions_for_launchable',
+                           return_value=regions):
+        # Cheapest joint price is cheap-accel-region: 9 + 26 = 35, cheaper
+        # than cheap-instance-region (8 + 47 = 55) and than the region-mixed
+        # sum of minimums (8 + 26 = 34), which no region offers.
+        assert r.get_cost(3600) == 35.0
+
+
+def test_get_cost_with_region_prices_that_region():
+    mock_cloud = mock.Mock()
+    mock_cloud.instance_type_to_hourly_cost.return_value = 8.0
+    mock_cloud.accelerators_to_hourly_cost.return_value = 26.0
+    mock_cloud.validate_region_zone.return_value = ('some-region', None)
+    r = Resources(cloud=mock_cloud,
+                  instance_type='instance_type',
+                  accelerators={'A100': 16},
+                  region='some-region')
+    assert r.get_cost(3600) == 34.0
+    mock_cloud.instance_type_to_hourly_cost.assert_called_once_with(
+        'instance_type', False, 'some-region', None)
+    mock_cloud.accelerators_to_hourly_cost.assert_called_once_with(
+        {'A100': 16}, False, 'some-region', None)
+
+
+def _run_label_test(allowed_labels: Dict[str, str],
+                    invalid_labels: Dict[str, str],
+                    cloud: clouds.Cloud = None):
+    """Run a test for labels with the given allowed and invalid labels."""
+    r_allowed = Resources(cloud=cloud, labels=allowed_labels)  # Should pass
+    r_allowed.validate()
+    assert r_allowed.labels == allowed_labels, ('Allowed labels '
+                                                'should be the same')
+
+    # Check for each invalid label
+    for invalid_label, value in invalid_labels.items():
+        l = {invalid_label: value}
+        r = Resources(cloud=cloud, labels=l)
+        with pytest.raises(ValueError):
+            r.validate()
+            assert False, (f'Resources {r.to_yaml_config()} were initialized '
+                           f'with invalid label {invalid_label}={value} but no '
+                           'error was raised.')
+
+
+def test_gcp_labels_resources():
+    allowed_labels = {
+        **GLOBAL_VALID_LABELS,
+    }
+    invalid_labels = {
+        **GLOBAL_INVALID_LABELS,
+        'domain/key': 'value',
+        '1numericstart': 'value',
+    }
+    cloud = clouds.GCP()
+    _run_label_test(allowed_labels, invalid_labels, cloud)
+
+
+def test_aws_labels_resources():
+    allowed_labels = {
+        **GLOBAL_VALID_LABELS,
+    }
+    invalid_labels = {
+        **GLOBAL_INVALID_LABELS,
+        'aws:cannotstartwithaws': 'value',
+    }
+    cloud = clouds.AWS()
+    _run_label_test(allowed_labels, invalid_labels, cloud)
+
+
+def test_kubernetes_labels_resources():
+    allowed_labels = {
+        **GLOBAL_VALID_LABELS,
+        'kueue.x-k8s.io/queue-name': 'queue',
+        'a' * 253 + '/' + 'k' * 63: 'v' *
+                                    63,  # upto 253 chars in domain, 63 in key
+        'mylabel': '',  # empty label values are allowed by k8s
+        '1numericstart': 'value',  # numeric start is allowed by k8s
+    }
+    invalid_labels = {
+        **GLOBAL_INVALID_LABELS,
+        'a' * 254 + '/' + 'k' * 64: 'v' *
+                                    63,  # exceed 253 chars in domain, 63 in key
+    }
+    cloud = clouds.Kubernetes()
+    _run_label_test(allowed_labels, invalid_labels, cloud)
+
+
+def test_no_cloud_labels_resources():
+    global_user_state.set_enabled_clouds(['aws', 'gcp'],
+                                         sky_cloud.CloudCapability.COMPUTE,
+                                         constants.SKYPILOT_DEFAULT_WORKSPACE)
+    global_user_state.set_allowed_clouds(
+        check._get_workspace_allowed_clouds(
+            constants.SKYPILOT_DEFAULT_WORKSPACE),
+        constants.SKYPILOT_DEFAULT_WORKSPACE)
+    allowed_labels = {
+        **GLOBAL_VALID_LABELS,
+    }
+    invalid_labels = {
+        **GLOBAL_INVALID_LABELS,
+        'aws:cannotstartwithaws': 'value',
+        'domain/key': 'value',  # Invalid for GCP
+    }
+    _run_label_test(allowed_labels, invalid_labels)
+
+
+def test_no_cloud_labels_resources_single_enabled_cloud():
+    global_user_state.set_enabled_clouds(['aws'],
+                                         sky_cloud.CloudCapability.COMPUTE,
+                                         constants.SKYPILOT_DEFAULT_WORKSPACE)
+    global_user_state.set_allowed_clouds(
+        check._get_workspace_allowed_clouds(
+            constants.SKYPILOT_DEFAULT_WORKSPACE),
+        constants.SKYPILOT_DEFAULT_WORKSPACE)
+    allowed_labels = {
+        **GLOBAL_VALID_LABELS,
+        'domain/key': 'value',  # Valid for AWS
+    }
+    invalid_labels = {
+        **GLOBAL_INVALID_LABELS,
+        'aws:cannotstartwithaws': 'value',
+    }
+    _run_label_test(allowed_labels, invalid_labels, cloud=clouds.AWS())
+
+
+@mock.patch('sky.catalog.instance_type_exists', return_value=True)
+@mock.patch('sky.catalog.get_accelerators_from_instance_type',
+            return_value={'fake-acc': 2})
+@mock.patch('sky.clouds.aws.AWS.get_image_root_device_name',
+            return_value='/dev/sda1')
+@mock.patch('sky.catalog.get_image_id_from_tag', return_value='fake-image')
+@mock.patch('sky.catalog.get_arch_from_instance_type', return_value='fake-arch')
+@mock.patch.object(clouds.aws, 'DEFAULT_SECURITY_GROUP_NAME', 'fake-default-sg')
+def test_aws_make_deploy_variables(*mocks) -> None:
+    os.environ[
+        skypilot_config.
+        ENV_VAR_SKYPILOT_CONFIG] = './tests/test_yamls/test_aws_config.yaml'
+    importlib.reload(skypilot_config)
+
+    cloud = clouds.AWS()
+    cluster_name = resources_utils.ClusterName(display_name='display',
+                                               name_on_cloud='cloud')
+    region = clouds.Region(name='fake-region')
+    zones = [clouds.Zone(name='fake-zone')]
+    resource = Resources(cloud=cloud, instance_type='fake-type: 3')
+    config = resource.make_deploy_variables(cluster_name,
+                                            region,
+                                            zones,
+                                            num_nodes=1,
+                                            dryrun=True)
+
+    expected_config_base = {
+        'instance_type': resource.instance_type,
+        'custom_resources': '{"fake-acc":2}',
+        'max_efa_interfaces': 0,
+        'enforce_tags': [],
+        'use_spot': False,
+        'region': 'fake-region',
+        'image_id': 'fake-image',
+        'disk_encrypted': False,
+        'ssh_user': 'ubuntu',
+        'disk_tier': 'gp3',
+        'disk_throughput': 218,
+        'disk_iops': 3500,
+        'docker_image': None,
+        'docker_container_name': 'sky_container',
+        'docker_login_config': None,
+        'docker_run_options': [],
+        'initial_setup_commands': [],
+        'zones': 'fake-zone',
+        'root_device_name': '/dev/sda1'
+    }
+
+    # test using defaults
+    expected_config = expected_config_base.copy()
+    expected_config.update({
+        'security_group': 'fake-default-sg',
+        'security_group_managed_by_skypilot': 'true'
+    })
+    assert config == expected_config, ('unexpected resource '
+                                       'variables generated')
+
+    # test using cluster matches regex, top
+    cluster_name = resources_utils.ClusterName(
+        display_name='sky-serve-fake1-1234', name_on_cloud='name-on-cloud')
+    expected_config = expected_config_base.copy()
+    expected_config.update({
+        'security_group': 'fake-1-sg',
+        'security_group_managed_by_skypilot': 'false'
+    })
+    config = resource.make_deploy_variables(cluster_name,
+                                            region,
+                                            zones,
+                                            num_nodes=1,
+                                            dryrun=True)
+    assert config == expected_config, ('unexpected resource '
+                                       'variables generated')
+
+    # test using cluster matches regex, middle
+    cluster_name = resources_utils.ClusterName(
+        display_name='sky-serve-fake2-1234', name_on_cloud='name-on-cloud')
+    expected_config = expected_config_base.copy()
+    expected_config.update({
+        'security_group': 'fake-2-sg',
+        'security_group_managed_by_skypilot': 'false'
+    })
+    config = resource.make_deploy_variables(cluster_name,
+                                            region,
+                                            zones,
+                                            num_nodes=1,
+                                            dryrun=True)
+    assert config == expected_config, ('unexpected resource '
+                                       'variables generated')
+
+
+@mock.patch('sky.catalog.instance_type_exists', return_value=True)
+@mock.patch('sky.catalog.get_accelerators_from_instance_type',
+            return_value={'fake-acc': 2})
+@mock.patch('sky.clouds.aws.AWS.get_image_root_device_name',
+            return_value='/dev/xvda')
+@mock.patch('sky.catalog.get_image_id_from_tag', return_value='fake-image')
+@mock.patch('sky.catalog.get_arch_from_instance_type', return_value='fake-arch')
+@mock.patch.object(clouds.aws, 'DEFAULT_SECURITY_GROUP_NAME', 'fake-default-sg')
+def test_aws_make_deploy_variables_ssh_user(*mocks) -> None:
+    os.environ[
+        skypilot_config.
+        ENV_VAR_SKYPILOT_CONFIG] = './tests/test_yamls/test_aws_config_ssh_user.yaml'
+    importlib.reload(skypilot_config)
+
+    cloud = clouds.AWS()
+    cluster_name = resources_utils.ClusterName(display_name='display',
+                                               name_on_cloud='cloud')
+    region = clouds.Region(name='fake-region')
+    zones = [clouds.Zone(name='fake-zone')]
+    resource = Resources(cloud=cloud, instance_type='fake-type: 3')
+    config = resource.make_deploy_variables(cluster_name,
+                                            region,
+                                            zones,
+                                            num_nodes=1,
+                                            dryrun=True)
+
+    expected_config_base = {
+        'instance_type': resource.instance_type,
+        'custom_resources': '{"fake-acc":2}',
+        'max_efa_interfaces': 0,
+        'enforce_tags': [],
+        'use_spot': False,
+        'region': 'fake-region',
+        'image_id': 'fake-image',
+        'disk_encrypted': False,
+        'ssh_user': 'test-user',
+        'disk_tier': 'gp3',
+        'disk_throughput': 218,
+        'disk_iops': 3500,
+        'docker_image': None,
+        'docker_container_name': 'sky_container',
+        'docker_login_config': None,
+        'docker_run_options': [],
+        'initial_setup_commands': [],
+        'zones': 'fake-zone',
+        'root_device_name': '/dev/xvda'
+    }
+
+    # test using defaults
+    expected_config = expected_config_base.copy()
+    expected_config.update({
+        'security_group': 'fake-default-sg',
+        'security_group_managed_by_skypilot': 'true'
+    })
+    assert config == expected_config, ('unexpected resource '
+                                       'variables generated')
+
+
+@pytest.mark.parametrize(['resources_kwargs', 'expected_yaml_config'], [
+    ({
+        'infra': '*/*/us-east-1b',
+        'accelerators': 'A10'
+    }, {
+        'infra': '*/*/us-east-1b',
+        'accelerators': {
+            'A10': 1
+        },
+    }),
+    ({
+        'infra': 'gcp/*/us-east1-b',
+        'accelerators': 'A10:8',
+        'labels': {
+            'key': 'value'
+        }
+    }, {
+        'infra': 'gcp/*/us-east1-b',
+        'accelerators': {
+            'A10': 8
+        },
+        'labels': {
+            'key': 'value'
+        },
+    }),
+])
+def test_to_yaml_and_load(resources_kwargs, expected_yaml_config):
+    r = Resources(**resources_kwargs)
+    yaml_config = r.to_yaml_config()
+    assert yaml_config == expected_yaml_config
+
+    loaded_r = list(Resources.from_yaml_config(yaml_config))[0]
+    assert loaded_r.cloud == r.cloud
+    assert loaded_r.region == r.region
+    assert loaded_r.zone == r.zone
+    original_accelerators = r.accelerators
+    assert loaded_r.accelerators == original_accelerators
+    assert original_accelerators == r.accelerators
+    assert loaded_r.labels == r.labels
+
+
+def test_resources_any_of():
+    """Test Resources creation with any_of option."""
+    # Test any_of with different resources options
+    config = {
+        'any_of': [
+            {
+                'cpus': 8,
+                'memory': 16
+            },
+            {
+                'cpus': 4,
+                'memory': 32
+            },
+            {
+                'accelerators': 'V100:1'
+            },
+        ]
+    }
+    resources_set = Resources.from_yaml_config(config)
+
+    # Verify it returns a set of resources
+    assert isinstance(resources_set, set)
+    assert len(resources_set) == 3
+
+    # Validate the resources options are correctly created
+    resources_list = list(resources_set)
+
+    # Find resources by properties (order may not be preserved)
+    r_cpus8 = next((r for r in resources_list if r.cpus == '8'), None)
+    r_cpus4 = next((r for r in resources_list if r.cpus == '4'), None)
+    r_gpu = next((r for r in resources_list if r.accelerators is not None),
+                 None)
+
+    assert r_cpus8 is not None
+    assert r_cpus8.memory == '16'
+
+    assert r_cpus4 is not None
+    assert r_cpus4.memory == '32'
+
+    assert r_gpu is not None
+    assert r_gpu.accelerators == {'V100': 1}
+
+
+def test_resources_ordered():
+    """Test Resources creation with ordered option."""
+    # Test ordered with different resources options
+    config = {
+        'ordered': [
+            {
+                'infra': 'gcp',
+                'accelerators': 'A100:8'
+            },
+            {
+                'infra': 'aws',
+                'accelerators': 'V100:8'
+            },
+            {
+                'accelerators': 'T4:8'
+            },
+        ]
+    }
+    resources_list = Resources.from_yaml_config(config)
+
+    # Verify it returns a list of resources
+    assert isinstance(resources_list, list)
+    assert len(resources_list) == 3
+
+    # Ordered resources should preserve order
+    assert resources_list[0].infra.cloud.lower() == 'gcp'
+    assert resources_list[0].accelerators == {'A100': 8}
+
+    assert resources_list[1].infra.cloud.lower() == 'aws'
+    assert resources_list[1].accelerators == {'V100': 8}
+
+    assert resources_list[2].accelerators == {'T4': 8}
+
+
+def test_resources_any_of_spot_flag():
+    """Test Resources with any_of option including spot flag variations."""
+    config = {
+        'accelerators': 'A100:8',
+        'any_of': [{
+            'use_spot': True
+        }, {
+            'use_spot': False
+        }]
+    }
+    resources_set = Resources.from_yaml_config(config)
+
+    # Verify it returns a set of resources
+    assert isinstance(resources_set, set)
+    assert len(resources_set) == 2
+
+    # Find spot and on-demand resources
+    resources_list = list(resources_set)
+    r_spot = next((r for r in resources_list if r.use_spot), None)
+    r_ondemand = next((r for r in resources_list if not r.use_spot), None)
+
+    assert r_spot is not None
+    assert r_spot.accelerators == {'A100': 8}
+    assert r_spot.use_spot is True
+
+    assert r_ondemand is not None
+    assert r_ondemand.accelerators == {'A100': 8}
+    assert r_ondemand.use_spot is False
+
+
+def test_resources_ordered_preference():
+    """Test Resources creation with ordered preference correctly preserves order."""
+    config = {
+        'ordered': [
+            {
+                'infra': 'aws/us-east-1',
+                'accelerators': 'A100:8'
+            },
+            {
+                'infra': 'gcp/us-central1',
+                'accelerators': 'A100:8'
+            },
+            {
+                'infra': 'azure/eastus',
+                'accelerators': 'A100:8'
+            },
+        ]
+    }
+    resources_list = Resources.from_yaml_config(config)
+
+    # Verify order matches the input order
+    assert resources_list[0].infra.cloud.lower() == 'aws'
+    assert resources_list[0].infra.region == 'us-east-1'
+
+    assert resources_list[1].infra.cloud.lower() == 'gcp'
+    assert resources_list[1].infra.region == 'us-central1'
+
+    assert resources_list[2].infra.cloud.lower() == 'azure'
+    assert resources_list[2].infra.region == 'eastus'
+
+
+def test_resources_any_of_dump_in_serve_version_bump():
+    any_of_1 = [
+        {
+            'accelerators': {
+                'H200': 1
+            },
+        },
+        {
+            'accelerators': {
+                'H100': 1
+            },
+        },
+        {
+            'accelerators': {
+                'L4': 4
+            },
+        },
+    ]
+    any_of_2 = [
+        {
+            'accelerators': {
+                'H100': 1
+            },
+        },
+        {
+            'accelerators': {
+                'L4': 4
+            },
+        },
+        {
+            'accelerators': {
+                'H200': 1
+            },
+        },
+    ]
+    assert (resources_utils.normalize_any_of_resources_config(any_of_1) ==
+            resources_utils.normalize_any_of_resources_config(any_of_2))
+
+
+def test_resources_any_of_ordered_exclusive():
+    """Test that Resources raises ValueError if both any_of and ordered are specified."""
+    config = {'any_of': [{'cpus': 8}], 'ordered': [{'cpus': 4}]}
+
+    # Should raise ValueError because both any_of and ordered are specified
+    with pytest.raises(ValueError,
+                       match='Cannot specify both "any_of" and "ordered"'):
+        Resources.from_yaml_config(config)
+
+
+def test_resources_any_of_with_base_infra():
+    """Test Resources creation with any_of option and base infra."""
+    # Test any_of with base infra and additional infra specifications
+    config = {
+        'infra': 'aws',  # Base infra
+        'cpus': 8,
+        'any_of': [
+            {
+                'infra': 'aws/us-east-1'
+            },  # Override with specific region
+            {
+                'infra': 'aws/us-west-2'
+            },  # Different region
+            {
+                'infra': 'gcp/us-central1'
+            },  # Different cloud
+        ]
+    }
+    resources_set = Resources.from_yaml_config(config)
+
+    # Verify it returns a set of resources
+    assert isinstance(resources_set, set)
+    assert len(resources_set) == 3
+
+    # Validate the resources are correctly created with proper infra
+    resources_list = list(resources_set)
+
+    # All resources should have cpus=8 from the base config
+    for r in resources_list:
+        assert r.cpus == '8'
+
+    # Find resources by infra properties
+    r_east = next((r for r in resources_list if r.infra.region == 'us-east-1'),
+                  None)
+    r_west = next((r for r in resources_list if r.infra.region == 'us-west-2'),
+                  None)
+    r_gcp = next((r for r in resources_list if r.infra.cloud.lower() == 'gcp'),
+                 None)
+
+    assert r_east is not None
+    assert str(r_east.cloud).lower() == 'aws'
+
+    assert r_west is not None
+    assert str(r_west.cloud).lower() == 'aws'
+
+    assert r_gcp is not None
+    assert r_gcp.infra.region == 'us-central1'
+
+
+def test_resources_ordered_with_base_infra():
+    """Test Resources creation with ordered option and base infra."""
+    # Test ordered with base infra and additional infra specifications
+    config = {
+        'infra': 'azure',  # Base infra
+        'accelerators': 'A100:8',  # Base accelerator
+        'ordered': [
+            {
+                'infra': 'gcp/us-central1'
+            },  # Specific region in same cloud
+            {
+                'infra': 'aws/us-east-1'
+            },  # Different cloud
+            {
+                'accelerators': 'T4:8'
+            },  # Another cloud
+        ]
+    }
+    resources_list = Resources.from_yaml_config(config)
+
+    # Verify it returns a list of resources with right length
+    assert isinstance(resources_list, list)
+    assert len(resources_list) == 3
+
+    # All resources should have A100:8 from the base config
+    assert resources_list[0].accelerators == {'A100': 8}
+    assert resources_list[1].accelerators == {'A100': 8}
+    assert resources_list[2].accelerators == {'T4': 8}
+
+    # Ordered resources should preserve order and have correct infra
+    assert str(resources_list[0].cloud).lower() == 'gcp'
+    assert resources_list[0].region == 'us-central1'
+
+    assert str(resources_list[1].cloud).lower() == 'aws'
+    assert resources_list[1].region == 'us-east-1'
+
+    assert str(resources_list[2].cloud).lower() == 'azure'
+    assert resources_list[2].region is None
+
+
+def test_kubernetes_image_id_formats_in_resources(enable_all_clouds):
+    """Test Resources normalizes Kubernetes image_id to include 'docker:' prefix."""
+    k8s_cloud = clouds.Kubernetes()
+    test_cases = [
+        # (input_image_id, expected_stored_image_id_in_resources_object)
+        ('alpine', 'docker:alpine'),
+        ('docker:alpine', 'docker:alpine'),
+        ('myrepo/myimage:latest', 'docker:myrepo/myimage:latest'),
+        ('docker:myrepo/myimage:latest', 'docker:myrepo/myimage:latest'),
+        ('another.registry.com/myrepo/myimage:tag',
+         'docker:another.registry.com/myrepo/myimage:tag'),
+        ('docker:another.registry.com/myrepo/myimage:tag',
+         'docker:another.registry.com/myrepo/myimage:tag'),
+    ]
+
+    for input_id, expected_stored_id in test_cases:
+        # Test direct initialization and validation
+        # This assumes Resources.__init__ or a subsequent step normalizes
+        # image_id for Kubernetes by adding 'docker:' if missing.
+        res = Resources(cloud=k8s_cloud, image_id=input_id)
+        res.validate(
+        )  # Kubernetes cloud validate_resources currently just checks type
+        assert list(res.image_id.values())[0] == expected_stored_id, (
+            f'Input: {input_id}, Expected stored: {expected_stored_id}, '
+            f'Got: {res.image_id}')
+
+        # Test YAML serialization and deserialization
+        # Assumes to_yaml_config() serializes the (potentially prefixed)
+        # internal value.
+        yaml_config = res.to_yaml_config()
+        assert list(
+            yaml_config.get('image_id').values())[0] == expected_stored_id, (
+                f'Input: {input_id}, Expected in YAML: {expected_stored_id}, '
+                f'Got in YAML: {yaml_config}')
+
+        loaded_res_list = list(Resources.from_yaml_config(yaml_config))
+        assert len(loaded_res_list) == 1, f"Load count for {input_id}"
+        loaded_res = loaded_res_list[0]
+        assert list(loaded_res.image_id.values())[0] == expected_stored_id, (
+            f'Input: {input_id}, Expected from loaded YAML: {expected_stored_id}, '
+            f'Got: {loaded_res.image_id}')
+        assert isinstance(
+            loaded_res.cloud,
+            clouds.Kubernetes), (f'Loaded cloud type mismatch for {input_id}')
+
+
+def test_image_id_dual_cloud_and_docker():
+    """image_id can carry both a cloud VM image and a docker image.
+
+    Uses the reserved 'docker' key alongside a region-keyed AMI. See the
+    AMI-missing-driver-for-B300 motivation (PR #9759): users want to boot a
+    custom AMI (correct NVIDIA driver) and still run their own container.
+    """
+    r = Resources(cloud='aws',
+                  image_id={
+                      'us-east-1': 'ami-0abcdef',
+                      'docker': 'myimage:latest',
+                  })
+    # The docker image is split out and stored separately.
+    assert r.extract_docker_image() == 'myimage:latest'
+    # The public image_id / get_cloud_image_id only expose the cloud image.
+    assert r.get_cloud_image_id() == {'us-east-1': 'ami-0abcdef'}
+    assert r.image_id == {'us-east-1': 'ami-0abcdef'}
+    # Both features are required (regression: was an elif, dropping IMAGE_ID).
+    features = {f.value for f in r.get_required_cloud_features()}
+    assert 'docker_image' in features
+    assert 'image_id' in features
+
+
+def test_image_id_docker_key_strips_prefix():
+    """A 'docker:' prefix on the reserved docker key is stripped."""
+    r = Resources(cloud='aws',
+                  image_id={
+                      'us-east-1': 'ami-0abcdef',
+                      'docker': 'docker:myimage:latest',
+                  })
+    assert r.extract_docker_image() == 'myimage:latest'
+    assert r.get_cloud_image_id() == {'us-east-1': 'ami-0abcdef'}
+
+
+def test_image_id_docker_key_only():
+    """A dict with only the 'docker' key behaves like docker:-only."""
+    r = Resources(cloud='aws', image_id={'docker': 'myimage:latest'})
+    assert r.extract_docker_image() == 'myimage:latest'
+    assert r.get_cloud_image_id() is None
+    assert r.image_id is None
+
+
+def test_image_id_ambiguous_docker_spec_rejected():
+    """docker key + a docker:-prefixed region value is ambiguous -> error."""
+    with pytest.raises(ValueError, match='only one mechanism'):
+        Resources(cloud='aws',
+                  image_id={
+                      'us-east-1': 'docker:img1',
+                      'docker': 'img2',
+                  })
+
+
+@pytest.mark.parametrize(
+    'image_id, expected_docker, expected_cloud',
+    [
+        # Legacy docker:-prefixed string: no separate cloud image.
+        ('docker:myimage:latest', 'myimage:latest', None),
+        # Legacy region-agnostic docker dict.
+        ({
+            None: 'docker:myimage:latest'
+        }, 'myimage:latest', None),
+    ])
+def test_image_id_legacy_docker_formats_unchanged(image_id, expected_docker,
+                                                  expected_cloud):
+    """Existing docker: image_id formats keep their old semantics."""
+    r = Resources(cloud='aws', image_id=image_id)
+    assert r.extract_docker_image() == expected_docker
+    assert r.get_cloud_image_id() == expected_cloud
+
+
+def test_image_id_legacy_ami_unchanged():
+    """A plain AMI image_id is unaffected by the docker-key support."""
+    r = Resources(cloud='aws', region='us-east-1', image_id='ami-12345')
+    assert r.extract_docker_image() is None
+    assert r.get_cloud_image_id() == {'us-east-1': 'ami-12345'}
+    assert r._docker_image is None
+
+
+def test_image_id_dual_yaml_round_trip():
+    """to_yaml_config / from_yaml_config preserves both images."""
+    r = Resources(cloud='aws',
+                  image_id={
+                      'us-east-1': 'ami-0abcdef',
+                      'docker': 'myimage:latest',
+                  })
+    config = r.to_yaml_config()
+    assert config['image_id'] == {
+        'us-east-1': 'ami-0abcdef',
+        'docker': 'myimage:latest',
+    }
+    loaded = list(Resources.from_yaml_config(config))[0]
+    assert loaded.extract_docker_image() == 'myimage:latest'
+    assert loaded.get_cloud_image_id() == {'us-east-1': 'ami-0abcdef'}
+
+
+def test_image_id_dual_copy_preserves_both():
+    """Resources.copy() keeps both the cloud image and the docker image."""
+    r = Resources(cloud='aws',
+                  image_id={
+                      'us-east-1': 'ami-0abcdef',
+                      'docker': 'myimage:latest',
+                  })
+    copied = r.copy()
+    assert copied.extract_docker_image() == 'myimage:latest'
+    assert copied.get_cloud_image_id() == {'us-east-1': 'ami-0abcdef'}
+
+
+def test_image_id_dual_pickle_round_trip():
+    """Pickling preserves both images, and old pickles migrate cleanly."""
+    r = Resources(cloud='aws',
+                  image_id={
+                      'us-east-1': 'ami-0abcdef',
+                      'docker': 'myimage:latest',
+                  })
+    unpickled = pickle.loads(pickle.dumps(r))
+    assert unpickled.extract_docker_image() == 'myimage:latest'
+    assert unpickled.get_cloud_image_id() == {'us-east-1': 'ami-0abcdef'}
+
+    # Simulate an object pickled before _VERSION 34 (no _docker_image attr).
+    legacy = Resources(cloud='aws', region='us-east-1', image_id='ami-12345')
+    state = dict(legacy.__dict__)
+    state.pop('_docker_image', None)
+    state['_version'] = 33
+    migrated = Resources.__new__(Resources)
+    migrated.__setstate__(state)
+    assert migrated._docker_image is None
+
+
+def test_network_tier_basic():
+    """Test basic network tier functionality and validation."""
+    # Test with no network_tier specified (defaults to None)
+    r = Resources()
+    assert r.network_tier is None
+
+    # Test with standard network tier
+    r = Resources(network_tier='standard')
+    assert r.network_tier == resources_utils.NetworkTier.STANDARD
+
+    # Test with best network tier
+    r = Resources(network_tier='best')
+    assert r.network_tier == resources_utils.NetworkTier.BEST
+
+    # Test with NetworkTier enum directly
+    r = Resources(network_tier=resources_utils.NetworkTier.BEST)
+    assert r.network_tier == resources_utils.NetworkTier.BEST
+
+
+def test_network_tier_validation():
+    """Test network tier validation with invalid values."""
+    # Test invalid network tier string
+    with pytest.raises(ValueError, match='Invalid network_tier'):
+        Resources(network_tier='invalid')
+
+    # Test case insensitive validation
+    r = Resources(network_tier='BEST')
+    assert r.network_tier == resources_utils.NetworkTier.BEST
+
+    r = Resources(network_tier='Standard')
+    assert r.network_tier == resources_utils.NetworkTier.STANDARD
+
+
+def test_network_tier_comparison():
+    """Test network tier comparison in less_demanding_than method."""
+    # Test network tier matching
+    r1 = Resources(cloud=clouds.GCP(), network_tier='standard')
+    r2 = Resources(cloud=clouds.GCP(), network_tier='standard')
+    assert r1.less_demanding_than(r2)
+
+    # Test standard <= best
+    r1 = Resources(cloud=clouds.GCP(), network_tier='standard')
+    r2 = Resources(cloud=clouds.GCP(), network_tier='best')
+    assert r1.less_demanding_than(r2)
+
+    # Test best not <= standard
+    r1 = Resources(cloud=clouds.GCP(), network_tier='best')
+    r2 = Resources(cloud=clouds.GCP(), network_tier='standard')
+    assert not r1.less_demanding_than(r2)
+
+    # Test None network_tier vs specified
+    r1 = Resources(cloud=clouds.GCP(), network_tier='best')
+    r2 = Resources(cloud=clouds.GCP())  # No network_tier specified
+    assert not r1.less_demanding_than(r2)
+
+    # Test None network_tier (should accept anything)
+    r1 = Resources(cloud=clouds.GCP())  # No network_tier specified
+    r2 = Resources(cloud=clouds.GCP(), network_tier='best')
+    assert r1.less_demanding_than(r2)
+
+
+def test_network_tier_cloud_features():
+    """Test that network_tier=best requires CUSTOM_NETWORK_TIER feature."""
+    # Test standard tier doesn't require custom network tier feature
+    r = Resources(network_tier='standard')
+    features = r.get_required_cloud_features()
+    assert clouds.CloudImplementationFeatures.CUSTOM_NETWORK_TIER not in features
+
+    # Test best tier requires custom network tier feature
+    r = Resources(network_tier='best')
+    features = r.get_required_cloud_features()
+    assert clouds.CloudImplementationFeatures.CUSTOM_NETWORK_TIER in features
+
+
+def test_network_tier_yaml_serialization():
+    """Test network tier YAML serialization and deserialization."""
+    # Test best network tier
+    r = Resources(network_tier='best')
+    yaml_config = r.to_yaml_config()
+    assert yaml_config['network_tier'] == 'best'
+
+    loaded_resources = list(Resources.from_yaml_config(yaml_config))[0]
+    assert loaded_resources.network_tier == resources_utils.NetworkTier.BEST
+
+    # Test standard network tier
+    r = Resources(network_tier='standard')
+    yaml_config = r.to_yaml_config()
+    assert yaml_config['network_tier'] == 'standard'
+
+    loaded_resources = list(Resources.from_yaml_config(yaml_config))[0]
+    assert loaded_resources.network_tier == resources_utils.NetworkTier.STANDARD
+
+
+def test_network_tier_with_gcp():
+    """Test network tier functionality specifically with GCP cloud."""
+    # Test GCP supports both standard and best network tiers
+    r_standard = Resources(infra='gcp', network_tier='standard')
+    r_standard.validate()
+    assert r_standard.network_tier == resources_utils.NetworkTier.STANDARD
+
+    r_best = Resources(infra='gcp', network_tier='best')
+    r_best.validate()
+    assert r_best.network_tier == resources_utils.NetworkTier.BEST
+
+
+def test_network_tier_copy():
+    """Test network tier preservation in copy operations."""
+    r = Resources(network_tier='best', cpus=4)
+    r_copy = r.copy()
+    assert r_copy.network_tier == resources_utils.NetworkTier.BEST
+
+    # Test overriding network tier in copy
+    r_override = r.copy(network_tier='standard')
+    assert r_override.network_tier == resources_utils.NetworkTier.STANDARD
+    assert r_override.cpus == '4'  # Other properties preserved
+
+
+@pytest.mark.parametrize('value', [True, 2.0])
+def test_set_pod_resource_limits_task_config_override(value):
+    """set_pod_resource_limits in a task-level config block must survive.
+
+    Regression test for https://github.com/skypilot-org/skypilot/issues/9785:
+    the field was silently dropped by Resources.copy() (invoked during the
+    launch/optimize flow) because it was missing from
+    OVERRIDEABLE_CONFIG_KEYS_IN_TASK.
+    """
+    overrides = {'kubernetes': {'set_pod_resource_limits': value}}
+    r = Resources(infra='kubernetes',
+                  cpus=2,
+                  memory=8,
+                  _cluster_config_overrides=overrides)
+    assert r.cluster_config_overrides == overrides
+
+    # copy() is called during the launch/optimize flow; the override must be
+    # preserved rather than silently stripped.
+    r_copy = r.copy()
+    assert r_copy.cluster_config_overrides == overrides
+
+    # The read path used by make_deploy_resources_variables must see it.
+    read = skypilot_config.get_effective_workspace_region_config(
+        cloud='kubernetes',
+        region=None,
+        keys=('set_pod_resource_limits',),
+        default_value=False,
+        override_configs=r_copy.cluster_config_overrides)
+    assert read == value
+
+
+def test_network_tier_repr():
+    """Test that network tier appears in the string representation."""
+    r = Resources(network_tier='best')
+    repr_str = str(r)
+    assert 'network_tier=best' in repr_str
+
+    r = Resources(network_tier='standard')
+    repr_str = str(r)
+    assert 'network_tier=standard' in repr_str
+
+
+def test_autostop_config():
+    """Test autostop config override functionality."""
+    # Override with down=True when no existing autostop config
+    r = Resources()
+    assert r.autostop_config is None
+
+    r.override_autostop_config(down=True)
+    assert r.autostop_config is not None
+    assert r.autostop_config.enabled is True
+    assert r.autostop_config.down is True
+    assert r.autostop_config.idle_minutes == 0  # default value
+    assert r.autostop_config.wait_for == None  # default value
+
+    # Override with idle_minutes when no existing autostop config
+    r = Resources()
+    assert r.autostop_config is None
+
+    r.override_autostop_config(idle_minutes=10)
+    assert r.autostop_config is not None
+    assert r.autostop_config.enabled is True
+    assert r.autostop_config.down is False  # default value
+    assert r.autostop_config.idle_minutes == 10
+    assert r.autostop_config.wait_for == None  # default value
+
+    # Override with both down and idle_minutes when no existing config
+    r = Resources()
+    assert r.autostop_config is None
+
+    r.override_autostop_config(down=True,
+                               idle_minutes=15,
+                               wait_for=autostop_lib.AutostopWaitFor.JOBS)
+    assert r.autostop_config is not None
+    assert r.autostop_config.enabled is True
+    assert r.autostop_config.down is True
+    assert r.autostop_config.idle_minutes == 15
+    assert r.autostop_config.wait_for == autostop_lib.AutostopWaitFor.JOBS
+
+    # Override when there's an existing autostop config
+    r = Resources(autostop={
+        'idle_minutes': 20,
+        'down': False,
+        'wait_for': 'none'
+    })
+    assert r.autostop_config is not None
+    assert r.autostop_config.enabled is True
+    assert r.autostop_config.down is False
+    assert r.autostop_config.idle_minutes == 20
+    assert r.autostop_config.wait_for == autostop_lib.AutostopWaitFor.NONE
+
+    # Override only down flag
+    r.override_autostop_config(down=True)
+    assert r.autostop_config.enabled is True
+    assert r.autostop_config.down is True
+    assert r.autostop_config.idle_minutes == 20  # unchanged
+    assert r.autostop_config.wait_for == autostop_lib.AutostopWaitFor.NONE  # unchanged
+
+    # Override existing config with new idle_minutes
+    r = Resources(autostop={'idle_minutes': 25, 'down': True})
+    assert r.autostop_config.idle_minutes == 25
+    assert r.autostop_config.down is True
+
+    r.override_autostop_config(idle_minutes=30)
+    assert r.autostop_config.enabled is True
+    assert r.autostop_config.down is True  # unchanged
+    assert r.autostop_config.idle_minutes == 30
+
+    # Override existing config with all parameters
+    r = Resources(autostop={
+        'idle_minutes': 35,
+        'down': False,
+        'wait_for': 'jobs'
+    })
+    r.override_autostop_config(down=True,
+                               idle_minutes=40,
+                               wait_for=autostop_lib.AutostopWaitFor.NONE)
+    assert r.autostop_config.enabled is True
+    assert r.autostop_config.down is True
+    assert r.autostop_config.idle_minutes == 40
+    assert r.autostop_config.wait_for == autostop_lib.AutostopWaitFor.NONE
+
+    # Call override with default parameters (should do nothing)
+    r = Resources()
+    assert r.autostop_config is None
+
+    r.override_autostop_config()  # both parameters are default (False, None)
+    assert r.autostop_config is None  # should remain None
+
+    # Call override with default parameters on existing config
+    r = Resources(autostop={
+        'idle_minutes': 45,
+        'down': True,
+        'wait_for': 'none'
+    })
+    original_config = r.autostop_config
+
+    r.override_autostop_config()  # should do nothing
+    assert r.autostop_config is original_config  # same object
+    assert r.autostop_config.idle_minutes == 45  # unchanged
+    assert r.autostop_config.down is True  # unchanged
+    assert r.autostop_config.wait_for == autostop_lib.AutostopWaitFor.NONE  # unchanged
+
+    # Override with down=False (should still create config if none exists)
+    r = Resources()
+    assert r.autostop_config is None
+
+    r.override_autostop_config(
+        down=False,
+        idle_minutes=50,
+        wait_for=autostop_lib.AutostopWaitFor.JOBS_AND_SSH)
+    assert r.autostop_config is not None
+    assert r.autostop_config.enabled is True
+    assert r.autostop_config.down is False
+    assert r.autostop_config.idle_minutes == 50
+    assert r.autostop_config.wait_for == autostop_lib.AutostopWaitFor.JOBS_AND_SSH
+
+    # Test with disabled autostop config
+    r = Resources(autostop=False)
+    assert r.autostop_config is not None
+    assert r.autostop_config.enabled is False
+
+    r.override_autostop_config(down=True,
+                               idle_minutes=55,
+                               wait_for=autostop_lib.AutostopWaitFor.NONE)
+    assert r.autostop_config.enabled is False  # should remain disabled
+    assert r.autostop_config.down is True
+    assert r.autostop_config.idle_minutes == 55
+    assert r.autostop_config.wait_for == autostop_lib.AutostopWaitFor.NONE
+
+
+def test_disk_size_conversion():
+    """Test disk size conversion to GB."""
+    # Test integer input
+    r = Resources(disk_size=100)
+    assert r.disk_size == 100
+
+    # Test string input with different units
+    r = Resources(disk_size='100GB')
+    assert r.disk_size == 100
+
+    r = Resources(disk_size='1024MB')
+    assert r.disk_size == 1
+
+    r = Resources(disk_size='1TB')
+    assert r.disk_size == 1024
+
+    with pytest.raises(ValueError):
+        Resources(disk_size='1024KB')
+
+    with pytest.raises(ValueError):
+        Resources(disk_size='1024B')
+
+    r = Resources(disk_size='1PB')
+    assert r.disk_size == 1024 * 1024
+
+    # Test invalid format
+    with pytest.raises(ValueError):
+        Resources(disk_size='invalid')
+
+
+def test_memory_conversion():
+    """Test memory conversion to GB."""
+    # Test integer input
+    r = Resources(memory=8)
+    assert r.memory == '8'
+
+    # Test string input with different units
+    r = Resources(memory='8GB')
+    assert r.memory == '8.0'
+
+    r = Resources(memory='8192MB')
+    assert r.memory == '8.0'
+
+    r = Resources(memory='1TB+')
+    assert r.memory == '1024.0+'
+
+    r = Resources(memory='1PB')
+    assert r.memory == '1048576.0'
+
+    # Test with plus suffix
+    r = Resources(memory='8GB+')
+    assert r.memory == '8.0+'
+
+    # Test invalid format
+    with pytest.raises(ValueError):
+        Resources(memory='invalid')
+
+
+def test_autostop_time_format():
+    """Test autostop time format parsing."""
+    # Test minutes format
+    r = Resources(autostop='5m')
+    assert r.autostop_config.idle_minutes == 5
+
+    # Test hours format
+    r = Resources(autostop='2h')
+    assert r.autostop_config.idle_minutes == 120
+
+    # Test days format
+    r = Resources(autostop='1d')
+    assert r.autostop_config.idle_minutes == 1440
+
+    r = Resources(autostop=30)
+    assert r.autostop_config.idle_minutes == 30
+
+    # Test numeric format
+    r = Resources(autostop='60')
+    assert r.autostop_config.idle_minutes == 60
+
+    # Test invalid format
+    with pytest.raises(ValueError):
+        Resources(autostop='invalid')
+
+
+def test_priority_basic():
+    """Test basic priority field functionality."""
+    # Test with no priority specified (defaults to None)
+    r = Resources()
+    assert r.priority is None
+
+    # Test with valid priority values
+    r = Resources(priority=constants.MIN_PRIORITY)
+    assert r.priority == constants.MIN_PRIORITY
+
+    r = Resources(priority=constants.DEFAULT_PRIORITY)
+    assert r.priority == constants.DEFAULT_PRIORITY
+
+    r = Resources(priority=constants.MAX_PRIORITY)
+    assert r.priority == constants.MAX_PRIORITY
+
+    # Test with None explicitly
+    r = Resources(priority=None)
+    assert r.priority is None
+
+
+def test_priority_validation():
+    """Test priority field validation with invalid values."""
+    # Test invalid priority - below range
+    error_message = f'Priority must be between {constants.MIN_PRIORITY} and {constants.MAX_PRIORITY}'
+    with pytest.raises(ValueError, match=error_message):
+        Resources(priority=constants.MIN_PRIORITY - 1)
+
+    # Test invalid priority - above range
+    with pytest.raises(ValueError, match=error_message):
+        Resources(priority=constants.MAX_PRIORITY + 1)
+
+
+def test_priority_yaml_serialization():
+    """Test priority YAML serialization and deserialization."""
+    # Test priority serialization
+    r = Resources(priority=750)
+    yaml_config = r.to_yaml_config()
+    assert yaml_config['priority'] == 750
+
+    loaded_resources = list(Resources.from_yaml_config(yaml_config))[0]
+    assert loaded_resources.priority == 750
+
+    # Test None priority (should not appear in yaml)
+    r = Resources(priority=None)
+    yaml_config = r.to_yaml_config()
+    assert 'priority' not in yaml_config
+
+    # Test priority with other fields
+    r = Resources(cpus=4, memory='8', priority=200)
+    yaml_config = r.to_yaml_config()
+    assert yaml_config['priority'] == 200
+    assert yaml_config['cpus'] == '4'
+    assert yaml_config['memory'] == '8'
+
+    loaded_resources = list(Resources.from_yaml_config(yaml_config))[0]
+    assert loaded_resources.priority == 200
+    assert loaded_resources.cpus == '4'
+    assert loaded_resources.memory == '8'
+
+
+def test_priority_class_yaml_serialization():
+    """priority_class round-trips; construction allows both priority fields."""
+    r = Resources(priority_class='tier1')
+    assert r.priority is None
+    assert r.priority_class == 'tier1'
+    yaml_config = r.to_yaml_config()
+    assert yaml_config['priority_class'] == 'tier1'
+    loaded = list(Resources.from_yaml_config(yaml_config))[0]
+    assert loaded.priority_class == 'tier1'
+
+    r2 = Resources(priority=100, priority_class='tier1')
+    assert r2.priority == 100 and r2.priority_class == 'tier1'
+    y2 = r2.to_yaml_config()
+    assert y2['priority'] == 100 and y2['priority_class'] == 'tier1'
+
+
+def test_priority_copy():
+    """Test priority preservation in copy operations."""
+    r = Resources(priority=300, cpus=4)
+    r_copy = r.copy()
+    assert r_copy.priority == 300
+
+    # Test overriding priority in copy
+    r_override = r.copy(priority=600)
+    assert r_override.priority == 600
+    assert r_override.cpus == '4'  # Other properties preserved
+
+    # Test copying with None priority
+    r_none = Resources(priority=None, cpus=2)
+    r_copy = r_none.copy()
+    assert r_copy.priority is None
+
+    # Test overriding None priority in copy
+    r_override = r_none.copy(priority=100)
+    assert r_override.priority == 100
+    assert r_override.cpus == '2'
+
+
+def test_priority_with_any_of():
+    """Test priority field works with any_of configuration."""
+    config = {
+        'priority': constants.DEFAULT_PRIORITY,  # Base priority
+        'any_of': [
+            {
+                'cpus': 8,
+                'memory': 16
+            },
+            {
+                'cpus': 4,
+                'memory': 32,
+                'priority': 800  # Override priority
+            },
+        ]
+    }
+    resources_set = Resources.from_yaml_config(config)
+
+    assert isinstance(resources_set, set)
+    assert len(resources_set) == 2
+
+    resources_list = list(resources_set)
+
+    # Find resources by properties
+    r_cpus8 = next((r for r in resources_list if r.cpus == '8'), None)
+    r_cpus4 = next((r for r in resources_list if r.cpus == '4'), None)
+
+    assert r_cpus8 is not None
+    assert r_cpus8.priority == constants.DEFAULT_PRIORITY  # Base priority
+
+    assert r_cpus4 is not None
+    assert r_cpus4.priority == 800  # Override priority
+
+
+def test_priority_with_ordered():
+    """Test priority field works with ordered configuration."""
+    config = {
+        'priority': 300,  # Base priority
+        'ordered': [
+            {
+                'infra': 'gcp',
+                'accelerators': 'A100:8'
+            },
+            {
+                'infra': 'aws',
+                'accelerators': 'V100:8',
+                'priority': 700  # Override priority
+            },
+        ]
+    }
+    resources_list = Resources.from_yaml_config(config)
+
+    assert isinstance(resources_list, list)
+    assert len(resources_list) == 2
+
+    # Ordered resources should preserve order
+    assert resources_list[0].infra.cloud.lower() == 'gcp'
+    assert resources_list[0].priority == 300  # Base priority
+
+    assert resources_list[1].infra.cloud.lower() == 'aws'
+    assert resources_list[1].priority == 700  # Override priority
+
+
+@pytest.mark.parametrize(['resources_kwargs', 'expected_yaml_config'], [
+    ({
+        'infra': 'aws/us-east-1',
+        'accelerators': 'A10',
+        'priority': 400
+    }, {
+        'infra': 'aws/us-east-1',
+        'accelerators': {
+            'A10': 1
+        },
+        'priority': 400,
+    }),
+    ({
+        'cpus': 4,
+        'memory': '8+',
+        'priority': 0
+    }, {
+        'cpus': '4',
+        'memory': '8+',
+        'priority': 0,
+    }),
+    ({
+        'cpus': 2,
+        'priority': 1000
+    }, {
+        'cpus': '2',
+        'priority': 1000,
+    }),
+])
+def test_priority_to_yaml_and_load(resources_kwargs, expected_yaml_config):
+    """Test priority field in to_yaml_config and from_yaml_config."""
+    r = Resources(**resources_kwargs)
+    yaml_config = r.to_yaml_config()
+    assert yaml_config == expected_yaml_config
+
+    loaded_r = list(Resources.from_yaml_config(yaml_config))[0]
+    assert loaded_r.priority == r.priority
+    assert loaded_r.cpus == r.cpus
+    if 'accelerators' in expected_yaml_config:
+        assert loaded_r.accelerators == r.accelerators
+
+
+@pytest.mark.parametrize(
+    'r_kwargs, blocked_kwargs, expected',
+    [
+        # All fields match
+        ({
+            'cloud': clouds.AWS(),
+            'instance_type': 'p3.2xlarge',
+            'region': 'us-west-2',
+            'zone': 'us-west-2a',
+            'accelerators': {
+                'V100': 1
+            },
+            'use_spot': True
+        }, {
+            'cloud': clouds.AWS(),
+            'instance_type': 'p3.2xlarge',
+            'region': 'us-west-2',
+            'zone': 'us-west-2a',
+            'accelerators': {
+                'V100': 1
+            },
+            'use_spot': True
+        }, True),
+        # use_spot mismatch
+        ({
+            'cloud': clouds.AWS(),
+            'instance_type': 'p3.2xlarge',
+            'region': 'us-west-2',
+            'zone': 'us-west-2a',
+            'accelerators': {
+                'V100': 1
+            },
+            'use_spot': True
+        }, {
+            'cloud': clouds.AWS(),
+            'instance_type': 'p3.2xlarge',
+            'region': 'us-west-2',
+            'zone': 'us-west-2a',
+            'accelerators': {
+                'V100': 1
+            },
+            'use_spot': False
+        }, False),
+        # cloud mismatch
+        ({
+            'cloud': clouds.AWS(),
+            'instance_type': 'p3.2xlarge',
+            'region': 'us-west-2',
+            'zone': 'us-west-2a',
+            'accelerators': {
+                'V100': 1
+            },
+        }, {
+            'cloud': clouds.GCP(),
+            'instance_type': 'g2-standard-4',
+            'region': 'us-east4',
+            'zone': 'us-east4-c',
+            'accelerators': {
+                'L4': 1
+            },
+        }, False),
+        # instance_type mismatch
+        ({
+            'cloud': clouds.AWS(),
+            'instance_type': 'p3.2xlarge',
+            'region': 'us-west-2',
+            'zone': 'us-west-2a',
+            'accelerators': {
+                'V100': 1
+            },
+            'use_spot': True
+        }, {
+            'cloud': clouds.AWS(),
+            'instance_type': 'p3.8xlarge',
+            'region': 'us-west-2',
+            'zone': 'us-west-2a',
+            'accelerators': {
+                'V100': 1
+            },
+            'use_spot': True
+        }, False),
+    ])
+def test_should_be_blocked_by(r_kwargs, blocked_kwargs, expected):
+    """Test should_be_blocked_by method."""
+    r = Resources(**r_kwargs)
+    blocked = Resources(**blocked_kwargs)
+    assert r.should_be_blocked_by(blocked) == expected
+
+
+@mock.patch(
+    'sky.provision.kubernetes.utils.check_port_forward_mode_dependencies')
+def test_ssh_end_to_end_make_deploy_variables(mock_check_deps,
+                                              enable_all_clouds) -> None:
+    """End-to-end test: SSH cloud reads pod_config and provision_timeout from 'ssh' config.
+
+    This test verifies that when launching an SSH cluster, the entire flow
+    (from Resources.make_deploy_variables through SSH.make_deploy_resources_variables)
+    correctly reads configuration from the 'ssh' section and NOT from 'kubernetes' section.
+    """
+    # Set up config with both SSH and Kubernetes sections
+    os.environ[
+        skypilot_config.
+        ENV_VAR_SKYPILOT_CONFIG] = './tests/test_yamls/test_ssh_pod_config.yaml'
+    importlib.reload(skypilot_config)
+
+    # Create SSH cloud and resources
+    ssh_cloud = clouds.SSH()
+    cluster_name = resources_utils.ClusterName(display_name='ssh-test',
+                                               name_on_cloud='ssh-test')
+    region = clouds.Region(name='ssh-test-cluster')
+    zones = None
+    resource = Resources(cloud=ssh_cloud, instance_type='2CPU--4GB')
+
+    # Call make_deploy_variables - this is the entry point for the entire flow
+    config = resource.make_deploy_variables(cluster_name,
+                                            region,
+                                            zones,
+                                            num_nodes=1,
+                                            dryrun=True)
+
+    # Verify that provision_timeout comes from SSH config (7200), not K8s config (3600)
+    assert config['timeout'] == '7200', \
+        f"Should use SSH provision_timeout (7200), not Kubernetes (3600). Got: {config['timeout']}"
+
+    # The main assertion is timeout - pod_config merging happens elsewhere in the flow
+
+    # Clean up
+    del os.environ[skypilot_config.ENV_VAR_SKYPILOT_CONFIG]
+    importlib.reload(skypilot_config)
+
+
+def test_resources_add_subtract_cpu_only():
+    """Test adding and subtracting Resources with only CPU."""
+    r1 = Resources(cpus='2')
+    r2 = Resources(cpus='3')
+
+    # Test addition
+    result = r1 + r2
+    assert result is not None
+    assert result.cpus == '5.0'
+    assert result.memory is None
+    assert result.accelerators is None
+
+    # Test subtraction
+    result = r2 - r1
+    assert result is not None
+    assert result.cpus == '1.0'
+    assert result.memory is None
+    assert result.accelerators is None
+
+    # Test subtraction that results in 0
+    result = r1 - r1
+    assert result is not None
+    assert result.cpus is None  # 0 becomes None
+    assert result.memory is None
+    assert result.accelerators is None
+
+    # Test subtraction that would be negative (should clamp to 0/None)
+    result = r1 - r2
+    assert result is not None
+    assert result.cpus is None  # -1 becomes None (0 clamped)
+    assert result.memory is None
+    assert result.accelerators is None
+
+
+def test_resources_add_subtract_cpu_memory():
+    """Test adding and subtracting Resources with CPU and memory."""
+    r1 = Resources(cpus='2', memory='8')
+    r2 = Resources(cpus='3', memory='16')
+
+    # Test addition
+    result = r1 + r2
+    assert result is not None
+    assert result.cpus == '5.0'
+    assert result.memory == '24.0'
+    assert result.accelerators is None
+
+    # Test subtraction
+    result = r2 - r1
+    assert result is not None
+    assert result.cpus == '1.0'
+    assert result.memory == '8.0'
+    assert result.accelerators is None
+
+    # Test with None in one operand
+    r3 = Resources(cpus='2')
+    result = r1 + r3
+    assert result is not None
+    assert result.cpus == '4.0'
+    assert result.memory == '8.0'  # Preserved from r1
+    assert result.accelerators is None
+
+
+def test_resources_add_subtract_accelerators():
+    """Test adding and subtracting Resources with accelerators."""
+    r1 = Resources(accelerators={'V100': 2})
+    r2 = Resources(accelerators={'V100': 3})
+
+    # Test addition
+    result = r1 + r2
+    assert result is not None
+    assert result.cpus is None
+    assert result.memory is None
+    assert result.accelerators == {'V100': 5.0}
+
+    # Test subtraction
+    result = r2 - r1
+    assert result is not None
+    assert result.cpus is None
+    assert result.memory is None
+    assert result.accelerators == {'V100': 1.0}
+
+    # Test subtraction that results in 0 (should be removed)
+    result = r1 - r1
+    assert result is not None
+    assert result.cpus is None
+    assert result.memory is None
+    assert result.accelerators is None
+
+    # Test with different accelerator types
+    r3 = Resources(accelerators={'A100': 1})
+    result = r1 + r3
+    assert result is not None
+    assert result.accelerators == {'V100': 2.0, 'A100': 1.0}
+
+    # Test subtraction with different accelerator types
+    result = r1 - r3
+    assert result is not None
+    assert result.accelerators == {'V100': 2.0}  # A100 not in r1, so unchanged
+
+
+def test_resources_add_subtract_mixed():
+    """Test adding Resources with different combinations."""
+    # Start with all 3 resource types
+    r_base = Resources(cpus='4', memory='16', accelerators={'V100': 2})
+
+    # Add one with only memory
+    r_memory = Resources(memory='8')
+    result = r_base + r_memory
+    assert result is not None
+    assert result.cpus == '4.0'  # Preserved from r_base
+    assert result.memory == '24.0'  # 16 + 8
+    assert result.accelerators == {'V100': 2.0}  # Preserved from r_base
+
+    # Add one with only accelerator
+    r_accel = Resources(accelerators={'A100': 1})
+    result = result + r_accel
+    assert result is not None
+    assert result.cpus == '4.0'  # Still preserved
+    assert result.memory == '24.0'  # Still preserved
+    assert result.accelerators == {
+        'V100': 2.0,
+        'A100': 1.0
+    }  # Both accelerators
+
+    # Test subtraction with mixed resources
+    r_subtract = Resources(cpus='2', memory='8', accelerators={'V100': 1})
+    result = r_base - r_subtract
+    assert result is not None
+    assert result.cpus == '2.0'  # 4 - 2
+    assert result.memory == '8.0'  # 16 - 8
+    assert result.accelerators == {'V100': 1.0}  # 2 - 1
+
+    # Test subtracting None
+    result = r_base - None
+    assert result is not None
+    assert result.cpus == '4'
+    assert result.memory == '16'
+    assert result.accelerators == {'V100': 2.0}
+
+
+def test_resources_add_subtract_with_none():
+    """Test adding and subtracting with None operands."""
+    r1 = Resources(cpus='2', memory='8', accelerators={'V100': 1})
+
+    # Adding None should return self
+    result = r1 + None
+    assert result is not None
+    assert result.cpus == '2'
+    assert result.memory == '8'
+    assert result.accelerators == {'V100': 1.0}
+
+    # Subtracting None should return self
+    result = r1 - None
+    assert result is not None
+    assert result.cpus == '2'
+    assert result.memory == '8'
+    assert result.accelerators == {'V100': 1.0}
+
+
+def test_inferred_resource_not_copied():
+    """Test that when accelerator is None and only inferred by machine type,
+    the inferred accelerator values are not copied."""
+    r1 = Resources(instance_type='a2-highgpu-1g', cloud=clouds.GCP())
+    assert r1.accelerators == {'A100': 1}
+    assert r1._accelerators is None
+
+    override = {'instance_type': 'g2-standard-4'}
+    r2 = r1.copy(**override)
+    assert r2.accelerators == {'L4': 1}
+    assert r2._accelerators is None
+
+
+@mock.patch(
+    'sky.provision.kubernetes.utils.check_port_forward_mode_dependencies')
+def test_kubernetes_end_to_end_make_deploy_variables(mock_check_deps,
+                                                     enable_all_clouds) -> None:
+    """End-to-end test: Kubernetes cloud reads config from 'kubernetes' section.
+
+    This test complements test_ssh_end_to_end_make_deploy_variables by verifying
+    that Kubernetes cloud reads from 'kubernetes' section (not 'ssh' section).
+    """
+    # Set up config with both SSH and Kubernetes sections
+    os.environ[
+        skypilot_config.
+        ENV_VAR_SKYPILOT_CONFIG] = './tests/test_yamls/test_ssh_pod_config.yaml'
+    importlib.reload(skypilot_config)
+
+    # Create Kubernetes cloud and resources
+    k8s_cloud = clouds.Kubernetes()
+    cluster_name = resources_utils.ClusterName(display_name='k8s-test',
+                                               name_on_cloud='k8s-test')
+    region = clouds.Region(name='test-k8s-cluster')
+    zones = None
+    resource = Resources(cloud=k8s_cloud, instance_type='2CPU--4GB')
+
+    # Call make_deploy_variables
+    config = resource.make_deploy_variables(cluster_name,
+                                            region,
+                                            zones,
+                                            num_nodes=1,
+                                            dryrun=True)
+
+    # Verify that provision_timeout comes from Kubernetes config (3600), not SSH (7200)
+    assert config['timeout'] == '3600', \
+        f"Should use Kubernetes provision_timeout (3600), not SSH (7200). Got: {config['timeout']}"
+
+    # The main assertion is timeout - pod_config merging happens elsewhere in the flow
+
+    # Clean up
+    del os.environ[skypilot_config.ENV_VAR_SKYPILOT_CONFIG]
+    importlib.reload(skypilot_config)

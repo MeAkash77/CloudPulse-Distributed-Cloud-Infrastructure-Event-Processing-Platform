@@ -1,0 +1,101 @@
+import { apiClient } from '@/data/connectors/client';
+import { getErrorMessageFromResponse } from '@/data/utils';
+
+export async function getVolumes() {
+  try {
+    const data = await apiClient.fetch('/volumes', {}, 'GET');
+    // Transform the data to match the expected format
+    const transformedData =
+      data.map((volume) => {
+        // Build infra field from cloud, region, zone
+        let infra = volume.cloud || '';
+        if (volume.region) {
+          infra += `/${volume.region}`;
+        }
+        if (volume.zone) {
+          infra += `/${volume.zone}`;
+        }
+
+        return {
+          name: volume.name,
+          launched_at: volume.launched_at,
+          user_hash: volume.user_hash,
+          user_name: volume.user_name || '-',
+          workspace: volume.workspace || '-',
+          last_attached_at: volume.last_attached_at,
+          status: volume.status,
+          type: volume.type,
+          cloud: volume.cloud,
+          region: volume.region,
+          zone: volume.zone,
+          infra: infra,
+          size: volume.size,
+          config: volume.config,
+          storage_class: volume.config?.storage_class_name || '-',
+          access_mode: volume.config?.access_mode || '-',
+          namespace: volume.config?.namespace || '-',
+          name_on_cloud: volume.name_on_cloud,
+          usedby_pods: volume.usedby_pods,
+          usedby_clusters: volume.usedby_clusters,
+          last_use: volume.last_use || null,
+          error_message: volume.error_message || null,
+          // Whether the error above is one the volume can recover from. Servers
+          // older than this field report nothing, which reads as undefined --
+          // distinct from a definite false, so callers can tell "will not bind"
+          // from "cannot tell".
+          error_may_resolve: volume.error_may_resolve,
+          creation_yaml: volume.creation_yaml || null,
+          // Only set while the volume is being resized: `size` above is the
+          // capacity it has now, which is not what was asked for until the
+          // resize lands. Servers older than these fields report nothing.
+          resize_status: volume.resize_status || null,
+          resize_target_size: volume.resize_target_size ?? null,
+          resize_message: volume.resize_message || null,
+        };
+      }) || [];
+
+    return transformedData;
+  } catch (error) {
+    console.error('Failed to fetch volumes:', error);
+    throw error;
+  }
+}
+
+export async function deleteVolume(volumeName, { purge = false } = {}) {
+  let msg = '';
+  try {
+    const response = await apiClient.post('/volumes/delete', {
+      names: [volumeName],
+      purge,
+    });
+    if (!response.ok) {
+      console.error(
+        `Initial API request to delete volume failed with status ${response.status}`
+      );
+      return {
+        success: false,
+        msg: `Failed to delete volume with status ${response.status}`,
+      };
+    }
+    const id = response.headers.get('X-SkyPilot-Request-ID');
+    if (!id) {
+      console.error('No request ID received from server for deleting volume');
+      return {
+        success: false,
+        msg: 'No request ID received from server for deleting volume',
+      };
+    }
+    const fetchedData = await apiClient.get(`/api/get?request_id=${id}`);
+    if (!fetchedData.ok) {
+      const errorMessage = await getErrorMessageFromResponse(fetchedData);
+      msg = `Failed to delete volume with status ${fetchedData.status}, error: ${errorMessage}`;
+      console.error(msg);
+      return { success: false, msg: msg };
+    }
+    return { success: true };
+  } catch (error) {
+    msg = `Failed to delete volume: ${error}`;
+    console.error(msg);
+    return { success: false, msg: msg };
+  }
+}

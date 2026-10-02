@@ -1,0 +1,691 @@
+.. _slurm-getting-started:
+
+Getting Started on Slurm
+========================
+
+.. note::
+
+    Slurm support is under active development. We'd love to hear from you —
+    please `fill out this form <https://forms.gle/rfdWQcd9oQgp41Hm8>`_.
+
+Quickstart
+----------
+Have SSH access to a Slurm cluster? Get started with SkyPilot in 3 steps:
+
+.. code-block:: bash
+
+   # 1. Configure your Slurm cluster in ~/.slurm/config
+   $ mkdir -p ~/.slurm && cat > ~/.slurm/config << EOF
+   Host mycluster
+       HostName login.mycluster1.myorg.com
+       User myusername
+       IdentityFile ~/.ssh/id_rsa
+   EOF
+
+   # 2. Verify SkyPilot detects your Slurm cluster
+   $ sky check
+   # Shows "Slurm: enabled"
+
+   # 3. Launch your first SkyPilot task
+   $ sky launch --gpus H100:1 -- nvidia-smi
+
+For detailed instructions, prerequisites, and advanced features, read on.
+
+Prerequisites
+-------------
+
+To connect and use a Slurm cluster, SkyPilot needs SSH access to the Slurm login node (where you can run ``sbatch``, ``squeue``, etc.).
+
+In a typical workflow:
+
+1. A cluster administrator sets up a Slurm cluster and provides users with SSH access to the login node.
+
+2. Users configure the ``~/.slurm/config`` file with connection details for their Slurm cluster(s).
+   SkyPilot reads this configuration file to communicate with the cluster(s).
+
+Configuring Slurm clusters
+--------------------------
+
+SkyPilot uses an SSH config-style file at ``~/.slurm/config`` to connect to Slurm clusters.
+Each host entry in this file represents a Slurm cluster.
+
+Create the configuration file:
+
+.. code-block:: bash
+
+   $ mkdir -p ~/.slurm
+
+   $ cat > ~/.slurm/config << EOF
+   # Example Slurm cluster configuration
+   Host mycluster1
+       HostName login.mycluster1.myorg.com
+       User myusername
+       IdentityFile ~/.ssh/id_rsa
+       # Optional: Port 22
+       # Optional: ProxyJump jumphost
+       # Optional: ProxyCommand ssh -W %h:%p jumphost
+
+   # Optional: Add more clusters if you have multiple Slurm clusters
+   Host mycluster2
+       HostName login.mycluster2.myorg.com
+       User myusername
+       IdentityFile ~/.ssh/id_rsa
+   EOF
+
+.. note::
+
+    ``HostName`` and ``User`` are required fields. ``IdentityFile`` is optional;
+    if not specified, SSH will use keys from ssh-agent or default key locations
+    (e.g., ``~/.ssh/id_rsa``, ``~/.ssh/id_ed25519``).
+
+Verify your SSH connection works by running:
+
+.. code-block:: bash
+
+   $ ssh -F ~/.slurm/config <cluster_name> "sinfo"
+
+Launching your first task
+-------------------------
+.. _slurm-instructions:
+
+Once you have configured your Slurm cluster:
+
+1. Run :code:`sky check` and verify that Slurm is enabled in SkyPilot.
+
+   .. code-block:: console
+
+     $ sky check
+
+     Checking credentials to enable clouds for SkyPilot.
+     ...
+     Slurm: enabled
+       Allowed clusters:
+         ✔ mycluster1
+         ✔ mycluster2
+     ...
+
+
+2. You can now run any SkyPilot task on your Slurm cluster.
+
+   .. code-block:: console
+
+        $ sky launch --cpus 2 task.yaml
+        == Optimizer ==
+        Target: minimizing cost
+        Estimated cost: $0.0 / hour
+
+        Considered resources (1 node):
+        ---------------------------------------------------------------------------------------------------
+         INFRA                   INSTANCE          vCPUs   Mem(GB)   GPUS     COST ($)   CHOSEN
+        ---------------------------------------------------------------------------------------------------
+         Slurm (mycluster1)      -                 2       4         -        0.00          ✔
+         Slurm (mycluster2)      -                 2       4         -        0.00
+         Kubernetes (myk8s)      -                 2       4         -        0.00
+         AWS (us-east-1)         m6i.large         2       8         -        0.10
+         GCP (us-central1-a)     n2-standard-2     2       8         -        0.10
+        ---------------------------------------------------------------------------------------------------
+
+   SkyPilot will submit a job to your Slurm cluster using ``sbatch``.
+
+3. To run on a specific Slurm cluster or partition, use the ``--infra`` flag:
+
+   .. code-block:: bash
+
+      $ sky launch --infra slurm/mycluster/mypartition task.yaml
+
+
+Viewing cluster status
+----------------------
+
+To view the status of your SkyPilot clusters on Slurm:
+
+.. code-block:: console
+
+    $ sky status
+    NAME         LAUNCHED    RESOURCES                    STATUS   AUTOSTOP  COMMAND
+    my-task      10 mins ago Slurm(mycluster1, 2CPU--4GB) UP       -         sky launch...
+
+To terminate a cluster (cancels the underlying Slurm job):
+
+.. code-block:: console
+
+    $ sky down my-task
+
+
+Using GPUs
+----------
+
+To request GPUs on your Slurm cluster, specify the accelerator in your task YAML:
+
+.. code-block:: yaml
+
+    # task.yaml
+    resources:
+      accelerators: H200:1
+
+    run: |
+      nvidia-smi
+
+Or via the command line:
+
+.. code-block:: bash
+
+    $ sky launch --gpus H200:1 -- nvidia-smi
+
+SkyPilot will translate this to the appropriate ``--gres=gpu:`` directive for Slurm.
+
+.. note::
+
+    The GPU type name should match what's configured in your Slurm cluster's GRES configuration.
+    Common names include ``H100``, ``H200``, ``L4`` etc.
+
+
+Viewing GPU availability
+------------------------
+
+SkyPilot provides a unified dashboard to monitor GPU availability and utilization across **all** your Slurm clusters.
+
+To open the dashboard:
+
+.. code-block:: bash
+
+    $ sky dashboard
+
+Navigate to the **Infra** tab to see the real-time GPU availability across all your Slurm clusters:
+
+.. image:: /images/slurm-infra-page.png
+   :alt: SkyPilot Dashboard showing Slurm GPU availability overview
+   :width: 100%
+
+|
+
+Click on a cluster name to see detailed GPU availability per node:
+
+.. image:: /images/slurm-cluster-details-page.png
+   :alt: SkyPilot Dashboard showing Slurm cluster GPU details
+   :width: 100%
+
+|
+
+You can also view GPU availability from the CLI:
+
+.. code-block:: console
+
+    $ sky gpus list --infra slurm
+    Slurm GPUs
+    GPU    UTILIZATION
+    L40S   3 of 8 free
+    GH200  1 of 2 free
+    H100   8 of 8 free
+
+    Slurm Cluster: mycluster1
+    GPU   REQUESTABLE_QTY_PER_NODE  UTILIZATION
+    L40S  1, 2, 4                   3 of 8 free
+
+    Slurm Cluster: mycluster2
+    GPU    REQUESTABLE_QTY_PER_NODE  UTILIZATION
+    GH200  1                         1 of 2 free
+
+    Slurm Cluster: mycluster3
+    GPU   REQUESTABLE_QTY_PER_NODE  UTILIZATION
+    H100  1, 2, 4, 8                8 of 8 free
+
+    Slurm per node GPU availability
+    CLUSTER     NODE            PARTITION  STATE  GPU   UTILIZATION
+    mycluster1  ip-10-3-132-97  dev*,gpus  mix    L40S  1 of 4 free
+    mycluster1  ip-10-3-168-59  dev*,gpus  mix    L40S  2 of 4 free
+    ...
+
+
+Shared filesystem (NFS)
+-----------------------
+
+Most Slurm clusters have a shared filesystem (typically NFS) that is mounted on all compute nodes.
+SkyPilot leverages this existing setup - your home directory and files are automatically accessible
+from your SkyPilot clusters and jobs.
+
+This means your code, data, and outputs are available on all nodes without any additional configuration.
+
+If you have local files you want to use on the remote cluster, you can sync them from your local machine to the remote cluster using :ref:`file mounts and workdir <sync-code-artifacts>`.
+
+
+Configuring allowed clusters
+----------------------------
+
+By default, SkyPilot will use all clusters defined in ``~/.slurm/config``.
+To restrict which clusters SkyPilot can use, add the following to your ``~/.sky/config.yaml``:
+
+.. code-block:: yaml
+
+    slurm:
+      allowed_clusters:
+        - mycluster1
+        - mycluster2
+
+
+.. _slurm-submit-as-user:
+
+Submitting as authenticated users
+---------------------------------
+
+A shared SkyPilot API server can connect to Slurm with one privileged SSH
+credential while owning each job under the authenticated user's Unix account.
+Enable this behavior in the API server's configuration:
+
+.. code-block:: yaml
+
+    slurm:
+      submit_as_user: true
+
+Configure each Slurm host entry with the shared SSH user and private key. The
+SSH user must be ``root`` (using ``runuser``) or have passwordless ``sudo``
+permission for the submission and file operations described below:
+
+.. code-block:: text
+
+    Host mycluster
+        HostName login.mycluster.myorg.com
+        User slurm-admin
+        IdentityFile ~/.ssh/slurm_admin
+
+For a non-root SSH user, SkyPilot invokes individual executables as the
+submitting account, for example ``sudo -n -H -u alice -- sbatch ...``.
+Shell orchestration runs as the SSH account; setup scripts and interactive
+sessions run inside allocations through ``srun``.
+
+Allow the following executables as the workload accounts:
+
+* ``sbatch``, ``srun``, ``scancel``, and ``squeue`` for allocation operations.
+* ``scontrol -o show step`` for inspecting steps before container snapshots.
+* ``id -un`` for identity validation and ``stat -f -c %T`` for shared-directory
+  checks.
+* ``mkdir``, ``test``, ``cat``, ``tail``, ``mv``, ``rm``, ``find``, and
+  ``rsync --server`` for shared files. Restrict their arguments to the
+  required operations and paths.
+
+The shared files live under ``<workdir>/.sky_provision`` (submission scripts
+and batch logs), ``<workdir>/.sky_clusters/<cluster>`` (workdir, logs, and
+readiness), and ``<workdir>/.sky_snapshots/<cluster>`` (container snapshots).
+``workdir`` defaults to the target account's home directory. The node-local
+runtime directory is accessed inside the allocation using ``srun``.
+
+:download:`Download an example sudoers policy <slurm-sudoers.example>` for SSH
+account ``skypilot`` and workload accounts in group ``skyusers``, using each
+account's home directory as the shared base. It requires sudo 1.9.10 or later
+for argument regexes; Ubuntu 25.10 and later install sudo-rs as ``sudo``, which
+rejects these rules, so select the classic build with
+``update-alternatives --set sudo /usr/bin/sudo.ws``. Adjust the executable
+locations, group name, and paths,
+install the file with root ownership and mode ``0440``, and check it
+with ``visudo -cf``. The rsync rule lists explicit server arguments; different
+rsync versions may require an adjusted rule based on sudo's log. The ``rm`` rule
+also permits ``--one-file-system`` so recursive cleanup can skip nested
+filesystems, such as bucket mounts that could not be unmounted.
+
+:download:`Download a smaller policy <slurm-sudoers-minimal.example>` if you
+only need fresh launches, ``sky exec``, ``sky logs``, managed jobs, and
+``sky down``. It omits ``scontrol``, ``mv``, ``find``, ``rm``, and access to
+``.sky_snapshots``. ``sky down`` needs no ``rm``: the batch script's cleanup
+trap removes ``<workdir>/.sky_clusters/<cluster>`` from inside the allocation,
+as the job owner. The login node removes that directory only as a fallback,
+when the allocation ended without running the trap (for example a lost node);
+the smaller policy denies that fallback and leaves the directory for manual
+cleanup. Use the full policy for container ``sky stop``, snapshot restore with
+``sky start`` or ``sky launch``, and autostop. Autodown, which tears down the
+allocation without saving a snapshot, uses the smaller policy.
+
+Fresh clusters skip snapshot reads and use a unique snapshot directory, so
+leftover snapshots from a deleted cluster cannot be restored by a same-name
+launch. Snapshot cleanup failures after cancellation produce a warning
+without failing ``sky down``; snapshot files may remain and require manual
+cleanup. Snapshot reads for previously running clusters and container
+stop/start operations remain strict to protect saved state.
+
+The file-operation rules reject additional arguments and ``.``/``..`` path
+components.
+Argument matching does not resolve symlinks or constrain file names carried
+inside the rsync protocol. These rules are executable and argument controls,
+not a filesystem sandbox. Keep the rsync installation patched and use workload
+accounts whose accessible data matches the intended trust boundary.
+The path regexes accept any account's base, so the SSH account can invoke a
+file operation as one group member against another member's path; the target
+account's filesystem permissions still apply.
+
+Restrict run-as identities to workload accounts without administrative
+privileges. Any privileges available to those accounts are transitively
+available to the shared SSH account. Avoid ``(ALL, !root)``: it permits
+impersonating Slurm's administrative account. Use an explicit account or a
+dedicated group. ``Defaults:skypilot !requiretty`` permits noninteractive sudo
+operations by the SSH account ``skypilot``.
+
+Slurm executables must be available in sudo's ``secure_path`` (or the SSH
+account's ``PATH`` for a root transport). Configure site-specific binary paths
+there. Target-user login profiles are not sourced. Configure a shared
+``workdir``/``tmpdir`` explicitly when needed; ``$HOME``, ``$USER``, and
+``$LOGNAME`` resolve to the target account, while other expansion variables
+come from the SSH account's environment. For example, set
+``workdir: /training/$USER/sky-workdir`` and follow the policy's comment to swap
+the matching path prefix. Load workload modules in the task's ``setup`` or
+``run`` commands.
+
+SkyPilot maps the authenticated username to the portion before ``@``. For
+example, ``alice@example.com`` maps to the Unix account ``alice``. The account
+must already exist on the Slurm login and compute nodes. SkyPilot submits,
+queries, and cancels the user's allocations, runs host commands, transfers
+files, and starts host SSH sessions as that user. Container commands and SSH
+sessions run as root inside the container, while the Slurm allocation remains
+owned by the mapped user. An invalid or missing account, a sudo password
+prompt, or denied sudo permission causes the operation to fail instead of
+falling back to the SSH user.
+
+Cluster-wide inventory and observability run as the shared SSH user configured
+in ``~/.slurm/config``. That user must have permission to view the required
+Slurm node, partition, and job information.
+
+To enable the behavior for one cluster, set it under ``cluster_configs``:
+
+.. code-block:: yaml
+
+    slurm:
+      cluster_configs:
+        mycluster:
+          submit_as_user: true
+
+The per-cluster value overrides the global value. See
+:ref:`slurm.submit_as_user <config-yaml-slurm-submit-as-user>` for the full
+configuration reference.
+
+
+.. _slurm-pricing:
+
+Configuring pricing
+-------------------
+
+By default, Slurm virtual instance types report a cost of ``$0.00`` in
+``sky launch``, ``sky status``, and ``sky gpus list``.
+
+To display meaningful cost estimates, add hourly rates in your
+``~/.sky/config.yaml``:
+
+.. code-block:: yaml
+
+    slurm:
+      pricing:
+        cpu: 0.04        # $/vCPU/hr  (CPU-only instances)
+        memory: 0.01     # $/GB/hr    (CPU-only instances)
+        accelerators:
+          V100: 2.50     # $/accelerator/hr (all-in, includes cpu/memory)
+          A100: 3.50
+
+Pricing uses two mutually exclusive tiers: **CPU-only instances** (no
+accelerator) use the ``cpu`` and ``memory`` rates, while **accelerator
+instances** use only the per-accelerator rate (an all-in price that includes
+cpu and memory). All fields are optional; unset fields contribute ``$0.00``.
+
+You can also set different pricing per cluster and per partition using
+``cluster_configs``. Each level deep-merges with the parent — only the keys you
+specify are overridden:
+
+.. code-block:: yaml
+
+    slurm:
+      pricing:
+        cpu: 0.04
+        memory: 0.01
+        accelerators:
+          V100: 2.50
+      cluster_configs:
+        mycluster1:
+          pricing:
+            cpu: 0.06  # overrides; memory and accelerators inherited
+
+See :ref:`slurm.pricing <config-yaml-slurm-pricing>` and
+:ref:`slurm.cluster_configs <config-yaml-slurm-cluster-configs>` in the
+:ref:`advanced configuration reference <config-yaml>` for the full example with
+partition-level overrides.
+
+
+.. _slurm-container-images:
+
+Containers
+----------
+
+SkyPilot supports running tasks inside container images on Slurm, using
+`Pyxis <https://github.com/NVIDIA/pyxis>`_ and
+`enroot <https://github.com/NVIDIA/enroot>`_ under the hood.
+
+To use a container image, specify ``image_id`` in your task YAML or use the
+``--image-id`` CLI flag:
+
+.. code-block:: yaml
+
+    # task.yaml
+    resources:
+      image_id: docker:ubuntu:22.04
+
+    run: |
+      echo "Running inside container"
+      cat /etc/os-release
+
+.. code-block:: bash
+
+    # Or via CLI
+    $ sky launch --image-id docker:ubuntu:22.04 -- echo "hello from container"
+
+Images from any Docker-compatible registry are supported, including but not
+limited to Docker Hub, AWS ECR, GCP Artifact Registry, and NVIDIA NGC.
+
+.. note::
+
+    Container support requires the `Pyxis <https://github.com/NVIDIA/pyxis>`_
+    SPANK plugin to be installed on your Slurm cluster.
+
+Stopping and restarting containers
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Container clusters on Slurm support ``sky stop`` and ``sky start``. When a
+cluster stops, SkyPilot exports each node's container filesystem to shared
+storage and releases the Slurm allocation. Starting the cluster requests a new
+allocation and restores each node from its exported filesystem.
+
+Installed packages, files under ``/root``, and other changes to the container
+root filesystem are preserved. The user's home directory remains available
+through its existing shared-filesystem mount. Running processes and memory are
+not preserved, and ``/tmp`` and ``/run`` are recreated when the cluster starts.
+
+Before exporting the container filesystem, SkyPilot waits for the allocation's
+workload steps to exit. On clusters using ``proctrack/linuxproc``, a process
+that double-forks out of its Slurm step may remain alive after the step exits
+and cannot be detected by this drain. Workloads on these clusters should not
+detach processes from their Slurm steps before the cluster is stopped.
+``proctrack/cgroup`` tracks these descendants with the step.
+
+Snapshots are stored under
+``<workdir>/.sky_snapshots/<cluster-name-on-cloud>``. If ``workdir`` is not
+configured, SkyPilot uses the remote user's home directory. A snapshot uses
+approximately as much shared storage as the container root filesystem and
+continues to consume that storage while the cluster is stopped. ``sky down``
+deletes the snapshot.
+
+Stopping is available only when the cluster uses a container image and Pyxis
+is installed. Slurm clusters that run directly on the host cannot be stopped.
+
+Autostop on container clusters
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Container clusters support autostop: ``sky launch -i N``,
+``sky start -i N``, or ``sky autostop -i N`` schedules the cluster to stop
+after N idle minutes, and adding ``--down`` schedules it to terminate
+instead. Skylet, running on the allocation's head node, performs the same
+snapshot-and-release procedure as ``sky stop`` (or the full cleanup of
+``sky down``).
+
+Private registries
+^^^^^^^^^^^^^^^^^^
+
+.. note::
+
+    Unlike :ref:`cloud VMs <docker-containers-private-registries>` and
+    :ref:`Kubernetes <kubernetes-custom-images-private-repos>`, private registry
+    authentication on Slurm is configured **at the cluster level** by the
+    administrator. Users do not need to set ``SKYPILOT_DOCKER_*`` environment
+    variables.
+
+To pull images from private registries, the cluster administrator must configure
+enroot's credentials file on all compute nodes. Enroot uses a
+netrc format credentials file to authenticate with container registries. For more details,
+see the `enroot import documentation <https://github.com/NVIDIA/enroot/blob/main/doc/cmd/import.md#description>`_.
+
+**Step 1: Find the credentials file path**
+
+The credentials file location depends on your cluster's enroot configuration:
+
+.. code-block:: bash
+
+    # Check the configured ENROOT_CONFIG_PATH
+    $ grep ENROOT_CONFIG_PATH /etc/enroot/enroot.conf
+
+    # If ENROOT_CONFIG_PATH is set (e.g., ${HOME}/enroot):
+    #   Credentials file: ~/enroot/.credentials
+    # If unset (default):
+    #   Credentials file: ~/.config/enroot/.credentials
+
+**Step 2: Create the credentials file on all compute nodes**
+
+Since most Slurm clusters use a shared filesystem (e.g., NFS, Lustre), creating
+the file in the user's home directory typically makes it available on all nodes:
+
+.. tab-set::
+
+    .. tab-item:: Docker Hub
+        :sync: docker-hub-tab
+
+        Docker Hub authentication requires credentials for both the registry
+        and the auth server:
+
+        .. code-block:: bash
+
+            $ mkdir -p <ENROOT_CONFIG_PATH>
+            $ cat > <ENROOT_CONFIG_PATH>/.credentials << 'EOF'
+            machine auth.docker.io login <username> password <access-token>
+            machine registry-1.docker.io login <username> password <access-token>
+            EOF
+
+        Use a `personal access token <https://app.docker.com/settings/personal-access-tokens>`_
+        with "Read" repository permissions as the password.
+
+    .. tab-item:: AWS ECR
+        :sync: aws-ecr-tab
+
+        .. code-block:: bash
+
+            # Replace <ENROOT_CONFIG_PATH> with the path from Step 1
+            $ mkdir -p <ENROOT_CONFIG_PATH>
+            $ cat > <ENROOT_CONFIG_PATH>/.credentials << 'EOF'
+            machine <account-id>.dkr.ecr.<region>.amazonaws.com login AWS password $(aws ecr get-login-password --region <region>)
+            EOF
+
+        The ``$(...)`` syntax is evaluated by enroot at import time, so the
+        ECR token (which expires every 12 hours) is always refreshed
+        automatically.
+
+        **Requirements:**
+
+        - AWS CLI must be installed on compute nodes
+        - IAM credentials with ``ecr:GetAuthorizationToken``,
+          ``ecr:BatchGetImage``, and ``ecr:GetDownloadUrlForLayer`` permissions
+        - **enroot >= 4.0** is required for ECR. Older versions do not support
+          ECR's non-standard authentication flow. If you see
+          ``[ERROR] Could not process JSON input`` when pulling ECR images,
+          upgrade enroot to 4.0 or later. See enroot issues
+          `#143 <https://github.com/NVIDIA/enroot/issues/143>`_ and
+          `#189 <https://github.com/NVIDIA/enroot/issues/189>`_ for details.
+
+    .. tab-item:: GCP Artifact Registry
+        :sync: gcp-tab
+
+        The service account key must be base64-encoded because raw JSON
+        contains characters that break enroot's netrc parser:
+
+        .. code-block:: bash
+
+            $ mkdir -p <ENROOT_CONFIG_PATH>
+            $ cat > <ENROOT_CONFIG_PATH>/.credentials << 'EOF'
+            machine <location>-docker.pkg.dev login _json_key_base64 password $(base64 -w0 /path/to/service-account-key.json)
+            EOF
+
+        The service account must have the ``roles/artifactregistry.reader``
+        role. See `Artifact Registry authentication <https://cloud.google.com/artifact-registry/docs/docker/authentication#json-key>`_.
+
+        Replace ``<location>`` with your repository's location (e.g., ``us``,
+        ``us-central1``, ``europe-west1``).
+
+    .. tab-item:: NVIDIA NGC
+        :sync: nvidia-ngc-tab
+
+        .. code-block:: bash
+
+            $ mkdir -p <ENROOT_CONFIG_PATH>
+            $ cat > <ENROOT_CONFIG_PATH>/.credentials << 'EOF'
+            machine nvcr.io login $oauthtoken password <NGC_API_KEY>
+            EOF
+
+**Step 3: Verify the setup**
+
+Test that enroot can pull the private image on a compute node:
+
+.. code-block:: bash
+
+    $ srun enroot import --output /tmp/test.sqsh 'docker://<registry>#<image>:<tag>'
+    # Should succeed without authentication errors
+
+    # Clean up
+    $ rm /tmp/test.sqsh
+
+Once configured, users can launch SkyPilot tasks with private images without
+any additional setup.
+
+
+Current limitations
+-------------------
+
+Slurm support in SkyPilot is under active development. The following features are not yet supported:
+
+* **SkyServe**: Serving deployments on Slurm is not yet supported.
+
+FAQs
+----
+
+* **How does SkyPilot interact with Slurm?**
+
+  Each SkyPilot "cluster" corresponds to a Slurm job. When you run ``sky launch``, SkyPilot creates an sbatch script that requests the specified resources
+  and runs a long-lived process with the SkyPilot runtime.
+
+  SkyPilot uses slurm CLI commands on the login node to interact with the cluster. It submits jobs using ``sbatch``, views the status of jobs using ``squeue``, and terminates jobs using ``scancel``.
+
+
+* **Which user are jobs submitted as?**
+
+  By default, jobs are submitted as the ``User`` in ``~/.slurm/config``. With
+  :ref:`submit as user <slurm-submit-as-user>` enabled, SkyPilot instead uses
+  the Unix account mapped from the authenticated username. Jobs appear under
+  that account in ``squeue``, count against its quotas, and use its
+  permissions.
+
+* **Can I use multiple Slurm clusters?**
+
+  Yes. Add multiple host entries to your ``~/.slurm/config`` file. Each host will appear as a separate
+  region in SkyPilot's optimizer.
+
+* **What partition does SkyPilot use?**
+
+  By default, SkyPilot uses the default partition configured in your Slurm cluster. To specify a partition, use the ``--infra`` flag:
+
+  .. code-block:: bash
+
+     $ sky launch --infra slurm/mycluster/mypartition task.yaml
+
+* **Can SkyPilot provision a Slurm cluster for me?**
+
+  No. SkyPilot runs tasks on existing Slurm clusters. It does not provision new Slurm clusters
+  or add nodes to existing clusters.

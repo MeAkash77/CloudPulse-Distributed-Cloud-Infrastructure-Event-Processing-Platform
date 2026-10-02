@@ -1,0 +1,30 @@
+# Runs the InvokeAI Stable Diffusion web UI (https://github.com/invoke-ai/InvokeAI)
+# on a single GPU using the official ghcr.io/invoke-ai/invokeai:v6.14.2-cuda image.
+#
+# Usage:
+#   sky launch -c stable-diffusion examples/stable_diffusion/stable_diffusion_docker.yaml
+#   ssh -L 9090:localhost:9090 stable-diffusion
+#   # then open http://localhost:9090
+envs:
+  HUGGING_FACE_HUB_TOKEN: ""  # optional, for gated Hugging Face models
+
+resources:
+  accelerators: L4:1
+  ports: 9090
+
+setup: |
+  set -e
+  docker pull ghcr.io/invoke-ai/invokeai:v6.14.2-cuda
+
+run: |
+  set -e
+  # Models and generated images are kept under ~/invokeai on the host.
+  mkdir -p ~/invokeai
+  docker rm -f invokeai 2>/dev/null || true
+  docker run -d --name invokeai --restart on-failure \
+    --gpus all \
+    -p 9090:9090 \
+    -v ~/invokeai:/invokeai \
+    -e HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN:-} \
+    ghcr.io/invoke-ai/invokeai:v6.14.2-cuda
+  docker logs -f invokeai

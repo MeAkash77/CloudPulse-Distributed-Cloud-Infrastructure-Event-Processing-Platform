@@ -1,0 +1,6044 @@
+"""Tests for Kubernetes utils.
+
+"""
+
+import collections
+import copy
+import datetime
+import os
+import re
+import tempfile
+from typing import Optional
+import unittest
+from unittest import mock
+from unittest.mock import call
+from unittest.mock import patch
+
+import kubernetes
+import pytest
+import yaml
+
+from sky import exceptions
+from sky import models
+from sky.adaptors import kubernetes as kubernetes_adaptor
+from sky.catalog import kubernetes_catalog
+from sky.provision.kubernetes import constants as k8s_constants
+from sky.provision.kubernetes import utils
+
+
+# Test for exception on permanent errors like 401 (Unauthorized)
+def test_get_kubernetes_nodes():
+    with patch('sky.provision.kubernetes.utils.kubernetes.core_api'
+              ) as mock_core_api:
+        mock_core_api.return_value.list_node.side_effect = kubernetes.client.rest.ApiException(
+            status=401)
+        with pytest.raises(exceptions.KubeAPIUnreachableError):
+            utils.get_kubernetes_nodes(context='test')
+
+
+def test_get_kubernetes_node_info_capacity_vs_allocatable():
+    """A device-plugin withdrawal must be visible in the node info.
+
+    When the device plugin marks devices unhealthy (e.g. after an XID error),
+    kubelet keeps them in status.capacity but drops them from
+    status.allocatable. `total` must report the physical count with
+    allocatable alongside — deriving total from allocatable would shrink the
+    node's reported size in lockstep with the failure, hiding it — and
+    `accelerators_available` must be measured against allocatable so
+    withdrawn devices never count as free.
+    """
+    node = mock.MagicMock()
+    node.metadata.name = 'degraded-node'
+    node.metadata.labels = {'skypilot.co/accelerator': 'h100'}
+    node.status.capacity = {'nvidia.com/gpu': '8'}
+    node.status.allocatable = {'nvidia.com/gpu': '5'}
+    node.is_ready.return_value = True
+    node.is_cordoned.return_value = False
+    node.get_taints.return_value = []
+
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                   return_value=[node]), \
+         mock.patch('sky.provision.kubernetes.utils.'
+                   'get_allocated_resources_by_node',
+                   return_value=({'degraded-node': 3}, {})), \
+         mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
+                    return_value='nvidia.com/gpu'):
+        node_info = utils.get_kubernetes_node_info()
+
+    info = node_info.node_info_dict['degraded-node']
+    assert info.total['accelerator_count'] == 8
+    assert info.total['accelerator_allocatable'] == 5
+    # 5 allocatable - 3 requested; the 3 withdrawn devices are not free.
+    assert info.free['accelerators_available'] == 2
+
+
+def test_get_kubernetes_node_info_available_clamped_at_zero():
+    """Pods admitted before a withdrawal can hold more devices than remain
+    allocatable; available must clamp at 0 rather than go negative (a -1
+    would collide with the no-permission sentinel)."""
+    node = mock.MagicMock()
+    node.metadata.name = 'fully-withdrawn'
+    node.metadata.labels = {'skypilot.co/accelerator': 'h100'}
+    node.status.capacity = {'nvidia.com/gpu': '8'}
+    node.status.allocatable = {'nvidia.com/gpu': '0'}
+    node.is_ready.return_value = True
+    node.is_cordoned.return_value = False
+    node.get_taints.return_value = []
+
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                   return_value=[node]), \
+         mock.patch('sky.provision.kubernetes.utils.'
+                   'get_allocated_resources_by_node',
+                   return_value=({'fully-withdrawn': 3}, {})), \
+         mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
+                    return_value='nvidia.com/gpu'):
+        node_info = utils.get_kubernetes_node_info()
+
+    info = node_info.node_info_dict['fully-withdrawn']
+    assert info.total['accelerator_count'] == 8
+    assert info.total['accelerator_allocatable'] == 0
+    assert info.free['accelerators_available'] == 0
+
+
+def test_get_kubernetes_node_info():
+    """Tests get_kubernetes_node_info function."""
+    # Mock node and pod objects
+    mock_gpu_node_1 = mock.MagicMock()
+    mock_gpu_node_1.metadata.name = 'node-1'
+    mock_gpu_node_1.metadata.labels = {
+        'skypilot.co/accelerator': 'a100-80gb',
+        'cloud.google.com/gke-accelerator-count': '4'
+    }
+    mock_gpu_node_1.status.allocatable = {'nvidia.com/gpu': '4'}
+    mock_gpu_node_1.is_ready.return_value = True
+    mock_gpu_node_1.is_cordoned.return_value = False
+    mock_gpu_node_1.get_taints.return_value = []
+
+    mock_gpu_node_2 = mock.MagicMock()
+    mock_gpu_node_2.metadata.name = 'node-2'
+    mock_gpu_node_2.metadata.labels = {
+        'skypilot.co/accelerator': 'tpu-v4-podslice',
+        'cloud.google.com/gke-accelerator-count': '8',
+        'cloud.google.com/gke-tpu-accelerator': 'tpu-v4-podslice',
+        'cloud.google.com/gke-tpu-topology': '2x4'
+    }
+    mock_gpu_node_2.status.allocatable = {'google.com/tpu': '8'}
+    mock_gpu_node_2.is_ready.return_value = True
+    mock_gpu_node_2.is_cordoned.return_value = False
+    mock_gpu_node_2.get_taints.return_value = []
+
+    mock_pod_1 = mock.MagicMock()
+    mock_pod_1.spec.node_name = 'node-1'
+    mock_pod_1.status.phase = 'Running'
+    mock_pod_1.spec.containers = [
+        mock.MagicMock(resources=mock.MagicMock(
+            requests={'nvidia.com/gpu': '2'}))
+    ]
+
+    mock_pod_2 = mock.MagicMock()
+    mock_pod_2.spec.node_name = 'node-2'
+    mock_pod_2.status.phase = 'Running'
+    mock_pod_2.spec.containers = [
+        mock.MagicMock(resources=mock.MagicMock(
+            requests={'google.com/tpu': '4'}))
+    ]
+
+    # Test case 1: Normal operation with GPU and TPU nodes
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                   return_value=[mock_gpu_node_1, mock_gpu_node_2]), \
+         mock.patch('sky.provision.kubernetes.utils.'
+                   'get_allocated_resources_by_node',
+                   return_value=({mock_gpu_node_1.metadata.name: 2, mock_gpu_node_2.metadata.name: 4}, {})), \
+         mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
+                    return_value='nvidia.com/gpu'):
+        node_info = utils.get_kubernetes_node_info()
+        assert isinstance(node_info, models.KubernetesNodesInfo)
+        assert len(node_info.node_info_dict) == 2
+        assert node_info.node_info_dict[
+            'node-1'].accelerator_type == 'A100-80GB'
+        assert node_info.node_info_dict['node-1'].total[
+            'accelerator_count'] == 4
+        assert node_info.node_info_dict['node-1'].free[
+            'accelerators_available'] == 2
+        assert node_info.node_info_dict['node-2'].accelerator_type == (
+            'TPU-V4-PODSLICE')
+        assert node_info.node_info_dict['node-2'].total[
+            'accelerator_count'] == 8
+        assert node_info.node_info_dict['node-2'].free[
+            'accelerators_available'] == 4
+
+    # Test case 2: No permission to list pods
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                   return_value=[mock_gpu_node_1, mock_gpu_node_2]), \
+         mock.patch('sky.provision.kubernetes.utils.'
+                   'get_allocated_resources_by_node',
+                   side_effect=utils.kubernetes.kubernetes.client.ApiException(
+                       status=403)):
+        node_info = utils.get_kubernetes_node_info()
+        assert isinstance(node_info, models.KubernetesNodesInfo)
+        assert len(node_info.node_info_dict) == 2
+        assert node_info.node_info_dict['node-1'].free[
+            'accelerators_available'] == -1
+        assert node_info.node_info_dict['node-2'].free[
+            'accelerators_available'] == -1
+
+    # Test case 3: Multi-host TPU node
+    mock_tpu_node_1 = mock.MagicMock()
+    mock_tpu_node_1.metadata.name = 'node-3'
+    mock_tpu_node_1.metadata.labels = {
+        'skypilot.co/accelerator': 'tpu-v4-podslice',
+        'cloud.google.com/gke-accelerator-count': '4',
+        'cloud.google.com/gke-tpu-accelerator': 'tpu-v4-podslice',
+        'cloud.google.com/gke-tpu-topology': '4x4',
+        'cloud.google.com/gke-tpu-node-pool-type': 'multi-host'
+    }
+    mock_tpu_node_1.status.allocatable = {'google.com/tpu': '4'}
+    mock_tpu_node_1.is_ready.return_value = True
+    mock_tpu_node_1.is_cordoned.return_value = False
+    mock_tpu_node_1.get_taints.return_value = []
+
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                   return_value=[mock_gpu_node_1, mock_tpu_node_1]), \
+         mock.patch('sky.provision.kubernetes.utils.'
+                   'get_allocated_resources_by_node',
+                   return_value=(collections.defaultdict(int, {mock_gpu_node_1.metadata.name: 2}), {})):
+        node_info = utils.get_kubernetes_node_info()
+        assert isinstance(node_info, models.KubernetesNodesInfo)
+        # Multi-host TPU node should be excluded
+        assert len(node_info.node_info_dict) == 1
+        assert 'node-3' not in node_info.node_info_dict
+        assert '(Note: Multi-host TPUs are detected' in node_info.hint
+
+    # Test case 4: Empty cluster
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                   return_value=[]), \
+         mock.patch('sky.provision.kubernetes.utils.'
+                   'get_allocated_resources_by_node',
+                   return_value=({}, {})):
+        node_info = utils.get_kubernetes_node_info()
+        assert isinstance(node_info, models.KubernetesNodesInfo)
+        assert len(node_info.node_info_dict) == 0
+        assert node_info.hint == ''
+
+    # Test case 5: CPU-only nodes
+    mock_cpu_node_1 = mock.MagicMock()
+    mock_cpu_node_1.metadata.name = 'node-4'
+    mock_cpu_node_1.metadata.labels = {}
+    mock_cpu_node_1.status.allocatable = {'cpu': '4', 'memory': '16Gi'}
+    mock_cpu_node_1.status.addresses = [
+        mock.MagicMock(type='InternalIP', address='10.0.0.1')
+    ]
+    mock_cpu_node_1.is_ready.return_value = True
+    mock_cpu_node_1.is_cordoned.return_value = False
+    mock_cpu_node_1.get_taints.return_value = []
+
+    mock_cpu_node_2 = mock.MagicMock()
+    mock_cpu_node_2.metadata.name = 'node-5'
+    mock_cpu_node_2.metadata.labels = {}
+    mock_cpu_node_2.status.allocatable = {'cpu': '8', 'memory': '32Gi'}
+    mock_cpu_node_2.status.addresses = [
+        mock.MagicMock(type='InternalIP', address='10.0.0.2')
+    ]
+    mock_cpu_node_2.is_ready.return_value = True
+    mock_cpu_node_2.is_cordoned.return_value = False
+    mock_cpu_node_2.get_taints.return_value = []
+
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                   return_value=[mock_cpu_node_1, mock_cpu_node_2]), \
+         mock.patch('sky.provision.kubernetes.utils.'
+                   'get_allocated_resources_by_node',
+                   return_value=({}, {})) as mock_get_allocated_resources:
+        node_info = utils.get_kubernetes_node_info()
+
+        mock_get_allocated_resources.assert_called_once()
+        assert isinstance(node_info, models.KubernetesNodesInfo)
+        assert len(node_info.node_info_dict) == 2
+        assert node_info.node_info_dict['node-4'].accelerator_type is None
+        assert node_info.node_info_dict['node-4'].total[
+            'accelerator_count'] == 0
+        assert node_info.node_info_dict['node-4'].free[
+            'accelerators_available'] == 0
+        assert node_info.node_info_dict['node-5'].total[
+            'accelerator_count'] == 0
+        assert node_info.node_info_dict['node-5'].free[
+            'accelerators_available'] == 0
+
+    # Test case 6: Mixed CPU and GPU nodes
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                   return_value=[mock_cpu_node_1, mock_gpu_node_1]), \
+         mock.patch('sky.provision.kubernetes.utils.'
+                   'get_allocated_resources_by_node',
+                   return_value=({mock_gpu_node_1.metadata.name: 2}, {})) as mock_get_allocated_resources, \
+         mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
+                   return_value='nvidia.com/gpu'):
+        node_info = utils.get_kubernetes_node_info()
+
+        mock_get_allocated_resources.assert_called_once()
+        assert len(node_info.node_info_dict) == 2
+        # CPU node should have 0 accelerators
+        assert node_info.node_info_dict['node-4'].total[
+            'accelerator_count'] == 0
+        assert node_info.node_info_dict['node-4'].free[
+            'accelerators_available'] == 0
+        # GPU node should have correct allocation
+        assert node_info.node_info_dict['node-1'].total[
+            'accelerator_count'] == 4
+        assert node_info.node_info_dict['node-1'].free[
+            'accelerators_available'] == 2
+
+    # Test case 7: Cordoned node
+    mock_cordoned_node = mock.MagicMock()
+    mock_cordoned_node.metadata.name = 'node-cordoned'
+    mock_cordoned_node.metadata.labels = {
+        'skypilot.co/accelerator': 'a100-80gb',
+        'cloud.google.com/gke-accelerator-count': '4'
+    }
+    mock_cordoned_node.status.allocatable = {'nvidia.com/gpu': '4'}
+    mock_cordoned_node.status.capacity = {'cpu': '8', 'memory': '32Gi'}
+    mock_cordoned_node.status.addresses = [
+        mock.MagicMock(type='InternalIP', address='10.0.0.10')
+    ]
+    mock_cordoned_node.spec.unschedulable = True
+    mock_cordoned_node.spec.taints = [
+        mock.MagicMock(key='node.kubernetes.io/unschedulable',
+                       value=None,
+                       effect='NoSchedule')
+    ]
+    mock_cordoned_node.is_ready.return_value = True
+    mock_cordoned_node.is_cordoned.return_value = True
+    mock_cordoned_node.get_taints.return_value = []
+
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                   return_value=[mock_cordoned_node]), \
+         mock.patch('sky.provision.kubernetes.utils.'
+                   'get_allocated_resources_by_node',
+                   return_value=({mock_cordoned_node.metadata.name: 2}, {})), \
+         mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
+                   return_value='nvidia.com/gpu'):
+        node_info = utils.get_kubernetes_node_info()
+        assert isinstance(node_info, models.KubernetesNodesInfo)
+        assert len(node_info.node_info_dict) == 1
+        assert node_info.node_info_dict['node-cordoned'].is_cordoned is True
+        assert node_info.node_info_dict['node-cordoned'].taints == []
+
+    # Test case 8: Node with custom taints (no cordon)
+    mock_tainted_node = mock.MagicMock()
+    mock_tainted_node.metadata.name = 'node-tainted'
+    mock_tainted_node.metadata.labels = {
+        'skypilot.co/accelerator': 'v100',
+        'cloud.google.com/gke-accelerator-count': '2'
+    }
+    mock_tainted_node.status.allocatable = {'nvidia.com/gpu': '2'}
+    mock_tainted_node.status.capacity = {'cpu': '4', 'memory': '16Gi'}
+    mock_tainted_node.status.addresses = [
+        mock.MagicMock(type='InternalIP', address='10.0.0.11')
+    ]
+    mock_tainted_node.spec.unschedulable = False
+    mock_tainted_node.spec.taints = [
+        mock.MagicMock(key='dedicated', value='gpu', effect='NoSchedule'),
+        mock.MagicMock(key='gpu-type', value='v100', effect='NoExecute')
+    ]
+    mock_tainted_node.is_ready.return_value = True
+    mock_tainted_node.is_cordoned.return_value = False
+    mock_tainted_node.get_taints.return_value = [{
+        'key': 'dedicated',
+        'value': 'gpu',
+        'effect': 'NoSchedule'
+    }, {
+        'key': 'gpu-type',
+        'value': 'v100',
+        'effect': 'NoExecute'
+    }]
+
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                   return_value=[mock_tainted_node]), \
+         mock.patch('sky.provision.kubernetes.utils.'
+                   'get_allocated_resources_by_node',
+                   return_value=({mock_tainted_node.metadata.name: 1}, {})), \
+         mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
+                   return_value='nvidia.com/gpu'):
+        node_info = utils.get_kubernetes_node_info()
+        assert isinstance(node_info, models.KubernetesNodesInfo)
+        assert len(node_info.node_info_dict) == 1
+        assert node_info.node_info_dict['node-tainted'].is_cordoned is False
+        assert len(node_info.node_info_dict['node-tainted'].taints) == 2
+        assert node_info.node_info_dict['node-tainted'].taints[0] == {
+            'key': 'dedicated',
+            'value': 'gpu',
+            'effect': 'NoSchedule'
+        }
+        assert node_info.node_info_dict['node-tainted'].taints[1] == {
+            'key': 'gpu-type',
+            'value': 'v100',
+            'effect': 'NoExecute'
+        }
+
+    # Test case 9: Cordoned node with additional custom taints
+    mock_cordoned_and_tainted = mock.MagicMock()
+    mock_cordoned_and_tainted.metadata.name = 'node-cordoned-and-tainted'
+    mock_cordoned_and_tainted.metadata.labels = {
+        'skypilot.co/accelerator': 't4',
+        'cloud.google.com/gke-accelerator-count': '1'
+    }
+    mock_cordoned_and_tainted.status.allocatable = {'nvidia.com/gpu': '1'}
+    mock_cordoned_and_tainted.status.capacity = {'cpu': '2', 'memory': '8Gi'}
+    mock_cordoned_and_tainted.status.addresses = [
+        mock.MagicMock(type='InternalIP', address='10.0.0.12')
+    ]
+    mock_cordoned_and_tainted.spec.unschedulable = True
+    mock_cordoned_and_tainted.spec.taints = [
+        mock.MagicMock(key='node.kubernetes.io/unschedulable',
+                       value=None,
+                       effect='NoSchedule'),
+        mock.MagicMock(key='maintenance', value='true', effect='NoSchedule')
+    ]
+    mock_cordoned_and_tainted.is_ready.return_value = True
+    mock_cordoned_and_tainted.is_cordoned.return_value = True
+    mock_cordoned_and_tainted.get_taints.return_value = [{
+        'key': 'maintenance',
+        'value': 'true',
+        'effect': 'NoSchedule'
+    }]
+
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                   return_value=[mock_cordoned_and_tainted]), \
+         mock.patch('sky.provision.kubernetes.utils.'
+                   'get_allocated_resources_by_node',
+                   return_value=({mock_cordoned_and_tainted.metadata.name: 0}, {})), \
+         mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
+                   return_value='nvidia.com/gpu'):
+        node_info = utils.get_kubernetes_node_info()
+        assert isinstance(node_info, models.KubernetesNodesInfo)
+        assert len(node_info.node_info_dict) == 1
+        assert node_info.node_info_dict[
+            'node-cordoned-and-tainted'].is_cordoned is True
+        # Should only return non-cordon taints
+        assert len(
+            node_info.node_info_dict['node-cordoned-and-tainted'].taints) == 1
+        assert node_info.node_info_dict['node-cordoned-and-tainted'].taints[
+            0] == {
+                'key': 'maintenance',
+                'value': 'true',
+                'effect': 'NoSchedule'
+            }
+
+    # Test case 10: CPU-only node with cordoned status
+    mock_cpu_cordoned = mock.MagicMock()
+    mock_cpu_cordoned.metadata.name = 'node-cpu-cordoned'
+    mock_cpu_cordoned.metadata.labels = {}
+    mock_cpu_cordoned.status.allocatable = {'cpu': '4', 'memory': '16Gi'}
+    mock_cpu_cordoned.status.capacity = {'cpu': '4', 'memory': '16Gi'}
+    mock_cpu_cordoned.status.addresses = [
+        mock.MagicMock(type='InternalIP', address='10.0.0.13')
+    ]
+    mock_cpu_cordoned.spec.unschedulable = True
+    mock_cpu_cordoned.spec.taints = [
+        mock.MagicMock(key='node.kubernetes.io/unschedulable',
+                       value=None,
+                       effect='NoSchedule')
+    ]
+    mock_cpu_cordoned.is_ready.return_value = True
+    mock_cpu_cordoned.is_cordoned.return_value = True
+    mock_cpu_cordoned.get_taints.return_value = []
+
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                   return_value=[mock_cpu_cordoned]), \
+         mock.patch('sky.provision.kubernetes.utils.'
+                   'get_allocated_resources_by_node',
+                   return_value=({}, {})):
+        node_info = utils.get_kubernetes_node_info()
+        assert isinstance(node_info, models.KubernetesNodesInfo)
+        assert len(node_info.node_info_dict) == 1
+        assert node_info.node_info_dict['node-cpu-cordoned'].is_cordoned is True
+        assert node_info.node_info_dict['node-cpu-cordoned'].taints == []
+        assert node_info.node_info_dict['node-cpu-cordoned'].total[
+            'accelerator_count'] == 0
+
+
+def test_get_all_kube_context_names():
+    """Tests get_all_kube_context_names function with KUBECONFIG env var."""
+    mock_contexts = [{
+        'name': 'context1'
+    }, {
+        'name': 'context2'
+    }, {
+        'name': 'context3'
+    }]
+    mock_current_context = {'name': 'context1'}
+
+    with patch('sky.provision.kubernetes.utils.kubernetes.'
+               'list_kube_config_contexts',
+               return_value=(mock_contexts, mock_current_context)), \
+         patch('sky.provision.kubernetes.utils.is_incluster_config_available',
+               return_value=False):
+        context_names = utils.get_all_kube_context_names()
+        assert context_names == ['context1', 'context2', 'context3']
+
+    with patch('sky.provision.kubernetes.utils.kubernetes.'
+               'list_kube_config_contexts',
+               return_value=(mock_contexts, mock_current_context)), \
+         patch('sky.provision.kubernetes.utils.is_incluster_config_available',
+               return_value=True), \
+         patch('sky.provision.kubernetes.utils.kubernetes.'
+               'in_cluster_context_name',
+               return_value='in-cluster'):
+        context_names = utils.get_all_kube_context_names()
+        assert context_names == [
+            'context1', 'context2', 'context3', 'in-cluster'
+        ]
+
+    with patch('sky.provision.kubernetes.utils.kubernetes.'
+               'list_kube_config_contexts',
+               side_effect=utils.kubernetes.kubernetes.config.
+               config_exception.ConfigException()), \
+         patch('sky.provision.kubernetes.utils.is_incluster_config_available',
+               return_value=True), \
+         patch('sky.provision.kubernetes.utils.kubernetes.'
+               'in_cluster_context_name',
+               return_value='in-cluster'):
+        context_names = utils.get_all_kube_context_names()
+        assert context_names == ['in-cluster']
+
+    with patch('sky.provision.kubernetes.utils.kubernetes.'
+               'list_kube_config_contexts',
+               side_effect=utils.kubernetes.kubernetes.config.
+               config_exception.ConfigException()), \
+         patch('sky.provision.kubernetes.utils.is_incluster_config_available',
+               return_value=False):
+        context_names = utils.get_all_kube_context_names()
+        assert context_names == []
+
+    # Verify latest KUBECONFIG env var is used
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
+                                     delete=False) as f1, \
+         tempfile.NamedTemporaryFile(mode='w', suffix='.yaml',
+                                     delete=False) as f2:
+
+        # Write different kubeconfig content to each file
+        kubeconfig1_content = """
+apiVersion: v1
+kind: Config
+contexts:
+- name: old-context
+  context:
+    cluster: old-cluster
+    user: old-user
+current-context: old-context
+clusters:
+- name: old-cluster
+  cluster:
+    server: https://old-server
+users:
+- name: old-user
+  user: {}
+"""
+        kubeconfig2_content = """
+apiVersion: v1
+kind: Config
+contexts:
+- name: new-context
+  context:
+    cluster: new-cluster
+    user: new-user
+current-context: new-context
+clusters:
+- name: new-cluster
+  cluster:
+    server: https://new-server
+users:
+- name: new-user
+  user: {}
+"""
+        f1.write(kubeconfig1_content)
+        f1.flush()
+        f2.write(kubeconfig2_content)
+        f2.flush()
+
+        try:
+            # Mock the kubernetes module to use actual file loading
+            with patch(
+                    'sky.provision.kubernetes.utils.'
+                    'is_incluster_config_available',
+                    return_value=False):
+
+                # Set KUBECONFIG to first file
+                with patch.dict(os.environ, {'KUBECONFIG': f1.name}):
+                    # Mock the kubernetes.list_kube_config_contexts to read
+                    # from the actual file
+                    with patch('sky.provision.kubernetes.utils.kubernetes.'
+                               'list_kube_config_contexts') as mock_list:
+                        # Simulate reading from first kubeconfig
+                        mock_list.return_value = ([{
+                            'name': 'old-context'
+                        }], {
+                            'name': 'old-context'
+                        })
+                        context_names = utils.get_all_kube_context_names()
+                        assert context_names == ['old-context']
+                        # Verify the function was called (indicating it tried
+                        # to read config)
+                        mock_list.assert_called_once()
+
+                # Change KUBECONFIG to second file
+                with patch.dict(os.environ, {'KUBECONFIG': f2.name}):
+                    with patch('sky.provision.kubernetes.utils.kubernetes.'
+                               'list_kube_config_contexts') as mock_list:
+                        # Simulate reading from second kubeconfig
+                        mock_list.return_value = ([{
+                            'name': 'new-context'
+                        }], {
+                            'name': 'new-context'
+                        })
+                        context_names = utils.get_all_kube_context_names()
+                        assert context_names == ['new-context']
+                        mock_list.assert_called_once()
+
+        finally:
+            # Clean up temporary files
+            os.unlink(f1.name)
+            os.unlink(f2.name)
+
+
+def test_detect_gpu_label_formatter_invalid_label_skip():
+    """Tests that on finding a matching label, the
+    detect_gpu_label_formatter method will skip if
+    the label value is invalid."""
+
+    # this is an invalid GKE gpu label
+    valid, _ = utils.GKELabelFormatter.validate_label_value('H100_NVLINK_80GB')
+    assert not valid
+
+    # make node mocks with incorrect labels, as shown in
+    # https://github.com/skypilot-org/skypilot/issues/5628
+    mock_node = mock.MagicMock()
+    mock_node.metadata.name = 'node'
+    mock_node.metadata.labels = {
+        'cloud.google.com/gke-accelerator': 'H100_NVLINK_80GB',
+        'gpu.nvidia.com/class': 'H100_NVLINK_80GB',
+        'gpu.nvidia.com/count': '8',
+        'gpu.nvidia.com/model': 'H100_NVLINK_80GB',
+        'gpu.nvidia.com/vram': '81'
+    }
+
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                    return_value=[mock_node]):
+        lf, _ = utils.detect_gpu_label_formatter('whatever')
+        assert lf is not None
+        assert isinstance(lf, utils.CoreWeaveLabelFormatter)
+        utils.detect_gpu_label_formatter.cache_clear()
+
+
+def test_detect_gpu_label_formatter_suppresses_warning_for_coreweave_format():
+    """Tests that warnings are not logged when GKE label keys have
+    CoreWeave-formatted values (e.g., cloud.google.com/gke-accelerator=H100_NVLINK_80GB).
+    This happens on CoreWeave clusters where NFD sets GKE labels but with CoreWeave values.
+    """
+    warning_calls = []
+
+    def mock_warning(*args, **kwargs):
+        warning_calls.append(args[0] if args else '')
+
+    mock_node = mock.MagicMock()
+    mock_node.metadata.name = 'node'
+    mock_node.metadata.labels = {
+        # CoreWeave clusters may have cloud.google.com/gke-accelerator labels set by Node Feature
+        # Discovery (NFD), but with CoreWeave formatted values, causing confusion.
+        'cloud.google.com/gke-accelerator': 'H100_NVLINK_80GB',
+        'gpu.nvidia.com/class': 'H100_NVLINK_80GB',
+    }
+
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                    return_value=[mock_node]), \
+         mock.patch('sky.provision.kubernetes.utils.logger.warning', side_effect=mock_warning):
+        lf, _ = utils.detect_gpu_label_formatter('whatever')
+
+        # Should detect CoreWeaveLabelFormatter
+        assert lf is not None
+        assert isinstance(lf, utils.CoreWeaveLabelFormatter)
+
+        assert len(warning_calls) == 0, (
+            f'Expected no warnings about GKE label with CoreWeave format, '
+            f'but got: {warning_calls}')
+        utils.detect_gpu_label_formatter.cache_clear()
+
+
+def test_detect_gpu_label_formatter_logs_warning_with_no_valid_labels():
+    """Tests that warnings ARE logged when there are no valid labels."""
+    warning_calls = []
+
+    def mock_warning(*args, **kwargs):
+        warning_calls.append(args[0] if args else '')
+
+    mock_node = mock.MagicMock()
+    mock_node.metadata.name = 'node'
+    mock_node.metadata.labels = {
+        # Label with invalid value for GKE formatter
+        'cloud.google.com/gke-accelerator': 'H200',
+    }
+
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                    return_value=[mock_node]), \
+         mock.patch('sky.provision.kubernetes.utils.logger.warning', side_effect=mock_warning):
+        utils.detect_gpu_label_formatter.cache_clear()
+        lf, _ = utils.detect_gpu_label_formatter('whatever')
+
+        # Should not detect any formatter
+        assert lf is None
+
+        # SHOULD log warning about invalid GKE label value since no valid formatter found
+        expected_warning = (
+            'GPU label cloud.google.com/gke-accelerator matched for label '
+            'formatter GKELabelFormatter, '
+            'but has invalid value H200. '
+            'Reason: Invalid accelerator name in GKE cluster: H200. '
+            'Skipping...')
+        assert expected_warning in warning_calls, (
+            f'Expected warning not found. Expected: {expected_warning!r}\n'
+            f'Got warnings: {warning_calls}')
+
+
+def test_detect_gpu_label_formatter_ignores_empty_labels():
+    """Tests that the detect_gpu_label_formatter method correctly ignores
+    empty labels from CPU nodes and selects the appropriate formatter
+    based on non-empty labels from GPU nodes."""
+
+    # Mock CPU node with empty labels (typical CPU node configuration)
+    mock_cpu_node = mock.MagicMock()
+    mock_cpu_node.metadata.name = 'cpu-node'
+    mock_cpu_node.metadata.labels = {
+        'beta.kubernetes.io/arch': 'amd64',
+        'beta.kubernetes.io/os': 'linux',
+        'cloud.google.com/gke-accelerator': '',  # Empty GKE label
+        'gpu.nvidia.com/class': '',  # Empty CoreWeave label
+        'gpu.nvidia.com/count': '',
+        'gpu.nvidia.com/model': '',
+        'gpu.nvidia.com/vram': ''
+    }
+
+    # Mock GPU node with mixed labels (invalid GKE, valid CoreWeave)
+    mock_gpu_node = mock.MagicMock()
+    mock_gpu_node.metadata.name = 'gpu-node'
+    mock_gpu_node.metadata.labels = {
+        'cloud.google.com/gke-accelerator': 'H200',  # Invalid for GKE formatter
+        'gpu.nvidia.com/class': 'H200',  # Valid for CoreWeave formatter
+        'gpu.nvidia.com/count': '8',
+        'gpu.nvidia.com/model': 'H200',
+        'gpu.nvidia.com/vram': '143'
+    }
+
+    # Test when CPU node is returned first (Kube API is non-deterministic)
+    nodes = [mock_cpu_node, mock_gpu_node]
+
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                    return_value=nodes):
+        lf, _ = utils.detect_gpu_label_formatter('test-context')
+        assert lf is not None
+        assert isinstance(lf, utils.CoreWeaveLabelFormatter)
+        utils.detect_gpu_label_formatter.cache_clear()
+
+    # Test empty string variations
+    mock_cpu_node_whitespace = mock.MagicMock()
+    mock_cpu_node_whitespace.metadata.name = 'cpu-node-ws'
+    mock_cpu_node_whitespace.metadata.labels = {
+        'cloud.google.com/gke-accelerator': '   ',  # Whitespace only
+        'gpu.nvidia.com/class': '\t\n',  # Whitespace only
+    }
+
+    nodes_with_whitespace = [mock_cpu_node_whitespace, mock_gpu_node]
+
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                    return_value=nodes_with_whitespace):
+        lf, _ = utils.detect_gpu_label_formatter('test-context')
+        assert lf is not None
+        assert isinstance(lf, utils.CoreWeaveLabelFormatter)
+        utils.detect_gpu_label_formatter.cache_clear()
+
+
+# pylint: disable=line-too-long
+def test_heterogenous_gpu_detection():
+    """Tests that a heterogenous gpu cluster with empty
+    labels are correctly processed."""
+
+    mock_node1 = mock.MagicMock()
+    mock_node1.metadata.name = 'node1'
+    mock_node1.metadata.labels = {
+        'cloud.google.com/gke-accelerator': 'nvidia-h100-80gb',
+        'gpu.nvidia.com/class': 'nvidia-h100-80gb',
+        'gpu.nvidia.com/count': '2',
+        'gpu.nvidia.com/model': 'nvidia-h100-80gb',
+        'gpu.nvidia.com/vram': '81'
+    }
+    mock_node1.status.allocatable = {'nvidia.com/gpu': '2'}
+    mock_node1.is_ready.return_value = True
+    mock_node1.is_cordoned.return_value = False
+    mock_node1.get_taints.return_value = []
+
+    mock_node2 = mock.MagicMock()
+    mock_node2.metadata.name = 'node2'
+    mock_node2.metadata.labels = {'cloud.google.com/gke-accelerator': ''}
+    mock_node2.is_ready.return_value = True
+    mock_node2.is_cordoned.return_value = False
+    mock_node2.get_taints.return_value = []
+
+    mock_container1 = mock.MagicMock()
+    mock_container1.resources.requests = 0
+
+    mock_pod1 = mock.MagicMock()
+    mock_pod1.spec.node_name = 'node1'
+    mock_pod1.status.phase = 'Running'
+    mock_pod1.spec.containers = [mock_container1]
+
+    mock_container2 = mock.MagicMock()
+    mock_container2.resources.requests = 0
+
+    mock_pod2 = mock.MagicMock()
+    mock_pod2.spec.node_name = 'node2'
+    mock_pod2.status.phase = 'Running'
+    mock_pod2.spec.containers = [mock_container2]
+
+    with mock.patch('sky.clouds.cloud_in_iterable', return_value=True), \
+         mock.patch('sky.provision.kubernetes.utils.get_current_kube_config_context_name', return_value='doesntexist'), \
+         mock.patch('sky.provision.kubernetes.utils.check_credentials', return_value=[True]), \
+         mock.patch('sky.provision.kubernetes.utils.detect_accelerator_resource', return_value=True), \
+         mock.patch('sky.provision.kubernetes.utils.detect_gpu_label_formatter', return_value=[utils.GKELabelFormatter(), None]), \
+         mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes', return_value=[mock_node1, mock_node2]), \
+         mock.patch('sky.provision.kubernetes.utils.get_allocated_resources_by_node', return_value=({mock_node1.metadata.name: 1, mock_node2.metadata.name: 0}, {})), \
+         mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key', return_value='nvidia.com/gpu'):
+
+        counts, capacity, available = kubernetes_catalog.list_accelerators_realtime(
+            True, None, None, None)
+        assert (set(counts.keys()) == set(capacity.keys()) == set(available.keys())), \
+            (f'Keys of counts ({list(counts.keys())}), capacity ({list(capacity.keys())}), '
+             f'and available ({list(available.keys())}) must be the same.')
+        assert available == {'H100': 1}
+
+
+def test_low_priority_pod_filtering():
+    """Tests that low priority pods (e.g., CoreWeave HPC verification) are excluded from GPU allocation calculations."""
+    # Mock node with 8 GPUs
+    mock_node = mock.MagicMock()
+    mock_node.metadata.name = 'gpu-node'
+    mock_node.metadata.labels = {
+        'skypilot.co/accelerator': 'h100-80gb',
+        'cloud.google.com/gke-accelerator-count': '8'
+    }
+    mock_node.status.allocatable = {'nvidia.com/gpu': '8'}
+    mock_node.status.addresses = [
+        mock.MagicMock(type='InternalIP', address='10.0.0.1')
+    ]
+    mock_node.is_ready.return_value = True
+    mock_node.is_cordoned.return_value = False
+    mock_node.get_taints.return_value = []
+
+    # Mock regular pod requesting 2 GPUs
+    mock_regular_pod = mock.MagicMock()
+    mock_regular_pod.spec.node_name = 'gpu-node'
+    mock_regular_pod.status.phase = 'Running'
+    mock_regular_pod.metadata.name = 'regular-workload-pod'
+    mock_regular_pod.metadata.namespace = 'default'
+    mock_regular_pod.spec.containers = [
+        mock.MagicMock(resources=mock.MagicMock(
+            requests={'nvidia.com/gpu': '2'}))
+    ]
+
+    # Mock low priority pod requesting 4 GPUs (should be excluded)
+    mock_low_priority_pod = mock.MagicMock()
+    mock_low_priority_pod.spec.node_name = 'gpu-node'
+    mock_low_priority_pod.status.phase = 'Running'
+    mock_low_priority_pod.metadata.name = 'hpc-verification-h100-80gb-test'
+    mock_low_priority_pod.metadata.namespace = 'cw-hpc-verification'
+    mock_low_priority_pod.spec.containers = [
+        mock.MagicMock(resources=mock.MagicMock(
+            requests={'nvidia.com/gpu': '4'}))
+    ]
+
+    # Test with low priority pod filtering
+    with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                   return_value=[mock_node]), \
+         mock.patch('sky.provision.kubernetes.utils.'
+                   'get_allocated_resources_by_node',
+                   return_value=({mock_node.metadata.name: 2}, {})), \
+         mock.patch('sky.provision.kubernetes.utils.get_gpu_resource_key',
+                    return_value='nvidia.com/gpu'):
+
+        node_info = utils.get_kubernetes_node_info()
+        assert isinstance(node_info, models.KubernetesNodesInfo)
+        assert len(node_info.node_info_dict) == 1
+        # Should have 8 total GPUs, 2 allocated (regular pod only), 6 available
+        # Low priority pod should be excluded from allocation calculations
+        assert node_info.node_info_dict['gpu-node'].total[
+            'accelerator_count'] == 8
+        assert node_info.node_info_dict['gpu-node'].free[
+            'accelerators_available'] == 6
+
+
+def test_should_exclude_pod_from_gpu_allocation():
+    """Tests the helper function that identifies pods to exclude from GPU allocation calculations."""
+    # Test CoreWeave HPC verification pod (should be excluded)
+    mock_hpc_pod = mock.MagicMock()
+    mock_hpc_pod.metadata.namespace = 'cw-hpc-verification'
+
+    # Test regular pod (should not be excluded)
+    mock_regular_pod = mock.MagicMock()
+    mock_regular_pod.metadata.namespace = 'default'
+
+    # Test pod with different namespace (should not be excluded)
+    mock_other_pod = mock.MagicMock()
+    mock_other_pod.metadata.namespace = 'some-other-namespace'
+
+    # CoreWeave HPC verification pod should be excluded
+    assert utils.should_exclude_pod_from_gpu_allocation(mock_hpc_pod) == True
+
+    # Regular pods should not be excluded
+    assert utils.should_exclude_pod_from_gpu_allocation(
+        mock_regular_pod) == False
+    assert utils.should_exclude_pod_from_gpu_allocation(mock_other_pod) == False
+
+
+class TestCheckPodConfig(unittest.TestCase):
+    """Unit tests for check_pod_config."""
+
+    # apiVersion: v1 and kind: Pod are not required, since
+    # we are just validating the metadata and spec fields.
+    MINIMAL_POD_BASE = '''
+metadata:
+  name: test-pod
+spec:
+  containers:
+  - name: default-container
+    image: alpine:latest'''
+
+    def _check_pod_config(self,
+                          yaml_string: str,
+                          expected_is_valid: bool,
+                          expected_error_msg: Optional[str] = None):
+        """Helper method to test pod config validation.
+
+        Args:
+            yaml_string: YAML string to validate
+            expected_is_valid: Expected validation result
+            expected_error_msg: Expected error message (if any). If provided, checks that this string is contained in the error message.
+        """
+        pod_dict = yaml.safe_load(yaml_string)
+        is_valid, error_msg = utils.check_pod_config(pod_dict)
+        assert is_valid == expected_is_valid
+
+        if expected_is_valid:
+            assert error_msg is None
+        else:
+            assert error_msg is not None
+            if expected_error_msg:
+                assert expected_error_msg in error_msg
+
+    def test_minimal_valid_pod(self):
+        """Test with minimal valid pod configuration."""
+        self._check_pod_config(self.MINIMAL_POD_BASE, True)
+
+    def test_invalid_pod_spec_field_name(self):
+        """Test with invalid pod spec field names."""
+        # Potential user typo: volume instead of volumes
+        invalid_pod_spec_field = f'''
+{self.MINIMAL_POD_BASE}
+  volume: some-value'''
+
+        self._check_pod_config(
+            invalid_pod_spec_field,
+            False,
+            expected_error_msg='Validation error in spec.volume: Unknown field')
+
+    def test_invalid_container_spec_field_name(self):
+        """Test with invalid container field names."""
+        # Potential user typo: arg instead of args
+        invalid_container_field = f'''
+{self.MINIMAL_POD_BASE}
+    arg: ['hello']'''
+
+        self._check_pod_config(
+            invalid_container_field,
+            False,
+            expected_error_msg=
+            'Validation error in spec.containers.arg: Unknown field')
+
+    def test_invalid_metadata_field_name(self):
+        """Test with invalid metadata field names."""
+        invalid_metadata_field = '''
+metadata:
+  name: invalid-metadata-pod
+  invalidMetadataField: invalid-value
+spec:
+  containers:
+  - name: container
+    image: alpine:latest'''
+
+        self._check_pod_config(
+            invalid_metadata_field,
+            False,
+            expected_error_msg=
+            'Validation error in metadata.invalidMetadataField: Unknown field')
+
+    def test_missing_required_container_name(self):
+        """Test with missing required container name."""
+        # `name` is required by V1Container
+        container_without_name = '''
+spec:
+  containers:
+  - image: alpine:latest
+'''
+
+        self._check_pod_config(
+            container_without_name,
+            False,
+            expected_error_msg=
+            'Validation error in spec.containers: Invalid value for `name`')
+
+    def test_missing_required_volume_name(self):
+        """Test with missing required volume name."""
+        # `name` is required by V1Volume
+        volume_without_name = f'''
+{self.MINIMAL_POD_BASE}
+  volumes:
+  - persistentVolumeClaim:
+      claimName: my-pvc
+'''
+
+        self._check_pod_config(
+            volume_without_name,
+            False,
+            expected_error_msg=
+            'Validation error in spec.volumes: Invalid value for `name`')
+
+    def test_missing_required_container_env_name(self):
+        """Test with missing required container env name."""
+        # `name` is required by V1EnvVar
+        container_without_env_name = f'''
+{self.MINIMAL_POD_BASE}
+spec:
+  containers:
+  - name: default-container
+    image: alpine:latest
+    env:
+    - value: some-value
+'''
+
+        self._check_pod_config(
+            container_without_env_name,
+            False,
+            expected_error_msg=
+            'Validation error in spec.containers.env: Invalid value for `name`')
+
+    def test_missing_optional_container_image(self):
+        """Test with missing optional container image."""
+        # `image` is optional in V1Container
+        container_without_image = '''
+spec:
+  containers:
+  - name: test-container'''
+        self._check_pod_config(container_without_image, True)
+
+    def test_spec_without_containers(self):
+        """Test with spec without containers."""
+        spec_without_containers = '''
+spec: {}'''
+
+        self._check_pod_config(
+            spec_without_containers,
+            False,
+            expected_error_msg=
+            'Validation error in spec: Invalid value for `containers`')
+
+    def test_valid_field_invalid_type(self):
+        """Test with valid field but invalid type.
+
+        This won't be caught by the client-side validation, but will be
+        caught later on by the Kubernetes API server in run_instances.
+        """
+        valid_field_invalid_type = f'''
+{self.MINIMAL_POD_BASE}
+    readinessProbe: hello
+'''
+        self._check_pod_config(valid_field_invalid_type, True)
+
+    def test_comprehensive_pod_features(self):
+        """Test pod with comprehensive Kubernetes features."""
+        comprehensive_pod_config = '''
+metadata:
+  name: comprehensive-test-pod
+  namespace: test-namespace
+  labels:
+    app: comprehensive-app
+    version: v2.0
+    tier: backend
+  annotations:
+    description: "Comprehensive pod testing all Kubernetes features"
+    scheduler.alpha.kubernetes.io/critical-pod: ""
+    container.apparmor.security.beta.kubernetes.io/gpu-container: runtime/default
+    k8s.v1.cni.cncf.io/networks: macvlan-conf
+spec:
+  restartPolicy: OnFailure
+  terminationGracePeriodSeconds: 60
+  activeDeadlineSeconds: 3600
+  priorityClassName: high-priority
+  priority: 1000
+  serviceAccountName: comprehensive-service-account
+  automountServiceAccountToken: true
+  hostNetwork: false
+  hostPID: false
+  hostIPC: false
+  dnsPolicy: ClusterFirst
+  enableServiceLinks: false
+  shareProcessNamespace: false
+  dnsConfig:
+    nameservers:
+    - 8.8.8.8
+    - 8.8.4.4
+    searches:
+    - example.com
+    - cluster.local
+    options:
+    - name: ndots
+      value: "2"
+  hostAliases:
+  - ip: "192.168.1.100"
+    hostnames:
+    - "example.com"
+  imagePullSecrets:
+  - name: registry-secret-1
+  - name: registry-secret-2
+  securityContext:
+    runAsUser: 1000
+    runAsGroup: 3000
+    runAsNonRoot: true
+    fsGroup: 2000
+    supplementalGroups: [4000, 5000]
+    seLinuxOptions:
+      level: "s0:c123,c456"
+    sysctls:
+    - name: net.core.somaxconn
+      value: "1024"
+  nodeSelector:
+    kubernetes.io/arch: amd64
+    node-type: gpu-enabled
+  tolerations:
+  - key: nvidia.com/gpu
+    operator: Exists
+    effect: NoSchedule
+  - key: dedicated
+    operator: Equal
+    value: "true"
+    effect: NoExecute
+    tolerationSeconds: 300
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+        - matchExpressions:
+          - key: kubernetes.io/arch
+            operator: In
+            values: ["amd64", "arm64"]
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        preference:
+          matchExpressions:
+          - key: node-type
+            operator: In
+            values: ["gpu-enabled"]
+    podAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app: database
+        topologyKey: kubernetes.io/hostname
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 50
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app: web-server
+          topologyKey: kubernetes.io/hostname
+  topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app: comprehensive-app
+  initContainers:
+  - name: init-setup
+    image: busybox:latest
+    command: ['sh', '-c', 'echo "Initializing..." && sleep 5']
+    securityContext:
+      runAsUser: 1001
+      allowPrivilegeEscalation: false
+  - name: init-download
+    image: curlimages/curl:latest
+    command: ['curl', '-o', '/shared/config.json', 'https://example.com/config']
+    volumeMounts:
+    - name: shared-data
+      mountPath: /shared
+  containers:
+  - name: gpu-app-container
+    image: nvidia/cuda:11.8-devel-ubuntu20.04
+    imagePullPolicy: Always
+    workingDir: /app
+    command: ["python", "/app/main.py"]
+    args: ["-c", "/config/app.conf"]
+    ports:
+    - name: http
+      containerPort: 8080
+      protocol: TCP
+    - name: metrics
+      containerPort: 9090
+      protocol: TCP
+    resources:
+      requests:
+        nvidia.com/gpu: "2"
+        cpu: "2"
+        memory: "4Gi"
+        ephemeral-storage: "10Gi"
+        hugepages-2Mi: "1Gi"
+      limits:
+        nvidia.com/gpu: "2"
+        cpu: "4"
+        memory: "8Gi"
+        ephemeral-storage: "20Gi"
+        hugepages-2Mi: "1Gi"
+    env:
+    - name: CUDA_VISIBLE_DEVICES
+      value: "0,1"
+    - name: POD_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.name
+    - name: POD_NAMESPACE
+      valueFrom:
+        fieldRef:
+          fieldPath: metadata.namespace
+    - name: NODE_NAME
+      valueFrom:
+        fieldRef:
+          fieldPath: spec.nodeName
+    - name: CONFIG_VALUE
+      valueFrom:
+        configMapKeyRef:
+          name: app-config
+          key: config-key
+          optional: true
+    - name: SECRET_VALUE
+      valueFrom:
+        secretKeyRef:
+          name: app-secrets
+          key: secret-key
+    - name: RESOURCE_LIMIT_CPU
+      valueFrom:
+        resourceFieldRef:
+          resource: limits.cpu
+    envFrom:
+    - configMapRef:
+        name: env-config
+        optional: true
+    - secretRef:
+        name: env-secrets
+    - prefix: DB_
+      configMapRef:
+        name: database-config
+    securityContext:
+      runAsUser: 1001
+      runAsGroup: 3001
+      runAsNonRoot: true
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        add: ["NET_ADMIN", "SYS_TIME"]
+        drop: ["ALL"]
+      seccompProfile:
+        type: RuntimeDefault
+      procMount: Default
+    lifecycle:
+      postStart:
+        exec:
+          command: ["/bin/sh", "-c", "echo 'Container started' > /var/log/startup.log"]
+      preStop:
+        httpGet:
+          path: /shutdown
+          port: 8080
+          scheme: HTTP
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 8080
+        httpHeaders:
+        - name: Custom-Header
+          value: health-check
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      successThreshold: 1
+      failureThreshold: 3
+    readinessProbe:
+      tcpSocket:
+        port: 8080
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      timeoutSeconds: 3
+      successThreshold: 1
+      failureThreshold: 3
+    startupProbe:
+      exec:
+        command: ["cat", "/tmp/healthy"]
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      timeoutSeconds: 1
+      successThreshold: 1
+      failureThreshold: 30
+    volumeMounts:
+    - name: pvc-volume
+      mountPath: /data
+    - name: config-volume
+      mountPath: /config
+      readOnly: true
+    - name: secret-volume
+      mountPath: /secrets
+      readOnly: true
+    - name: shared-data
+      mountPath: /shared
+    - name: empty-volume
+      mountPath: /tmp-data
+    - name: projected-volume
+      mountPath: /projected
+      subPath: configs
+    - name: writable-volume
+      mountPath: /writable
+    volumeDevices:
+    - name: block-volume
+      devicePath: /dev/block-device
+  - name: tpu-sidecar
+    image: tensorflow/tensorflow:latest
+    resources:
+      requests:
+        google.com/tpu: "1"
+        cpu: "1"
+        memory: "2Gi"
+      limits:
+        google.com/tpu: "1"
+        cpu: "2"
+        memory: "4Gi"
+    volumeMounts:
+    - name: log-volume
+      mountPath: /var/log
+  volumes:
+  - name: pvc-volume
+    persistentVolumeClaim:
+      claimName: my-pvc
+      readOnly: false
+  - name: config-volume
+    configMap:
+      name: app-config
+      defaultMode: 0644
+      items:
+      - key: config.yaml
+        path: app-config.yaml
+        mode: 0600
+  - name: secret-volume
+    secret:
+      secretName: app-secrets
+      defaultMode: 0400
+  - name: host-volume
+    hostPath:
+      path: /host/data
+      type: DirectoryOrCreate
+  - name: empty-volume
+    emptyDir:
+      sizeLimit: "2Gi"
+      medium: Memory
+  - name: shared-data
+    emptyDir: {}
+  - name: log-volume
+    emptyDir: {}
+  - name: writable-volume
+    emptyDir: {}
+  - name: projected-volume
+    projected:
+      defaultMode: 0644
+      sources:
+      - configMap:
+          name: config1
+      - secret:
+          name: secret1
+      - serviceAccountToken:
+          path: token
+          expirationSeconds: 3600
+  - name: block-volume
+    persistentVolumeClaim:
+      claimName: block-pvc
+'''
+
+        self._check_pod_config(comprehensive_pod_config, True)
+
+
+def test_parse_cpu_or_gpu_resource_to_float():
+    """Test parse_cpu_or_gpu_resource_to_float function."""
+    # Test with millicore values (ending with 'm')
+    assert utils.parse_cpu_or_gpu_resource_to_float('500m') == 0.5
+    assert utils.parse_cpu_or_gpu_resource_to_float('1000m') == 1.0
+    assert utils.parse_cpu_or_gpu_resource_to_float('250m') == 0.25
+    assert utils.parse_cpu_or_gpu_resource_to_float('1m') == 0.001
+    assert utils.parse_cpu_or_gpu_resource_to_float('0m') == 0.0
+
+    # Test with whole number values (no 'm' suffix)
+    assert utils.parse_cpu_or_gpu_resource_to_float('1') == 1.0
+    assert utils.parse_cpu_or_gpu_resource_to_float('2') == 2.0
+    assert utils.parse_cpu_or_gpu_resource_to_float('0') == 0.0
+    assert utils.parse_cpu_or_gpu_resource_to_float('4.5') == 4.5
+    assert utils.parse_cpu_or_gpu_resource_to_float('0.5') == 0.5
+
+    # Test edge cases
+    assert utils.parse_cpu_or_gpu_resource_to_float('') == 0.0  # Empty string
+
+
+def test_parse_memory_resource_with_millibytes():
+    """Test parse_memory_resource function with lowercase 'm' suffix.
+
+    This test verifies that parse_memory_resource correctly handles memory
+    values with lowercase 'm' suffix like '100m' = 0.1 bytes.
+    Note: For memory, 'm' means milli (0.001 bytes), so 100m = 100 * 0.001 = 0.1 bytes.
+    """
+    # Test with lowercase 'm' suffix (millibytes)
+    # 100m = 100 * 0.001 bytes = 0.1 bytes
+    assert utils.parse_memory_resource('100m', unit='B') == 0.1
+
+    # 1000m = 1000 * 0.001 bytes = 1.0 bytes
+    assert utils.parse_memory_resource('1000m', unit='B') == 1.0
+
+    # 500m = 500 * 0.001 bytes = 0.5 bytes
+    assert utils.parse_memory_resource('500m', unit='B') == 0.5
+
+    # Test conversion to GB: 100m = 0.1 bytes = 0.1 / (2^30) GB
+    result = utils.parse_memory_resource('100m', unit='G')
+    expected = 0.1 / (2**30)
+    assert abs(result - expected) < 1e-15
+
+    # Test with standard memory units (should work)
+    assert utils.parse_memory_resource('1Gi', unit='G') == 1.0
+    assert utils.parse_memory_resource('512Mi', unit='G') == 0.5
+    assert utils.parse_memory_resource('1024Mi', unit='G') == 1.0
+
+    # Test with bytes (no unit)
+    assert utils.parse_memory_resource('1024', unit='K') == 1.0
+
+
+def test_coreweave_autoscaler():
+    """Test that CoreweaveAutoscaler is properly configured."""
+    from sky.provision.kubernetes.utils import AUTOSCALER_TYPE_TO_AUTOSCALER
+    from sky.provision.kubernetes.utils import CoreweaveAutoscaler
+    from sky.provision.kubernetes.utils import CoreWeaveLabelFormatter
+    from sky.utils import kubernetes_enums
+
+    # Test that COREWEAVE autoscaler type is mapped correctly
+    autoscaler_class = AUTOSCALER_TYPE_TO_AUTOSCALER.get(
+        kubernetes_enums.KubernetesAutoscalerType.COREWEAVE)
+    assert autoscaler_class is not None
+    assert autoscaler_class == CoreweaveAutoscaler
+
+    # Test that CoreweaveAutoscaler uses the correct label formatter
+    assert CoreweaveAutoscaler.label_formatter == CoreWeaveLabelFormatter
+
+    # Test that CoreweaveAutoscaler cannot query backend (like other simple autoscalers)
+    assert CoreweaveAutoscaler.can_query_backend == False
+
+
+def test_combine_pod_config_fields_ssh_cloud():
+    """Test combine_pod_config_fields with SSH cloud and context handling."""
+    from sky import clouds
+    from sky.utils import config_utils
+
+    # Create a basic cluster YAML object
+    cluster_yaml_obj = {
+        'available_node_types': {
+            'ray_head_default': {
+                'node_config': {
+                    'spec': {
+                        'containers': [{
+                            'name': 'ray',
+                            'image': 'rayproject/ray:nightly'
+                        }]
+                    }
+                }
+            }
+        }
+    }
+
+    # Test 1: SSH cloud without context
+    ssh_cloud = clouds.SSH()
+    cluster_config_overrides = {}
+
+    with patch('sky.skypilot_config.get_effective_region_config',
+               return_value={}):
+        result = utils.combine_pod_config_fields(cluster_yaml_obj,
+                                                 cluster_config_overrides,
+                                                 cloud=ssh_cloud)
+        assert result is not None
+        assert 'available_node_types' in result
+
+    # Test 2: SSH cloud with context (should strip "ssh-" prefix)
+    ssh_context = 'ssh-my-cluster'
+    pod_config_for_context = {
+        'spec': {
+            'imagePullSecrets': [{
+                'name': 'my-secret'
+            }]
+        }
+    }
+
+    with patch('sky.skypilot_config.get_effective_region_config'
+              ) as mock_get_config:
+
+        def _side_effect_ssh(cloud, region, keys, default_value):
+            if keys == ('pod_config',):
+                return pod_config_for_context
+            return default_value
+
+        mock_get_config.side_effect = _side_effect_ssh
+        result = utils.combine_pod_config_fields(cluster_yaml_obj,
+                                                 cluster_config_overrides,
+                                                 cloud=ssh_cloud,
+                                                 context=ssh_context)
+
+        # Verify that get_effective_region_config was called with 'ssh' cloud
+        # and context without the "ssh-" prefix for pod_config.
+        assert mock_get_config.call_count == 1
+        mock_get_config.assert_has_calls([
+            call(cloud='ssh',
+                 region='my-cluster',
+                 keys=('pod_config',),
+                 default_value={}),
+        ],
+                                         any_order=False)
+
+        # Verify the pod config was merged
+        node_config = result['available_node_types']['ray_head_default'][
+            'node_config']
+        assert 'imagePullSecrets' in node_config['spec']
+        assert node_config['spec']['imagePullSecrets'][0]['name'] == 'my-secret'
+
+    # Test 3: SSH cloud with context that doesn't start with "ssh-" should raise assertion
+    invalid_context = 'my-cluster'
+    with pytest.raises(AssertionError,
+                       match='SSH context must start with "ssh-"'):
+        utils.combine_pod_config_fields(cluster_yaml_obj,
+                                        cluster_config_overrides,
+                                        cloud=ssh_cloud,
+                                        context=invalid_context)
+
+
+def test_combine_pod_config_fields_kubernetes_cloud():
+    """Test combine_pod_config_fields with Kubernetes cloud."""
+    from sky import clouds
+
+    # Create a basic cluster YAML object
+    cluster_yaml_obj = {
+        'available_node_types': {
+            'ray_head_default': {
+                'node_config': {
+                    'spec': {
+                        'containers': [{
+                            'name': 'ray',
+                            'image': 'rayproject/ray:nightly'
+                        }]
+                    }
+                }
+            }
+        }
+    }
+
+    # Test with Kubernetes cloud and context
+    k8s_cloud = clouds.Kubernetes()
+    k8s_context = 'my-k8s-cluster'
+    cluster_config_overrides = {}
+    pod_config_for_context = {'spec': {'nodeSelector': {'gpu': 'true'}}}
+
+    with patch('sky.skypilot_config.get_effective_region_config'
+              ) as mock_get_config:
+
+        def _side_effect_k8s(cloud, region, keys, default_value):
+            if keys == ('pod_config',):
+                return pod_config_for_context
+            return default_value
+
+        mock_get_config.side_effect = _side_effect_k8s
+        result = utils.combine_pod_config_fields(cluster_yaml_obj,
+                                                 cluster_config_overrides,
+                                                 cloud=k8s_cloud,
+                                                 context=k8s_context)
+
+        # Verify that get_effective_region_config was called with 'kubernetes'
+        # cloud and the context as-is for pod_config.
+        assert mock_get_config.call_count == 1
+        mock_get_config.assert_has_calls([
+            call(cloud='kubernetes',
+                 region=k8s_context,
+                 keys=('pod_config',),
+                 default_value={}),
+        ],
+                                         any_order=False)
+
+        # Verify the pod config was merged
+        node_config = result['available_node_types']['ray_head_default'][
+            'node_config']
+        assert 'nodeSelector' in node_config['spec']
+        assert node_config['spec']['nodeSelector']['gpu'] == 'true'
+
+
+def test_ssh_cloud_uses_ssh_config_for_provision_timeout():
+    """Test that SSH cloud uses 'ssh' cloud name for provision_timeout config lookup."""
+    from sky import clouds
+    from sky.utils import config_utils
+
+    # Create SSH and Kubernetes cloud instances
+    ssh_cloud = clouds.SSH()
+    k8s_cloud = clouds.Kubernetes()
+
+    # Verify that _REPR is set correctly
+    assert ssh_cloud._REPR == 'SSH'
+    assert k8s_cloud._REPR == 'Kubernetes'
+
+    # Create a config dictionary with both ssh and kubernetes provision_timeout
+    config_dict = {
+        'ssh': {
+            'provision_timeout': 7200,
+            'context_configs': {
+                'my-cluster': {
+                    'provision_timeout': 9000
+                }
+            }
+        },
+        'kubernetes': {
+            'provision_timeout': 3600,
+            'context_configs': {
+                'k8s-cluster': {
+                    'provision_timeout': 5400
+                }
+            }
+        }
+    }
+
+    # Test SSH cloud retrieves from 'ssh' config
+    ssh_timeout = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='ssh',
+        region=None,
+        keys=('provision_timeout',),
+        default_value=600)
+    assert ssh_timeout == 7200
+
+    # Test SSH cloud retrieves context-specific timeout
+    ssh_context_timeout = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='ssh',
+        region='my-cluster',
+        keys=('provision_timeout',),
+        default_value=600)
+    assert ssh_context_timeout == 9000
+
+    # Test Kubernetes cloud retrieves from 'kubernetes' config
+    k8s_timeout = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='kubernetes',
+        region=None,
+        keys=('provision_timeout',),
+        default_value=600)
+    assert k8s_timeout == 3600
+
+    # Test Kubernetes cloud retrieves context-specific timeout
+    k8s_context_timeout = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='kubernetes',
+        region='k8s-cluster',
+        keys=('provision_timeout',),
+        default_value=600)
+    assert k8s_context_timeout == 5400
+
+
+def test_ssh_cloud_context_stripping():
+    """Test that SSH cloud contexts have 'ssh-' prefix stripped when looking up config."""
+    from sky import clouds
+    from sky.utils import config_utils
+
+    ssh_cloud = clouds.SSH()
+
+    # SSH contexts are prefixed with 'ssh-', but the config uses the name without prefix
+    ssh_context = 'ssh-my-cluster'
+    expected_config_key = 'my-cluster'
+
+    config_dict = {
+        'ssh': {
+            'context_configs': {
+                'my-cluster': {  # Config uses name without 'ssh-' prefix
+                    'provision_timeout': 9000,
+                    'pod_config': {
+                        'metadata': {
+                            'labels': {
+                                'team': 'ml'
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    # When combine_pod_config_fields receives 'ssh-my-cluster' context,
+    # it should strip the 'ssh-' prefix and look up 'my-cluster' in the config
+    timeout = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='ssh',
+        region=expected_config_key,  # Uses stripped name
+        keys=('provision_timeout',),
+        default_value=600)
+    assert timeout == 9000
+
+    pod_config = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='ssh',
+        region=expected_config_key,
+        keys=('pod_config',),
+        default_value={})
+    assert pod_config == {'metadata': {'labels': {'team': 'ml'}}}
+
+
+def test_ssh_config_does_not_leak_to_kubernetes():
+    """Test that SSH pod_config does not leak to Kubernetes cloud."""
+    from sky import clouds
+    from sky.utils import config_utils
+
+    # Config with both SSH and Kubernetes sections
+    config_dict = {
+        'ssh': {
+            'pod_config': {
+                'metadata': {
+                    'labels': {
+                        'source': 'ssh-config',
+                        'ssh-only': 'true'
+                    }
+                }
+            },
+            'provision_timeout': 7200
+        },
+        'kubernetes': {
+            'pod_config': {
+                'metadata': {
+                    'labels': {
+                        'source': 'kubernetes-config',
+                        'k8s-only': 'true'
+                    }
+                }
+            },
+            'provision_timeout': 3600
+        }
+    }
+
+    # Kubernetes cloud should ONLY get kubernetes config
+    k8s_pod_config = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='kubernetes',
+        region=None,
+        keys=('pod_config',),
+        default_value={})
+
+    # Verify it got kubernetes config, NOT ssh config
+    assert k8s_pod_config['metadata']['labels']['source'] == 'kubernetes-config'
+    assert 'k8s-only' in k8s_pod_config['metadata']['labels']
+    assert 'ssh-only' not in k8s_pod_config['metadata']['labels'], \
+        "SSH config should NOT leak to Kubernetes"
+
+    # Kubernetes provision_timeout should be from kubernetes config
+    k8s_timeout = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='kubernetes',
+        region=None,
+        keys=('provision_timeout',),
+        default_value=600)
+    assert k8s_timeout == 3600, "Should get Kubernetes timeout, not SSH timeout"
+
+
+def test_kubernetes_config_does_not_leak_to_ssh():
+    """Test that Kubernetes pod_config does not leak to SSH cloud."""
+    from sky import clouds
+    from sky.utils import config_utils
+
+    # Config with both SSH and Kubernetes sections
+    config_dict = {
+        'ssh': {
+            'pod_config': {
+                'metadata': {
+                    'labels': {
+                        'source': 'ssh-config',
+                        'ssh-only': 'true'
+                    }
+                }
+            },
+            'provision_timeout': 7200
+        },
+        'kubernetes': {
+            'pod_config': {
+                'metadata': {
+                    'labels': {
+                        'source': 'kubernetes-config',
+                        'k8s-only': 'true'
+                    }
+                }
+            },
+            'provision_timeout': 3600
+        }
+    }
+
+    # SSH cloud should ONLY get ssh config
+    ssh_pod_config = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='ssh',
+        region=None,
+        keys=('pod_config',),
+        default_value={})
+
+    # Verify it got ssh config, NOT kubernetes config
+    assert ssh_pod_config['metadata']['labels']['source'] == 'ssh-config'
+    assert 'ssh-only' in ssh_pod_config['metadata']['labels']
+    assert 'k8s-only' not in ssh_pod_config['metadata']['labels'], \
+        "Kubernetes config should NOT leak to SSH"
+
+    # SSH provision_timeout should be from ssh config
+    ssh_timeout = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='ssh',
+        region=None,
+        keys=('provision_timeout',),
+        default_value=600)
+    assert ssh_timeout == 7200, "Should get SSH timeout, not Kubernetes timeout"
+
+
+def test_ssh_and_kubernetes_context_configs_isolated():
+    """Test that SSH and Kubernetes context configs are completely isolated."""
+    from sky import clouds
+    from sky.utils import config_utils
+
+    # Config with context_configs for both clouds
+    config_dict = {
+        'ssh': {
+            'context_configs': {
+                'my-cluster': {
+                    'pod_config': {
+                        'metadata': {
+                            'labels': {
+                                'from': 'ssh-context-config'
+                            }
+                        }
+                    },
+                    'provision_timeout': 9000
+                }
+            }
+        },
+        'kubernetes': {
+            'context_configs': {
+                'my-cluster': {  # Same context name as SSH
+                    'pod_config': {
+                        'metadata': {
+                            'labels': {
+                                'from': 'k8s-context-config'
+                            }
+                        }
+                    },
+                    'provision_timeout': 5400
+                }
+            }
+        }
+    }
+
+    # SSH should only get SSH context config
+    ssh_pod_config = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='ssh',
+        region='my-cluster',
+        keys=('pod_config',),
+        default_value={})
+    assert ssh_pod_config['metadata']['labels']['from'] == 'ssh-context-config', \
+        "SSH should get SSH context config"
+    assert ssh_pod_config['metadata']['labels']['from'] != 'k8s-context-config', \
+        "SSH should NOT get Kubernetes context config (no leakage)"
+
+    ssh_timeout = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='ssh',
+        region='my-cluster',
+        keys=('provision_timeout',),
+        default_value=600)
+    assert ssh_timeout == 9000, \
+        "SSH should get SSH provision_timeout"
+    assert ssh_timeout != 5400, \
+        "SSH should NOT get Kubernetes provision_timeout (no leakage)"
+
+    # Kubernetes should only get Kubernetes context config
+    k8s_pod_config = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='kubernetes',
+        region='my-cluster',
+        keys=('pod_config',),
+        default_value={})
+    assert k8s_pod_config['metadata']['labels']['from'] == 'k8s-context-config', \
+        "Kubernetes should get Kubernetes context config"
+    assert k8s_pod_config['metadata']['labels']['from'] != 'ssh-context-config', \
+        "Kubernetes should NOT get SSH context config (no leakage)"
+
+    k8s_timeout = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='kubernetes',
+        region='my-cluster',
+        keys=('provision_timeout',),
+        default_value=600)
+    assert k8s_timeout == 5400, \
+        "Kubernetes should get Kubernetes provision_timeout"
+    assert k8s_timeout != 9000, \
+        "Kubernetes should NOT get SSH provision_timeout (no leakage)"
+
+
+def test_context_configs_no_leakage_between_ssh_and_kubernetes():
+    """Test that context_configs with same context name don't leak across clouds.
+
+    This is a critical test ensuring that when both SSH and Kubernetes have
+    context_configs for the same context name (e.g., 'my-cluster'), they are
+    completely isolated and don't leak into each other.
+    """
+    from sky.utils import config_utils
+
+    # Both SSH and Kubernetes have context_configs for 'my-cluster'
+    # with DIFFERENT values that should NOT leak
+    config_dict = {
+        'ssh': {
+            'context_configs': {
+                'my-cluster': {
+                    'pod_config': {
+                        'metadata': {
+                            'labels': {
+                                'cloud': 'ssh',
+                                'ssh-only-label': 'ssh-value'
+                            }
+                        }
+                    },
+                    'provision_timeout': 7200
+                }
+            }
+        },
+        'kubernetes': {
+            'context_configs': {
+                'my-cluster': {  # SAME context name!
+                    'pod_config': {
+                        'metadata': {
+                            'labels': {
+                                'cloud': 'kubernetes',
+                                'k8s-only-label': 'k8s-value'
+                            }
+                        }
+                    },
+                    'provision_timeout': 3600
+                }
+            }
+        }
+    }
+
+    # Test SSH lookup for 'my-cluster'
+    ssh_result = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='ssh',
+        region='my-cluster',
+        keys=('pod_config',),
+        default_value={})
+
+    # SSH should have SSH labels
+    assert ssh_result['metadata']['labels']['cloud'] == 'ssh'
+    assert 'ssh-only-label' in ssh_result['metadata']['labels']
+    assert ssh_result['metadata']['labels']['ssh-only-label'] == 'ssh-value'
+
+    # SSH should NOT have Kubernetes labels (no leakage)
+    assert 'k8s-only-label' not in ssh_result['metadata']['labels'], \
+        "Kubernetes labels should NOT leak into SSH context_configs"
+    assert ssh_result['metadata']['labels']['cloud'] != 'kubernetes', \
+        "Kubernetes cloud label should NOT leak into SSH context_configs"
+
+    # Test Kubernetes lookup for 'my-cluster'
+    k8s_result = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='kubernetes',
+        region='my-cluster',
+        keys=('pod_config',),
+        default_value={})
+
+    # Kubernetes should have Kubernetes labels
+    assert k8s_result['metadata']['labels']['cloud'] == 'kubernetes'
+    assert 'k8s-only-label' in k8s_result['metadata']['labels']
+    assert k8s_result['metadata']['labels']['k8s-only-label'] == 'k8s-value'
+
+    # Kubernetes should NOT have SSH labels (no leakage)
+    assert 'ssh-only-label' not in k8s_result['metadata']['labels'], \
+        "SSH labels should NOT leak into Kubernetes context_configs"
+    assert k8s_result['metadata']['labels']['cloud'] != 'ssh', \
+        "SSH cloud label should NOT leak into Kubernetes context_configs"
+
+    # Test provision_timeout isolation
+    ssh_timeout = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='ssh',
+        region='my-cluster',
+        keys=('provision_timeout',),
+        default_value=600)
+    assert ssh_timeout == 7200, "SSH should get SSH timeout"
+    assert ssh_timeout != 3600, "SSH should NOT get Kubernetes timeout"
+
+    k8s_timeout = config_utils.get_cloud_config_value_from_dict(
+        dict_config=config_dict,
+        cloud='kubernetes',
+        region='my-cluster',
+        keys=('provision_timeout',),
+        default_value=600)
+    assert k8s_timeout == 3600, "Kubernetes should get Kubernetes timeout"
+    assert k8s_timeout != 7200, "Kubernetes should NOT get SSH timeout"
+
+
+def test_combine_pod_config_fields_ssh_and_kubernetes_isolation():
+    """Test that combine_pod_config_fields maintains isolation between SSH and Kubernetes."""
+    from unittest.mock import patch
+
+    from sky import clouds
+
+    # Create basic cluster YAML
+    cluster_yaml_obj = {
+        'available_node_types': {
+            'ray_head_default': {
+                'node_config': {
+                    'spec': {
+                        'containers': [{
+                            'name': 'ray',
+                            'image': 'rayproject/ray:nightly'
+                        }]
+                    }
+                }
+            }
+        }
+    }
+
+    # SSH cloud with SSH context
+    ssh_cloud = clouds.SSH()
+    ssh_context = 'ssh-test-cluster'
+
+    # Kubernetes cloud with regular context
+    k8s_cloud = clouds.Kubernetes()
+    k8s_context = 'k8s-test-cluster'
+
+    # Mock config that has DIFFERENT pod_configs for SSH vs Kubernetes
+    ssh_pod_config = {'spec': {'nodeSelector': {'ssh-node': 'true'}}}
+    k8s_pod_config = {'spec': {'nodeSelector': {'k8s-node': 'true'}}}
+
+    # Test SSH cloud gets SSH config
+    with patch('sky.skypilot_config.get_effective_region_config'
+              ) as mock_get_config:
+
+        def _side_effect_isolation_ssh(cloud, region, keys, default_value):
+            if keys == ('pod_config',):
+                return ssh_pod_config
+            return default_value
+
+        mock_get_config.side_effect = _side_effect_isolation_ssh
+
+        result = utils.combine_pod_config_fields(cluster_yaml_obj, {},
+                                                 cloud=ssh_cloud,
+                                                 context=ssh_context)
+
+        # Verify SSH pod config was used
+        node_config = result['available_node_types']['ray_head_default'][
+            'node_config']
+        assert 'nodeSelector' in node_config['spec']
+        assert node_config['spec']['nodeSelector']['ssh-node'] == 'true'
+        assert 'k8s-node' not in node_config['spec']['nodeSelector'], \
+            "Kubernetes config leaked to SSH!"
+
+        # Verify get_effective_region_config was called with 'ssh'
+        assert mock_get_config.call_count == 1
+        mock_get_config.assert_has_calls([
+            call(cloud='ssh',
+                 region='test-cluster',
+                 keys=('pod_config',),
+                 default_value={}),
+        ],
+                                         any_order=False)
+
+    # Test Kubernetes cloud gets Kubernetes config
+    with patch('sky.skypilot_config.get_effective_region_config'
+              ) as mock_get_config:
+
+        def _side_effect_isolation_k8s(cloud, region, keys, default_value):
+            if keys == ('pod_config',):
+                return k8s_pod_config
+            return default_value
+
+        mock_get_config.side_effect = _side_effect_isolation_k8s
+
+        result = utils.combine_pod_config_fields(cluster_yaml_obj, {},
+                                                 cloud=k8s_cloud,
+                                                 context=k8s_context)
+
+        # Verify Kubernetes pod config was used
+        node_config = result['available_node_types']['ray_head_default'][
+            'node_config']
+        assert 'nodeSelector' in node_config['spec']
+        assert node_config['spec']['nodeSelector']['k8s-node'] == 'true'
+        assert 'ssh-node' not in node_config['spec']['nodeSelector'], \
+            "SSH config leaked to Kubernetes!"
+
+        # Verify get_effective_region_config was called with 'kubernetes'
+        assert mock_get_config.call_count == 1
+        mock_get_config.assert_has_calls([
+            call(cloud='kubernetes',
+                 region=k8s_context,
+                 keys=('pod_config',),
+                 default_value={}),
+        ],
+                                         any_order=False)
+
+
+def test_hardcoded_kubernetes_functions_not_used_during_ssh_provisioning():
+    """Test that functions hardcoding cloud='kubernetes' would fail
+    for SSH if called."""
+
+    from unittest.mock import patch
+
+    from sky.utils import config_utils
+
+    # Setup: Config with DIFFERENT custom_metadata for SSH vs Kubernetes
+    config_dict = {
+        'ssh': {
+            'custom_metadata': {
+                'metadata': {
+                    'labels': {
+                        'source': 'ssh-config'
+                    }
+                }
+            }
+        },
+        'kubernetes': {
+            'custom_metadata': {
+                'metadata': {
+                    'labels': {
+                        'source': 'k8s-config'
+                    }
+                }
+            }
+        }
+    }
+
+    # Simulate what would happen if merge_custom_metadata was called
+    # during SSH provisioning with an SSH context
+    ssh_context = 'ssh-my-cluster'
+
+    with patch('sky.skypilot_config.get_effective_region_config') as mock_get:
+        # Mock to return based on cloud parameter
+        def get_config_side_effect(cloud,
+                                   region,
+                                   keys,
+                                   default_value=None,
+                                   override_configs=None):
+            if cloud == 'kubernetes' and keys == ('custom_metadata',):
+                return config_dict['kubernetes']['custom_metadata']
+            elif cloud == 'ssh' and keys == ('custom_metadata',):
+                return config_dict['ssh']['custom_metadata']
+            return default_value
+
+        mock_get.side_effect = get_config_side_effect
+
+        # Call merge_custom_metadata with SSH context
+        original_metadata = {}
+
+        # This currently calls get_effective_region_config with cloud='ssh'
+        utils.merge_custom_metadata(original_metadata, context=ssh_context)
+
+        # Verify it was called with 'ssh'
+        calls = mock_get.call_args_list
+        custom_metadata_calls = [
+            c for c in calls if c[1].get('keys') == ('custom_metadata',)
+        ]
+
+        assert len(custom_metadata_calls) >= 1
+        assert custom_metadata_calls[0][1]['cloud'] == 'ssh', \
+            "custom_metadata should use SSH cloud"
+
+
+def test_combine_pod_config_fields_and_metadata_uses_correct_cloud():
+    """Test that combine_pod_config_fields_and_metadata uses correct cloud for both parts.
+
+    This function calls:
+    1. combine_pod_config_fields
+    2. combine_metadata_fields
+
+    This test verifies that both configs are handled properly by their respective clouds.
+    """
+    from unittest.mock import patch
+
+    from sky import clouds
+
+    cluster_yaml = {
+        'provider': {
+            'autoscaler_service_account': {
+                'metadata': {}
+            },
+            'autoscaler_role': {
+                'metadata': {}
+            },
+            'autoscaler_role_binding': {
+                'metadata': {}
+            },
+            'services': []
+        },
+        'available_node_types': {
+            'ray_head_default': {
+                'node_config': {
+                    'spec': {
+                        'containers': [{
+                            'name': 'ray'
+                        }]
+                    },
+                    'metadata': {}
+                }
+            }
+        }
+    }
+
+    ssh_cloud = clouds.SSH()
+    ssh_context = 'ssh-test-cluster'
+
+    with patch('sky.skypilot_config.get_effective_region_config'
+              ) as mock_get_config:
+        config_calls = []
+
+        def track_calls(cloud,
+                        region,
+                        keys,
+                        default_value=None,
+                        override_configs=None):
+            config_calls.append({'cloud': cloud, 'keys': keys})
+            return default_value or {}
+
+        mock_get_config.side_effect = track_calls
+
+        # Call the combined function
+        result = utils.combine_pod_config_fields_and_metadata(
+            cluster_yaml, {}, cloud=ssh_cloud, context=ssh_context)
+
+        # Check calls to get_effective_region_config
+        pod_config_calls = [
+            c for c in config_calls if c['keys'] == ('pod_config',)
+        ]
+        custom_metadata_calls = [
+            c for c in config_calls if c['keys'] == ('custom_metadata',)
+        ]
+
+        # pod_config should use 'ssh'
+        assert len(pod_config_calls) >= 1
+        assert pod_config_calls[0]['cloud'] == 'ssh', \
+            "pod_config should use SSH cloud"
+
+        # custom_metadata should use 'ssh'
+        assert len(custom_metadata_calls) >= 1
+        assert custom_metadata_calls[0]['cloud'] == 'ssh', \
+            "custom_metadata should use SSH cloud"
+
+
+@pytest.mark.parametrize('unsorted_pod_names, expected_sorted_pod_names', [
+    ([
+        'test-cluster-worker10', 'test-cluster-worker2', 'test-cluster-head',
+        'test-cluster-worker1', 'test-cluster-worker3'
+    ], [
+        'test-cluster-head', 'test-cluster-worker1', 'test-cluster-worker2',
+        'test-cluster-worker3', 'test-cluster-worker10'
+    ]),
+    ([
+        'test-cluster-worker1', 'test-cluster-worker20', 'test-cluster-head',
+        'test-cluster-worker3', 'test-cluster-worker2'
+    ], [
+        'test-cluster-head', 'test-cluster-worker1', 'test-cluster-worker2',
+        'test-cluster-worker3', 'test-cluster-worker20'
+    ]),
+    ([
+        'test-cluster-worker1', 'test-cluster-worker2', 'test-cluster-head',
+        'test-cluster-worker3', 'test-cluster-worker4'
+    ], [
+        'test-cluster-head', 'test-cluster-worker1', 'test-cluster-worker2',
+        'test-cluster-worker3', 'test-cluster-worker4'
+    ]),
+    ([
+        'test-cluster-head', 'test-cluster-worker1', 'test-cluster-worker2',
+        'test-cluster-worker3', 'test-cluster-worker4'
+    ], [
+        'test-cluster-head', 'test-cluster-worker1', 'test-cluster-worker2',
+        'test-cluster-worker3', 'test-cluster-worker4'
+    ]),
+    ([
+        'my-worker-head', 'my-worker-worker1', 'my-worker-worker2',
+        'my-worker-worker3', 'my-worker-worker4'
+    ], [
+        'my-worker-head', 'my-worker-worker1', 'my-worker-worker2',
+        'my-worker-worker3', 'my-worker-worker4'
+    ]),
+    ([
+        'my-worker-head', 'my-worker-worker1', 'extra-pod', 'my-worker-worker2',
+        'my-worker-worker3', 'my-worker-worker4'
+    ], [
+        'my-worker-head', 'my-worker-worker1', 'my-worker-worker2',
+        'my-worker-worker3', 'my-worker-worker4', 'extra-pod'
+    ]),
+])
+def test_filter_pods_sorts_by_name(unsorted_pod_names,
+                                   expected_sorted_pod_names):
+    """Test that filter_pods returns pods sorted correctly"""
+    mock_pod_list = mock.MagicMock()
+    mock_pod_list.items = []
+    for pod_name in unsorted_pod_names:
+        mock_pod = mock.MagicMock()
+        mock_pod.metadata.name = pod_name
+        mock_pod.metadata.deletion_timestamp = None
+        mock_pod_list.items.append(mock_pod)
+
+    with patch('sky.provision.kubernetes.utils.kubernetes.core_api'
+              ) as mock_core_api:
+        mock_core_api.return_value.list_namespaced_pod.return_value = mock_pod_list
+
+        result = utils.filter_pods(namespace='test-namespace',
+                                   context='test-context',
+                                   tag_filters={'test-label': 'test-value'})
+
+        # Verify the pods are returned in sorted order
+        pod_names = list(result.keys())
+        assert pod_names == expected_sorted_pod_names
+
+
+class TestCheckInstanceFits:
+    """Tests for check_instance_fits function."""
+
+    def _create_mock_node(self,
+                          name: str,
+                          cpu_capacity: str,
+                          memory_capacity: str,
+                          is_ready: bool = True,
+                          labels: Optional[dict] = None,
+                          gpu_allocatable: Optional[str] = None,
+                          ephemeral_storage_capacity: Optional[str] = None):
+        """Helper to create mock Kubernetes node."""
+        mock_node = mock.MagicMock()
+        mock_node.metadata.name = name
+        mock_node.metadata.labels = labels or {}
+        mock_node.status.capacity = {
+            'cpu': cpu_capacity,
+            'memory': memory_capacity
+        }
+        mock_node.status.allocatable = {
+            'cpu': cpu_capacity,
+            'memory': memory_capacity
+        }
+        if ephemeral_storage_capacity is not None:
+            mock_node.status.capacity[
+                'ephemeral-storage'] = ephemeral_storage_capacity
+        if gpu_allocatable is not None:
+            mock_node.status.allocatable['nvidia.com/gpu'] = gpu_allocatable
+        mock_node.is_ready.return_value = is_ready
+        return mock_node
+
+    def test_cpu_instance_fits_on_cluster(self):
+        """Test CPU-only instance that fits on the cluster."""
+        mock_node = self._create_mock_node(name='cpu-node-1',
+                                           cpu_capacity='16',
+                                           memory_capacity='64Gi')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=[mock_node]):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '4CPU--16GB')
+            assert fits is True
+            assert reason is None
+
+    def test_cpu_instance_does_not_fit_insufficient_cpu(self):
+        """Test CPU-only instance that doesn't fit due to insufficient CPU."""
+        mock_node = self._create_mock_node(name='small-node',
+                                           cpu_capacity='2',
+                                           memory_capacity='64Gi')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=[mock_node]):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '4CPU--8GB')
+            assert fits is False
+            assert reason is not None
+            assert 'CPU' in reason
+
+    def test_cpu_instance_does_not_fit_insufficient_memory(self):
+        """Test CPU-only instance that doesn't fit due to insufficient memory."""
+        mock_node = self._create_mock_node(name='low-memory-node',
+                                           cpu_capacity='16',
+                                           memory_capacity='8Gi')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=[mock_node]):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '4CPU--16GB')
+            assert fits is False
+            assert reason is not None
+            assert 'memory' in reason.lower()
+
+    def test_cpu_instance_no_ready_nodes(self):
+        """Test CPU-only instance when no nodes are ready."""
+        mock_node = self._create_mock_node(name='not-ready-node',
+                                           cpu_capacity='16',
+                                           memory_capacity='64Gi',
+                                           is_ready=False)
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=[mock_node]):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '4CPU--16GB')
+            assert fits is False
+            assert reason is not None
+            assert 'No ready nodes' in reason
+
+    def test_cpu_instance_fits_with_ephemeral_storage(self):
+        """Test instance fits when ephemeral storage requirement is met."""
+        mock_node = self._create_mock_node(name='cpu-node-1',
+                                           cpu_capacity='16',
+                                           memory_capacity='64Gi',
+                                           ephemeral_storage_capacity='200Gi')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=[mock_node]):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '4CPU--16GB',
+                                                     ephemeral_storage_gb=100)
+            assert fits is True
+            assert reason is None
+
+    def test_cpu_instance_does_not_fit_insufficient_ephemeral_storage(self):
+        """Test instance does not fit due to insufficient ephemeral storage."""
+        mock_node = self._create_mock_node(name='cpu-node-1',
+                                           cpu_capacity='16',
+                                           memory_capacity='64Gi',
+                                           ephemeral_storage_capacity='50Gi')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=[mock_node]):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '4CPU--16GB',
+                                                     ephemeral_storage_gb=100)
+            assert fits is False
+            assert reason is not None
+            assert 'ephemeral storage' in reason.lower()
+
+    def test_cpu_instance_missing_ephemeral_storage_capacity(self):
+        """Test instance does not fit when node reports no ephemeral storage."""
+        mock_node = self._create_mock_node(name='cpu-node-1',
+                                           cpu_capacity='16',
+                                           memory_capacity='64Gi')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=[mock_node]):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '4CPU--16GB',
+                                                     ephemeral_storage_gb=100)
+            assert fits is False
+            assert reason is not None
+            assert 'ephemeral storage' in reason.lower()
+
+    def test_gpu_instance_fits_on_cluster(self):
+        """Test GPU instance that fits on the cluster."""
+        mock_node = self._create_mock_node(
+            name='gpu-node-1',
+            cpu_capacity='32',
+            memory_capacity='128Gi',
+            labels={
+                'cloud.google.com/gke-accelerator': 'nvidia-tesla-v100',
+            },
+            gpu_allocatable='4')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                       return_value=[mock_node]), \
+             mock.patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values',
+                       return_value=('cloud.google.com/gke-accelerator',
+                                   ['nvidia-tesla-v100'], None, None)), \
+             mock.patch('sky.provision.kubernetes.utils.get_node_accelerator_count',
+                       return_value=4):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '8CPU--32GB--V100:2')
+            assert fits is True
+            assert reason is None
+
+    def test_gpu_instance_gpu_type_not_available(self):
+        """Test GPU instance when GPU type is not available on cluster."""
+        mock_node = self._create_mock_node(name='cpu-node',
+                                           cpu_capacity='32',
+                                           memory_capacity='128Gi')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                       return_value=[mock_node]), \
+             mock.patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values',
+                       side_effect=exceptions.ResourcesUnavailableError('A100 not found')):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '8CPU--32GB--A100:1')
+            assert fits is False
+            assert reason is not None
+            assert 'A100 not found' in reason
+
+    def test_gpu_instance_no_ready_gpu_nodes(self):
+        """Test GPU instance when no ready GPU nodes are available."""
+        mock_node = self._create_mock_node(
+            name='gpu-node-not-ready',
+            cpu_capacity='32',
+            memory_capacity='128Gi',
+            is_ready=False,
+            labels={
+                'cloud.google.com/gke-accelerator': 'nvidia-tesla-v100',
+            },
+            gpu_allocatable='4')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                       return_value=[mock_node]), \
+             mock.patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values',
+                       return_value=('cloud.google.com/gke-accelerator',
+                                   ['nvidia-tesla-v100'], None, None)):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '8CPU--32GB--V100:2')
+            assert fits is False
+            assert reason is not None
+            assert 'No ready GPU nodes' in reason
+
+    def test_gpu_instance_insufficient_gpu_count(self):
+        """Test GPU instance when nodes don't have enough GPUs."""
+        mock_node = self._create_mock_node(
+            name='gpu-node-1',
+            cpu_capacity='32',
+            memory_capacity='128Gi',
+            labels={
+                'cloud.google.com/gke-accelerator': 'nvidia-tesla-v100',
+            },
+            gpu_allocatable='2')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                       return_value=[mock_node]), \
+             mock.patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values',
+                       return_value=('cloud.google.com/gke-accelerator',
+                                   ['nvidia-tesla-v100'], None, None)), \
+             mock.patch('sky.provision.kubernetes.utils.get_node_accelerator_count',
+                       return_value=2):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '8CPU--32GB--V100:4')
+            assert fits is False
+            assert reason is not None
+            assert 'No GPU nodes found with' in reason
+
+    def test_gpu_instance_insufficient_cpu_on_gpu_node(self):
+        """Test GPU instance when GPU nodes don't have enough CPU."""
+        mock_node = self._create_mock_node(
+            name='gpu-node-low-cpu',
+            cpu_capacity='4',  # Only 4 CPUs
+            memory_capacity='128Gi',
+            labels={
+                'cloud.google.com/gke-accelerator': 'nvidia-tesla-v100',
+            },
+            gpu_allocatable='4')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                       return_value=[mock_node]), \
+             mock.patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values',
+                       return_value=('cloud.google.com/gke-accelerator',
+                                   ['nvidia-tesla-v100'], None, None)), \
+             mock.patch('sky.provision.kubernetes.utils.get_node_accelerator_count',
+                       return_value=4):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '8CPU--32GB--V100:2')
+            assert fits is False
+            assert reason is not None
+            assert 'CPUs' in reason
+
+    def test_multiple_nodes_one_fits(self):
+        """Test that instance fits when at least one node has sufficient resources."""
+        small_node = self._create_mock_node(name='small-node',
+                                            cpu_capacity='4',
+                                            memory_capacity='16Gi')
+        large_node = self._create_mock_node(name='large-node',
+                                            cpu_capacity='32',
+                                            memory_capacity='128Gi')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=[small_node, large_node]):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '16CPU--64GB')
+            assert fits is True
+            assert reason is None
+
+    def test_empty_cluster(self):
+        """Test when cluster has no nodes."""
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=[]):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '4CPU--16GB')
+            assert fits is False
+            assert reason is not None
+            assert 'No ready nodes' in reason
+
+    def test_tpu_instance_fits(self):
+        """Test TPU instance that fits on the cluster."""
+        mock_node = self._create_mock_node(
+            name='tpu-node-1',
+            cpu_capacity='32',
+            memory_capacity='128Gi',
+            labels={
+                'cloud.google.com/gke-accelerator': 'tpu-v4-podslice',
+                'cloud.google.com/gke-tpu-accelerator': 'tpu-v4-podslice',
+                'cloud.google.com/gke-accelerator-count': '8',
+                'cloud.google.com/gke-tpu-topology': '2x4'
+            })
+        mock_node.status.allocatable['google.com/tpu'] = '8'
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                       return_value=[mock_node]), \
+             mock.patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values',
+                       return_value=('cloud.google.com/gke-tpu-accelerator',
+                                   ['tpu-v4-podslice'], None, None)), \
+             mock.patch('sky.provision.kubernetes.utils.is_tpu_on_gke',
+                       return_value=True), \
+             mock.patch('sky.provision.kubernetes.utils.normalize_tpu_accelerator_name',
+                       return_value=('tpu-v4-podslice', 8)), \
+             mock.patch('sky.provision.kubernetes.utils.is_multi_host_tpu',
+                       return_value=False):
+            fits, reason = utils.check_instance_fits(
+                'test-context', '8CPU--32GB--tpu-v4-podslice:8')
+            assert fits is True
+            assert reason is None
+
+    def test_context_none(self):
+        """Test with None context."""
+        mock_node = self._create_mock_node(name='node-1',
+                                           cpu_capacity='16',
+                                           memory_capacity='64Gi')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=[mock_node]):
+            fits, reason = utils.check_instance_fits(None, '4CPU--16GB')
+            assert fits is True
+            assert reason is None
+
+    def test_millicore_cpu_capacity(self):
+        """Test node with millicore CPU capacity."""
+        mock_node = self._create_mock_node(
+            name='millicore-node',
+            cpu_capacity='4000m',  # 4 CPUs in millicore
+            memory_capacity='64Gi')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=[mock_node]):
+            # Requesting 2 CPUs should fit on a 4 CPU node
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '2CPU--16GB')
+            assert fits is True
+            assert reason is None
+
+    def test_fractional_cpu_instance(self):
+        """Test instance with fractional CPU request."""
+        mock_node = self._create_mock_node(name='node-1',
+                                           cpu_capacity='4',
+                                           memory_capacity='16Gi')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=[mock_node]):
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '0.5CPU--2GB')
+            assert fits is True
+            assert reason is None
+
+    def test_tpu_multi_host_skipped(self):
+        """Test that multi-host TPU nodes are skipped.
+
+        When a TPU node is a multi-host configuration, it should be skipped
+        during the check, and if no single-host TPU nodes match, the check fails.
+        """
+        # Multi-host TPU node that should be skipped
+        mock_multi_host_node = self._create_mock_node(
+            name='tpu-multi-host-node',
+            cpu_capacity='32',
+            memory_capacity='128Gi',
+            labels={
+                'cloud.google.com/gke-tpu-accelerator': 'tpu-v4-podslice',
+                'cloud.google.com/gke-accelerator-count': '8',
+                'cloud.google.com/gke-tpu-topology': '4x4',
+                'cloud.google.com/gke-tpu-node-pool-type': 'multi-host'
+            })
+        mock_multi_host_node.status.allocatable['google.com/tpu'] = '8'
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                       return_value=[mock_multi_host_node]), \
+             mock.patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values',
+                       return_value=('cloud.google.com/gke-tpu-accelerator',
+                                   ['tpu-v4-podslice'], None, None)), \
+             mock.patch('sky.provision.kubernetes.utils.is_tpu_on_gke',
+                       return_value=True), \
+             mock.patch('sky.provision.kubernetes.utils.normalize_tpu_accelerator_name',
+                       return_value=('tpu-v4-podslice', 8)), \
+             mock.patch('sky.provision.kubernetes.utils.is_multi_host_tpu',
+                       return_value=True):
+            fits, reason = utils.check_instance_fits(
+                'test-context', '8CPU--32GB--tpu-v4-podslice:8')
+            # Should fail because multi-host TPU is skipped and no other TPU found
+            assert fits is False
+            assert reason is not None
+            assert 'Requested TPU type was not found' in reason
+
+    def test_tpu_chip_count_mismatch(self):
+        """Test TPU instance with mismatched chip count.
+
+        When TPU type matches but chip count doesn't match, the function
+        returns a list of available TPU configurations.
+        """
+        # TPU node with 4 chips, but we request 8
+        mock_tpu_node = self._create_mock_node(
+            name='tpu-node-4chip',
+            cpu_capacity='32',
+            memory_capacity='128Gi',
+            labels={
+                'cloud.google.com/gke-tpu-accelerator': 'tpu-v4-podslice',
+                'cloud.google.com/gke-accelerator-count': '4',
+                'cloud.google.com/gke-tpu-topology': '2x2'
+            })
+        mock_tpu_node.status.allocatable['google.com/tpu'] = '4'
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                       return_value=[mock_tpu_node]), \
+             mock.patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values',
+                       return_value=('cloud.google.com/gke-tpu-accelerator',
+                                   ['tpu-v4-podslice'], None, None)), \
+             mock.patch('sky.provision.kubernetes.utils.is_tpu_on_gke',
+                       return_value=True), \
+             mock.patch('sky.provision.kubernetes.utils.normalize_tpu_accelerator_name',
+                       return_value=('tpu-v4-podslice', 8)), \
+             mock.patch('sky.provision.kubernetes.utils.is_multi_host_tpu',
+                       return_value=False):
+            fits, reason = utils.check_instance_fits(
+                'test-context', '8CPU--32GB--tpu-v4-podslice:8')
+            assert fits is False
+            assert reason is not None
+            # Should mention available TPU types
+            assert 'tpu-v4-podslice:4' in reason
+            assert 'Requested TPU type was not found' in reason
+
+    def test_gpu_label_values_none(self):
+        """Test when get_accelerator_label_key_values returns None for values.
+
+        When gpu_label_values is None, it should be converted to empty list,
+        resulting in no matching GPU nodes found.
+        """
+        mock_node = self._create_mock_node(
+            name='gpu-node',
+            cpu_capacity='32',
+            memory_capacity='128Gi',
+            labels={
+                'cloud.google.com/gke-accelerator': 'nvidia-tesla-v100',
+            },
+            gpu_allocatable='4')
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                       return_value=[mock_node]), \
+             mock.patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values',
+                       return_value=('cloud.google.com/gke-accelerator',
+                                   None, None, None)):  # None for gpu_label_values
+            fits, reason = utils.check_instance_fits('test-context',
+                                                     '8CPU--32GB--V100:2')
+            assert fits is False
+            assert reason is not None
+            assert 'No ready GPU nodes found' in reason
+
+    def test_tpu_fits_returns_with_reason(self):
+        """Test TPU instance that fits.
+
+        This tests the path where check_tpu_fits returns True with reason=None.
+        """
+        mock_tpu_node = self._create_mock_node(
+            name='tpu-node-1',
+            cpu_capacity='32',
+            memory_capacity='128Gi',
+            labels={
+                'cloud.google.com/gke-tpu-accelerator': 'tpu-v4-podslice',
+                'cloud.google.com/gke-accelerator-count': '8',
+                'cloud.google.com/gke-tpu-topology': '2x4'
+            })
+        mock_tpu_node.status.allocatable['google.com/tpu'] = '8'
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                       return_value=[mock_tpu_node]), \
+             mock.patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values',
+                       return_value=('cloud.google.com/gke-tpu-accelerator',
+                                   ['tpu-v4-podslice'], None, None)), \
+             mock.patch('sky.provision.kubernetes.utils.is_tpu_on_gke',
+                       return_value=True), \
+             mock.patch('sky.provision.kubernetes.utils.normalize_tpu_accelerator_name',
+                       return_value=('tpu-v4-podslice', 8)), \
+             mock.patch('sky.provision.kubernetes.utils.is_multi_host_tpu',
+                       return_value=False):
+            fits, reason = utils.check_instance_fits(
+                'test-context', '8CPU--32GB--tpu-v4-podslice:8')
+            assert fits is True
+            assert reason is None
+
+    def test_tpu_does_not_fit(self):
+        """Test TPU instance that doesn't fit.
+
+        When check_tpu_fits returns (False, reason_string), it should return False and the reason.
+        """
+        # TPU node with different chip count
+        mock_tpu_node = self._create_mock_node(
+            name='tpu-node-4chip',
+            cpu_capacity='32',
+            memory_capacity='128Gi',
+            labels={
+                'cloud.google.com/gke-tpu-accelerator': 'tpu-v4-podslice',
+                'cloud.google.com/gke-accelerator-count': '4',
+                'cloud.google.com/gke-tpu-topology': '2x2'
+            })
+        mock_tpu_node.status.allocatable['google.com/tpu'] = '4'
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                       return_value=[mock_tpu_node]), \
+             mock.patch('sky.provision.kubernetes.utils.get_accelerator_label_key_values',
+                       return_value=('cloud.google.com/gke-tpu-accelerator',
+                                   ['tpu-v4-podslice'], None, None)), \
+             mock.patch('sky.provision.kubernetes.utils.is_tpu_on_gke',
+                       return_value=True), \
+             mock.patch('sky.provision.kubernetes.utils.normalize_tpu_accelerator_name',
+                       return_value=('tpu-v4-podslice', 8)), \
+             mock.patch('sky.provision.kubernetes.utils.is_multi_host_tpu',
+                       return_value=False):
+            fits, reason = utils.check_instance_fits(
+                'test-context', '8CPU--32GB--tpu-v4-podslice:8')
+            assert fits is False
+            assert reason is not None
+            assert 'Requested TPU type was not found' in reason
+
+
+class TestV1Node(unittest.TestCase):
+    """Tests for V1Node dataclass and its methods."""
+
+    def _create_v1node(self,
+                       name: str = 'test-node',
+                       labels: Optional[dict] = None,
+                       conditions: Optional[list] = None,
+                       unschedulable: bool = False,
+                       taints: Optional[list] = None) -> utils.V1Node:
+        """Helper to create a V1Node for testing."""
+        if labels is None:
+            labels = {}
+        if conditions is None:
+            conditions = []
+        if taints is None:
+            taints = []
+
+        return utils.V1Node(metadata=utils.V1ObjectMeta(name=name,
+                                                        labels=labels),
+                            status=utils.V1NodeStatus(
+                                allocatable={
+                                    'cpu': '4',
+                                    'memory': '16Gi'
+                                },
+                                capacity={
+                                    'cpu': '4',
+                                    'memory': '16Gi'
+                                },
+                                addresses=[
+                                    utils.V1NodeAddress(type='InternalIP',
+                                                        address='10.0.0.1')
+                                ],
+                                conditions=[
+                                    utils.V1NodeCondition(type=c['type'],
+                                                          status=c['status'])
+                                    for c in conditions
+                                ]),
+                            spec=utils.V1NodeSpec(unschedulable=unschedulable,
+                                                  taints=[
+                                                      utils.V1Taint(
+                                                          key=t['key'],
+                                                          effect=t['effect'],
+                                                          value=t.get('value'))
+                                                      for t in taints
+                                                  ]))
+
+    def test_is_ready_true(self):
+        """Test is_ready returns True when node has Ready condition with status True."""
+        node = self._create_v1node(conditions=[{
+            'type': 'Ready',
+            'status': 'True'
+        }])
+        assert node.is_ready() is True
+
+    def test_is_ready_false(self):
+        """Test is_ready returns False when node has Ready condition with status False."""
+        node = self._create_v1node(conditions=[{
+            'type': 'Ready',
+            'status': 'False'
+        }])
+        assert node.is_ready() is False
+
+    def test_is_ready_no_condition(self):
+        """Test is_ready returns False when node has no Ready condition."""
+        node = self._create_v1node(conditions=[{
+            'type': 'DiskPressure',
+            'status': 'False'
+        }])
+        assert node.is_ready() is False
+
+    def test_is_ready_unknown_status(self):
+        """Test is_ready returns False when Ready condition has Unknown status."""
+        node = self._create_v1node(conditions=[{
+            'type': 'Ready',
+            'status': 'Unknown'
+        }])
+        assert node.is_ready() is False
+
+    def test_is_cordoned_true(self):
+        """Test is_cordoned returns True when unschedulable is True."""
+        node = self._create_v1node(unschedulable=True)
+        assert node.is_cordoned() is True
+
+    def test_is_cordoned_false(self):
+        """Test is_cordoned returns False when unschedulable is False."""
+        node = self._create_v1node(unschedulable=False)
+        assert node.is_cordoned() is False
+
+    def test_get_taints_all(self):
+        """Test get_taints returns all taints by default."""
+        node = self._create_v1node(taints=[
+            {
+                'key': 'nvidia.com/gpu',
+                'effect': 'NoSchedule',
+                'value': 'true'
+            },
+            {
+                'key': 'dedicated',
+                'effect': 'NoExecute',
+                'value': 'gpu'
+            },
+        ])
+        taints = node.get_taints()
+        assert len(taints) == 2
+        assert taints[0]['key'] == 'nvidia.com/gpu'
+        assert taints[1]['key'] == 'dedicated'
+
+    def test_get_taints_exclude_cordon(self):
+        """Test get_taints excludes cordon taint when exclude_cordon=True."""
+        node = self._create_v1node(taints=[
+            {
+                'key': 'node.kubernetes.io/unschedulable',
+                'effect': 'NoSchedule'
+            },
+            {
+                'key': 'dedicated',
+                'effect': 'NoSchedule',
+                'value': 'gpu'
+            },
+        ])
+        taints = node.get_taints(exclude_cordon=True)
+        assert len(taints) == 1
+        assert taints[0]['key'] == 'dedicated'
+
+    def test_get_taints_exclude_not_ready_noschedule(self):
+        """Test get_taints excludes not ready taint with NoSchedule effect."""
+        node = self._create_v1node(taints=[
+            {
+                'key': 'node.kubernetes.io/unreachable',
+                'effect': 'NoSchedule'
+            },
+            {
+                'key': 'dedicated',
+                'effect': 'NoSchedule',
+                'value': 'gpu'
+            },
+        ])
+        taints = node.get_taints(exclude_not_ready=True)
+        assert len(taints) == 1
+        assert taints[0]['key'] == 'dedicated'
+
+    def test_get_taints_exclude_not_ready_noexecute(self):
+        """Test get_taints excludes not ready taint with NoExecute effect."""
+        node = self._create_v1node(taints=[
+            {
+                'key': 'node.kubernetes.io/unreachable',
+                'effect': 'NoExecute'
+            },
+            {
+                'key': 'dedicated',
+                'effect': 'NoSchedule',
+                'value': 'gpu'
+            },
+        ])
+        taints = node.get_taints(exclude_not_ready=True)
+        assert len(taints) == 1
+        assert taints[0]['key'] == 'dedicated'
+
+    def test_get_taints_exclude_not_ready_keeps_other_effects(self):
+        """Test get_taints keeps unreachable taint with other effects."""
+        node = self._create_v1node(taints=[
+            {
+                'key': 'node.kubernetes.io/unreachable',
+                'effect': 'PreferNoSchedule'
+            },
+            {
+                'key': 'dedicated',
+                'effect': 'NoSchedule',
+                'value': 'gpu'
+            },
+        ])
+        taints = node.get_taints(exclude_not_ready=True)
+        assert len(taints) == 2
+        keys = [t['key'] for t in taints]
+        assert 'node.kubernetes.io/unreachable' in keys
+
+    def test_get_taints_exclude_effects(self):
+        """Test get_taints excludes taints with specified effects."""
+        node = self._create_v1node(taints=[
+            {
+                'key': 'nvidia.com/gpu',
+                'effect': 'NoSchedule'
+            },
+            {
+                'key': 'dedicated',
+                'effect': 'PreferNoSchedule'
+            },
+            {
+                'key': 'critical',
+                'effect': 'NoExecute'
+            },
+        ])
+        taints = node.get_taints(exclude_effects=['PreferNoSchedule'])
+        assert len(taints) == 2
+        effects = [t['effect'] for t in taints]
+        assert 'PreferNoSchedule' not in effects
+
+    def test_get_taints_exclude_keys(self):
+        """Test get_taints excludes taints with specified keys."""
+        node = self._create_v1node(taints=[
+            {
+                'key': 'nvidia.com/gpu',
+                'effect': 'NoSchedule'
+            },
+            {
+                'key': 'dedicated',
+                'effect': 'NoSchedule'
+            },
+        ])
+        taints = node.get_taints(exclude_keys=['nvidia.com/gpu'])
+        assert len(taints) == 1
+        assert taints[0]['key'] == 'dedicated'
+
+    def test_get_taints_empty(self):
+        """Test get_taints returns empty list when node has no taints."""
+        node = self._create_v1node(taints=[])
+        taints = node.get_taints()
+        assert len(taints) == 0
+
+
+class TestGetHandledTaintKeys(unittest.TestCase):
+    """Tests for get_handled_taint_keys function."""
+
+    def test_default_keys(self):
+        """Test that default keys include TPU and GPU resource keys."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            # Remove CUSTOM_GPU_RESOURCE_KEY if it exists
+            if 'CUSTOM_GPU_RESOURCE_KEY' in os.environ:
+                del os.environ['CUSTOM_GPU_RESOURCE_KEY']
+            keys = utils.get_handled_taint_keys()
+            assert utils.TPU_RESOURCE_KEY in keys
+            assert 'nvidia.com/gpu' in keys
+            assert 'amd.com/gpu' in keys
+
+    def test_custom_key_included(self):
+        """Test that custom GPU resource key is included when env var is set."""
+        with mock.patch.dict(os.environ,
+                             {'CUSTOM_GPU_RESOURCE_KEY': 'custom.io/gpu'}):
+            keys = utils.get_handled_taint_keys()
+            assert 'custom.io/gpu' in keys
+            assert utils.TPU_RESOURCE_KEY in keys
+            assert 'nvidia.com/gpu' in keys
+
+
+class TestAllowedNodesFiltering:
+    """Tests for _filter_allowed_nodes() discovery filtering."""
+
+    def _create_node(self,
+                     name: str,
+                     labels: Optional[dict] = None,
+                     internal_ip: Optional[str] = None,
+                     external_ip: Optional[str] = None) -> utils.V1Node:
+        """Helper to create a V1Node with addresses for filtering tests."""
+        addresses = []
+        if internal_ip:
+            addresses.append(
+                utils.V1NodeAddress(type='InternalIP', address=internal_ip))
+        if external_ip:
+            addresses.append(
+                utils.V1NodeAddress(type='ExternalIP', address=external_ip))
+        return utils.V1Node(
+            metadata=utils.V1ObjectMeta(name=name, labels=labels or {}),
+            status=utils.V1NodeStatus(
+                allocatable={
+                    'cpu': '4',
+                    'memory': '16Gi'
+                },
+                capacity={
+                    'cpu': '4',
+                    'memory': '16Gi'
+                },
+                addresses=addresses,
+                conditions=[utils.V1NodeCondition(type='Ready',
+                                                  status='True')]),
+            spec=utils.V1NodeSpec(unschedulable=False, taints=[]))
+
+    def _make_nodes(self):
+        """Create a standard set of test nodes."""
+        return [
+            self._create_node('gpu-node-1',
+                              labels={
+                                  'pool': 'gpu',
+                                  'team': 'research'
+                              },
+                              internal_ip='10.0.1.1'),
+            self._create_node('gpu-node-2',
+                              labels={
+                                  'pool': 'gpu',
+                                  'team': 'platform'
+                              },
+                              internal_ip='10.0.1.2'),
+            self._create_node('cpu-node-1',
+                              labels={
+                                  'pool': 'cpu',
+                                  'team': 'research'
+                              },
+                              internal_ip='10.0.2.1'),
+            self._create_node('cpu-node-2',
+                              labels={
+                                  'pool': 'cpu',
+                                  'team': 'platform'
+                              },
+                              internal_ip='10.0.2.2',
+                              external_ip='203.0.113.5'),
+        ]
+
+    def test_filter_no_config(self):
+        """No allowed_nodes config returns all nodes."""
+        nodes = self._make_nodes()
+        with mock.patch('sky.skypilot_config.get_effective_region_config',
+                        return_value=None):
+            result = utils._filter_allowed_nodes(nodes, context='test')
+        assert len(result) == 4
+
+    def test_filter_empty_config(self):
+        """allowed_nodes: {} returns all nodes."""
+        nodes = self._make_nodes()
+        with mock.patch('sky.skypilot_config.get_effective_region_config',
+                        return_value={}):
+            result = utils._filter_allowed_nodes(nodes, context='test')
+        assert len(result) == 4
+
+    def test_filter_label_selector_single(self):
+        """Single label matches nodes with that label."""
+        nodes = self._make_nodes()
+        config = {'label_selector': {'pool': 'gpu'}}
+        with mock.patch('sky.skypilot_config.get_effective_region_config',
+                        return_value=config):
+            result = utils._filter_allowed_nodes(nodes, context='test')
+        assert sorted(
+            n.metadata.name for n in result) == ['gpu-node-1', 'gpu-node-2']
+
+    def test_filter_label_selector_multiple_or(self):
+        """Multiple labels are OR'd: pool=gpu OR team=research."""
+        nodes = self._make_nodes()
+        config = {'label_selector': {'pool': 'gpu', 'team': 'research'}}
+        with mock.patch('sky.skypilot_config.get_effective_region_config',
+                        return_value=config):
+            result = utils._filter_allowed_nodes(nodes, context='test')
+        # gpu-node-1 (pool=gpu), gpu-node-2 (pool=gpu), cpu-node-1 (team=research)
+        assert sorted(n.metadata.name for n in result) == [
+            'cpu-node-1', 'gpu-node-1', 'gpu-node-2'
+        ]
+
+    def test_filter_names(self):
+        """Names list matches by node name."""
+        nodes = self._make_nodes()
+        config = {'names': ['gpu-node-1', 'cpu-node-2']}
+        with mock.patch('sky.skypilot_config.get_effective_region_config',
+                        return_value=config):
+            result = utils._filter_allowed_nodes(nodes, context='test')
+        assert sorted(
+            n.metadata.name for n in result) == ['cpu-node-2', 'gpu-node-1']
+
+    def test_filter_ips_internal(self):
+        """IPs match against InternalIP addresses."""
+        nodes = self._make_nodes()
+        config = {'ips': ['10.0.1.1', '10.0.2.2']}
+        with mock.patch('sky.skypilot_config.get_effective_region_config',
+                        return_value=config):
+            result = utils._filter_allowed_nodes(nodes, context='test')
+        assert sorted(
+            n.metadata.name for n in result) == ['cpu-node-2', 'gpu-node-1']
+
+    def test_filter_ips_external(self):
+        """IPs match against ExternalIP addresses."""
+        nodes = self._make_nodes()
+        config = {'ips': ['203.0.113.5']}
+        with mock.patch('sky.skypilot_config.get_effective_region_config',
+                        return_value=config):
+            result = utils._filter_allowed_nodes(nodes, context='test')
+        assert [n.metadata.name for n in result] == ['cpu-node-2']
+
+    def test_filter_combined_or(self):
+        """Labels + names + IPs all OR'd together."""
+        nodes = self._make_nodes()
+        # pool=gpu -> gpu-node-1, gpu-node-2
+        # names=[cpu-node-1]
+        # ips=[10.0.2.2] -> cpu-node-2
+        config = {
+            'label_selector': {
+                'pool': 'gpu'
+            },
+            'names': ['cpu-node-1'],
+            'ips': ['10.0.2.2'],
+        }
+        with mock.patch('sky.skypilot_config.get_effective_region_config',
+                        return_value=config):
+            result = utils._filter_allowed_nodes(nodes, context='test')
+        assert sorted(n.metadata.name for n in result) == [
+            'cpu-node-1', 'cpu-node-2', 'gpu-node-1', 'gpu-node-2'
+        ]
+
+    def test_filter_no_matches(self):
+        """Config set but nothing matches returns empty list."""
+        nodes = self._make_nodes()
+        config = {'label_selector': {'pool': 'nonexistent'}}
+        with mock.patch('sky.skypilot_config.get_effective_region_config',
+                        return_value=config):
+            result = utils._filter_allowed_nodes(nodes, context='test')
+        assert not result
+
+    def test_filter_no_duplicates(self):
+        """Node matching multiple criteria is only included once."""
+        nodes = self._make_nodes()
+        # gpu-node-1 matches both label and name
+        config = {
+            'label_selector': {
+                'pool': 'gpu'
+            },
+            'names': ['gpu-node-1'],
+        }
+        with mock.patch('sky.skypilot_config.get_effective_region_config',
+                        return_value=config):
+            result = utils._filter_allowed_nodes(nodes, context='test')
+        names = [n.metadata.name for n in result]
+        assert names.count('gpu-node-1') == 1
+        assert sorted(names) == ['gpu-node-1', 'gpu-node-2']
+
+
+class TestAllowedNodesScheduling:
+    """Tests for allowed_nodes scheduling enforcement (nodeAffinity injection).
+
+    These test the logic that injects nodeAffinity constraints into pod specs
+    to ensure pods only land on allowed nodes. Pod specs are modeled after
+    what the kubernetes-ray.yml.j2 template actually generates.
+    """
+
+    def _make_pod_spec_gpu(self):
+        """A GPU workload pod spec as generated by the template.
+
+        The template produces:
+        - requiredDuringScheduling with GPU label matchExpression
+        - podAffinity for GPU binpacking (co-locate on same node)
+        - GPU resource limits
+        """
+        return {
+            'metadata': {
+                'labels': {}
+            },
+            'spec': {
+                'containers': [{
+                    'resources': {
+                        'limits': {
+                            'nvidia.com/gpu': '1'
+                        }
+                    }
+                }],
+                'affinity': {
+                    'nodeAffinity': {
+                        'requiredDuringSchedulingIgnoredDuringExecution': {
+                            'nodeSelectorTerms': [{
+                                'matchExpressions': [{
+                                    'key': 'cloud.google.com/gke-accelerator',
+                                    'operator': 'In',
+                                    'values': ['nvidia-a100'],
+                                }]
+                            }]
+                        }
+                    },
+                    'podAffinity': {
+                        'preferredDuringSchedulingIgnoredDuringExecution': [{
+                            'weight': 1,
+                            'podAffinityTerm': {
+                                'labelSelector': {
+                                    'matchExpressions': [{
+                                        'key': 'skypilot-binpack',
+                                        'operator': 'In',
+                                        'values': ['gpu'],
+                                    }]
+                                },
+                                'topologyKey': 'kubernetes.io/hostname',
+                            },
+                        }]
+                    },
+                },
+            },
+        }
+
+    def _make_pod_spec_cpu_on_gpu_cluster(self):
+        """A CPU-only workload on a cluster that has GPUs.
+
+        The template produces:
+        - NO requiredDuringScheduling (no GPU constraint)
+        - preferredDuringScheduling to AVOID GPU nodes (DoesNotExist)
+        - NO podAffinity (no binpacking needed)
+        - CPU-only resource limits
+        """
+        return {
+            'metadata': {
+                'labels': {}
+            },
+            'spec': {
+                'containers': [{
+                    'resources': {
+                        'limits': {
+                            'cpu': '4',
+                            'memory': '8Gi'
+                        }
+                    }
+                }],
+                'affinity': {
+                    'nodeAffinity': {
+                        'preferredDuringSchedulingIgnoredDuringExecution': [{
+                            'weight': 1,
+                            'preference': {
+                                'matchExpressions': [{
+                                    'key': 'cloud.google.com/gke-accelerator',
+                                    'operator': 'DoesNotExist',
+                                }]
+                            },
+                        }]
+                    }
+                },
+            },
+        }
+
+    def _make_pod_spec_cpu_no_gpus_in_cluster(self):
+        """A CPU-only workload on a cluster with no GPUs at all.
+
+        The template produces NO affinity block at all when there are no
+        GPU labels to avoid and no GPUs to require.
+        """
+        return {
+            'metadata': {
+                'labels': {}
+            },
+            'spec': {
+                'containers': [{
+                    'resources': {
+                        'limits': {
+                            'cpu': '4',
+                            'memory': '8Gi'
+                        }
+                    }
+                }],
+            },
+        }
+
+    def _make_filtered_nodes(self):
+        """Create mock filtered nodes with kubernetes.io/hostname labels."""
+        nodes = []
+        for name, hostname, ip in [
+            ('node-a', 'node-a', '10.0.1.1'),
+            ('node-b', 'node-b', '10.0.1.2'),
+        ]:
+            nodes.append(
+                utils.V1Node(metadata=utils.V1ObjectMeta(
+                    name=name,
+                    labels={
+                        'kubernetes.io/hostname': hostname,
+                        'pool': 'gpu'
+                    }),
+                             status=utils.V1NodeStatus(
+                                 allocatable={
+                                     'cpu': '4',
+                                     'memory': '16Gi'
+                                 },
+                                 capacity={
+                                     'cpu': '4',
+                                     'memory': '16Gi'
+                                 },
+                                 addresses=[
+                                     utils.V1NodeAddress(type='InternalIP',
+                                                         address=ip)
+                                 ],
+                                 conditions=[
+                                     utils.V1NodeCondition(type='Ready',
+                                                           status='True')
+                                 ]),
+                             spec=utils.V1NodeSpec(unschedulable=False,
+                                                   taints=[])))
+        return nodes
+
+    # Shared sub-expressions used in expected outputs.
+    _GPU_EXPR = {
+        'key': 'cloud.google.com/gke-accelerator',
+        'operator': 'In',
+        'values': ['nvidia-a100'],
+    }
+    _HOSTNAME_EXPR = {
+        'key': 'kubernetes.io/hostname',
+        'operator': 'In',
+        'values': ['node-a', 'node-b'],
+    }
+    _POD_AFFINITY = {
+        'podAffinity': {
+            'preferredDuringSchedulingIgnoredDuringExecution': [{
+                'weight': 1,
+                'podAffinityTerm': {
+                    'labelSelector': {
+                        'matchExpressions': [{
+                            'key': 'skypilot-binpack',
+                            'operator': 'In',
+                            'values': ['gpu'],
+                        }]
+                    },
+                    'topologyKey': 'kubernetes.io/hostname',
+                },
+            }]
+        }
+    }
+    _PREFERRED_AVOID_GPU = {
+        'preferredDuringSchedulingIgnoredDuringExecution': [{
+            'weight': 1,
+            'preference': {
+                'matchExpressions': [{
+                    'key': 'cloud.google.com/gke-accelerator',
+                    'operator': 'DoesNotExist',
+                }]
+            },
+        }]
+    }
+
+    def test_scheduling_labels_only_gpu_workload(self):
+        """Label-only config + GPU pod: cross-product with existing GPU term."""
+        pod_spec = self._make_pod_spec_gpu()
+        config = {'label_selector': {'pool': 'gpu', 'team': 'research'}}
+
+        result = utils.inject_allowed_nodes_affinity(copy.deepcopy(
+            pod_spec['spec']),
+                                                     config,
+                                                     context='test')
+
+        assert result == {
+            'containers': [{
+                'resources': {
+                    'limits': {
+                        'nvidia.com/gpu': '1'
+                    }
+                }
+            }],
+            'affinity': {
+                'nodeAffinity': {
+                    'requiredDuringSchedulingIgnoredDuringExecution': {
+                        'nodeSelectorTerms': [
+                            {
+                                'matchExpressions': [
+                                    self._GPU_EXPR,
+                                    {
+                                        'key': 'pool',
+                                        'operator': 'In',
+                                        'values': ['gpu']
+                                    },
+                                ]
+                            },
+                            {
+                                'matchExpressions': [
+                                    self._GPU_EXPR,
+                                    {
+                                        'key': 'team',
+                                        'operator': 'In',
+                                        'values': ['research']
+                                    },
+                                ]
+                            },
+                        ]
+                    }
+                },
+                **self._POD_AFFINITY,
+            },
+        }
+
+    def test_scheduling_labels_only_cpu_on_gpu_cluster(self):
+        """Label-only config + CPU pod on GPU cluster."""
+        pod_spec = self._make_pod_spec_cpu_on_gpu_cluster()
+        config = {'label_selector': {'pool': 'gpu', 'team': 'research'}}
+
+        result = utils.inject_allowed_nodes_affinity(copy.deepcopy(
+            pod_spec['spec']),
+                                                     config,
+                                                     context='test')
+
+        assert result == {
+            'containers': [{
+                'resources': {
+                    'limits': {
+                        'cpu': '4',
+                        'memory': '8Gi'
+                    }
+                }
+            }],
+            'affinity': {
+                'nodeAffinity': {
+                    **self._PREFERRED_AVOID_GPU,
+                    'requiredDuringSchedulingIgnoredDuringExecution': {
+                        'nodeSelectorTerms': [
+                            {
+                                'matchExpressions': [{
+                                    'key': 'pool',
+                                    'operator': 'In',
+                                    'values': ['gpu']
+                                },]
+                            },
+                            {
+                                'matchExpressions': [{
+                                    'key': 'team',
+                                    'operator': 'In',
+                                    'values': ['research']
+                                },]
+                            },
+                        ]
+                    },
+                },
+            },
+        }
+
+    def test_scheduling_labels_only_cpu_no_gpus(self):
+        """Label-only config + CPU pod on cluster with no GPUs."""
+        pod_spec = self._make_pod_spec_cpu_no_gpus_in_cluster()
+        config = {'label_selector': {'pool': 'cpu'}}
+
+        result = utils.inject_allowed_nodes_affinity(copy.deepcopy(
+            pod_spec['spec']),
+                                                     config,
+                                                     context='test')
+
+        assert result == {
+            'containers': [{
+                'resources': {
+                    'limits': {
+                        'cpu': '4',
+                        'memory': '8Gi'
+                    }
+                }
+            }],
+            'affinity': {
+                'nodeAffinity': {
+                    'requiredDuringSchedulingIgnoredDuringExecution': {
+                        'nodeSelectorTerms': [{
+                            'matchExpressions': [{
+                                'key': 'pool',
+                                'operator': 'In',
+                                'values': ['cpu']
+                            },]
+                        },]
+                    },
+                },
+            },
+        }
+
+    def test_scheduling_with_names_gpu_workload(self):
+        """Names config + GPU pod: hostname added to existing GPU term."""
+        pod_spec = self._make_pod_spec_gpu()
+        config = {'names': ['node-a', 'node-b']}
+        filtered_nodes = self._make_filtered_nodes()
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=filtered_nodes):
+            result = utils.inject_allowed_nodes_affinity(copy.deepcopy(
+                pod_spec['spec']),
+                                                         config,
+                                                         context='test')
+
+        assert result == {
+            'containers': [{
+                'resources': {
+                    'limits': {
+                        'nvidia.com/gpu': '1'
+                    }
+                }
+            }],
+            'affinity': {
+                'nodeAffinity': {
+                    'requiredDuringSchedulingIgnoredDuringExecution': {
+                        'nodeSelectorTerms': [{
+                            'matchExpressions': [
+                                self._GPU_EXPR,
+                                self._HOSTNAME_EXPR,
+                            ]
+                        }]
+                    }
+                },
+                **self._POD_AFFINITY,
+            },
+        }
+
+    def test_scheduling_with_ips_cpu_on_gpu_cluster(self):
+        """IPs config + CPU pod on GPU cluster: hostname term created."""
+        pod_spec = self._make_pod_spec_cpu_on_gpu_cluster()
+        config = {'ips': ['10.0.1.1', '10.0.1.2']}
+        filtered_nodes = self._make_filtered_nodes()
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=filtered_nodes):
+            result = utils.inject_allowed_nodes_affinity(copy.deepcopy(
+                pod_spec['spec']),
+                                                         config,
+                                                         context='test')
+
+        assert result == {
+            'containers': [{
+                'resources': {
+                    'limits': {
+                        'cpu': '4',
+                        'memory': '8Gi'
+                    }
+                }
+            }],
+            'affinity': {
+                'nodeAffinity': {
+                    **self._PREFERRED_AVOID_GPU,
+                    'requiredDuringSchedulingIgnoredDuringExecution': {
+                        'nodeSelectorTerms': [{
+                            'matchExpressions': [self._HOSTNAME_EXPR]
+                        }]
+                    },
+                },
+            },
+        }
+
+    def test_scheduling_labels_and_names_gpu_workload(self):
+        """Labels + names combined with GPU pod.
+
+        Labels produce dynamic terms, names produce a hostname term
+        (only for the named node). All are cross-producted with the
+        existing GPU term.
+        """
+        pod_spec = self._make_pod_spec_gpu()
+        config = {
+            'label_selector': {
+                'pool': 'gpu'
+            },
+            'names': ['node-a'],
+        }
+        filtered_nodes = self._make_filtered_nodes()
+
+        with mock.patch('sky.provision.kubernetes.utils.get_kubernetes_nodes',
+                        return_value=filtered_nodes):
+            result = utils.inject_allowed_nodes_affinity(copy.deepcopy(
+                pod_spec['spec']),
+                                                         config,
+                                                         context='test')
+
+        assert result == {
+            'containers': [{
+                'resources': {
+                    'limits': {
+                        'nvidia.com/gpu': '1'
+                    }
+                }
+            }],
+            'affinity': {
+                'nodeAffinity': {
+                    'requiredDuringSchedulingIgnoredDuringExecution': {
+                        'nodeSelectorTerms': [
+                            # Label term: GPU AND pool=gpu (dynamic)
+                            {
+                                'matchExpressions': [
+                                    self._GPU_EXPR,
+                                    {
+                                        'key': 'pool',
+                                        'operator': 'In',
+                                        'values': ['gpu']
+                                    },
+                                ]
+                            },
+                            # Hostname term: GPU AND hostname=node-a
+                            # (only node-a, not node-b, because names
+                            # only listed node-a)
+                            {
+                                'matchExpressions': [
+                                    self._GPU_EXPR,
+                                    {
+                                        'key': 'kubernetes.io/hostname',
+                                        'operator': 'In',
+                                        'values': ['node-a'],
+                                    },
+                                ]
+                            },
+                        ]
+                    }
+                },
+                **self._POD_AFFINITY,
+            },
+        }
+
+    def test_scheduling_no_config(self):
+        """No allowed_nodes config leaves affinity unchanged."""
+        pod_spec = self._make_pod_spec_gpu()
+        original = copy.deepcopy(pod_spec['spec'])
+
+        result = utils.inject_allowed_nodes_affinity(copy.deepcopy(
+            pod_spec['spec']),
+                                                     None,
+                                                     context='test')
+
+        assert result == original
+
+
+# ---------------------------------------------------------------------------
+# Tests for kubernetes.enable_docker shorthand config
+# ---------------------------------------------------------------------------
+
+_BASE_CLUSTER_YAML = {
+    'provider': {
+        'type': 'external',
+        'module': 'sky.provision.kubernetes',
+        'namespace': 'default',
+    },
+    'available_node_types': {
+        'ray_head_default': {
+            'node_config': {
+                'metadata': {
+                    'name': 'test-cluster-head',
+                    'namespace': 'default',
+                    'labels': {},
+                },
+                'spec': {
+                    'containers': [{
+                        'name': 'ray-node',
+                        'image': 'skypilot:latest',
+                    }],
+                },
+            }
+        }
+    },
+}
+
+
+class TestDockerSidecarDefaults(unittest.TestCase):
+    """Tests for DOCKER_SIDECAR_DEFAULTS."""
+
+    def test_defaults_returns_valid_dind(self):
+        defaults = utils.DOCKER_SIDECAR_DEFAULTS[utils.DockerMode.ALL]
+        assert isinstance(defaults, utils.DockerSidecarDefaults)
+        assert defaults.image
+        assert defaults.cli_image
+        assert defaults.cache_vol_name
+        assert defaults.cache_mount
+
+    def test_defaults_returns_valid_buildkit(self):
+        defaults = utils.DOCKER_SIDECAR_DEFAULTS[utils.DockerMode.BUILD]
+        assert isinstance(defaults, utils.DockerSidecarDefaults)
+        assert defaults.cli_image
+        assert defaults.cache_mount == '/home/user/.local/share/buildkit'
+
+    def test_defaults_unknown_mode_raises(self):
+        with self.assertRaises(ValueError):
+            utils.DockerMode('unknown')
+
+
+class TestNormalizeEnableDockerConfig(unittest.TestCase):
+    """Tests for normalize_enable_docker_config()."""
+
+    # ---- disabled / None ----
+
+    def test_none_returns_none(self):
+        assert utils.normalize_enable_docker_config(None) is None
+
+    def test_false_returns_none(self):
+        assert utils.normalize_enable_docker_config(False) is None
+
+    # ---- simple bool / string ----
+
+    def test_true_returns_all(self):
+        result = utils.normalize_enable_docker_config(True)
+        assert result == utils.DockerConfig(mode=utils.DockerMode.ALL)
+
+    def test_string_all_returns_all(self):
+        result = utils.normalize_enable_docker_config('ALL')
+        assert result == utils.DockerConfig(mode=utils.DockerMode.ALL)
+
+    def test_string_build_returns_build(self):
+        result = utils.normalize_enable_docker_config('BUILD')
+        assert result == utils.DockerConfig(mode=utils.DockerMode.BUILD)
+
+    # ---- dict form ----
+
+    def test_dict_mode_all(self):
+        result = utils.normalize_enable_docker_config({'mode': 'ALL'})
+        assert result == utils.DockerConfig(mode=utils.DockerMode.ALL)
+
+    def test_dict_mode_build(self):
+        result = utils.normalize_enable_docker_config({'mode': 'BUILD'})
+        assert result == utils.DockerConfig(mode=utils.DockerMode.BUILD)
+
+    def test_dict_with_cache_volume(self):
+        result = utils.normalize_enable_docker_config({
+            'mode': 'ALL',
+            'cache_volume': 'my-cache',
+        })
+        assert result == utils.DockerConfig(mode=utils.DockerMode.ALL,
+                                            cache_volume='my-cache')
+
+    def test_dict_build_with_cache_volume(self):
+        result = utils.normalize_enable_docker_config({
+            'mode': 'BUILD',
+            'cache_volume': 'bk-cache',
+        })
+        assert result == utils.DockerConfig(mode=utils.DockerMode.BUILD,
+                                            cache_volume='bk-cache')
+
+    # ---- edge cases ----
+
+    def test_empty_dict_returns_none(self):
+        """Empty dict (e.g. from config default_value) is treated as disabled."""
+        assert utils.normalize_enable_docker_config({}) is None
+
+    def test_dict_without_mode_key_returns_none(self):
+        """Dict missing 'mode' key is treated as disabled."""
+        assert utils.normalize_enable_docker_config({'cache_volume': 'vol'
+                                                    }) is None
+
+    def test_invalid_type_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            utils.normalize_enable_docker_config(42)
+        assert 'Invalid enable_docker value' in str(ctx.exception)
+
+    def test_invalid_string_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            utils.normalize_enable_docker_config('abcd')
+        assert 'Invalid enable_docker value' in str(ctx.exception)
+
+
+class TestCombinePodConfigFieldsWithEnableDocker(unittest.TestCase):
+    """Tests for combine_pod_config_fields() after docker sidecar refactor.
+
+    Docker sidecar injection is now handled by the Jinja2 template
+    (kubernetes-ray.yml.j2), not by combine_pod_config_fields().  These tests
+    verify that combine_pod_config_fields() no longer injects docker sidecars,
+    and that pod_config merging still works correctly when sidecars are
+    already present in the rendered template.
+    """
+
+    def _base_yaml(self):
+        import copy
+        return copy.deepcopy(_BASE_CLUSTER_YAML)
+
+    def _base_yaml_with_dind(self):
+        """Simulate a template-rendered YAML that already has a dind sidecar."""
+        import copy
+        yaml_obj = copy.deepcopy(_BASE_CLUSTER_YAML)
+        node_cfg = yaml_obj['available_node_types']['ray_head_default'][
+            'node_config']
+        node_cfg['spec']['containers'].append({
+            'name': 'dind',
+            'image': 'docker:29.3-dind',
+            'securityContext': {
+                'privileged': True
+            },
+        })
+        node_cfg['spec']['volumes'] = [{'name': 'docker-sock', 'emptyDir': {}}]
+        yaml_obj['provider']['docker_config'] = {
+            'mode': 'ALL',
+            'cache_volume': None,
+        }
+        return yaml_obj
+
+    def test_combine_does_not_inject_docker_sidecars(self):
+        """combine_pod_config_fields no longer injects docker sidecars."""
+        cluster_yaml = self._base_yaml()
+
+        def mock_get_config(cloud, region, keys, default_value=None):
+            return default_value
+
+        with patch('sky.skypilot_config.get_effective_region_config',
+                   side_effect=mock_get_config):
+            from sky import clouds as sky_clouds
+            result = utils.combine_pod_config_fields(
+                cluster_yaml,
+                cluster_config_overrides={},
+                cloud=sky_clouds.Kubernetes(),
+                context='test-ctx')
+
+        node_cfg = result['available_node_types']['ray_head_default'][
+            'node_config']
+        container_names = [c['name'] for c in node_cfg['spec']['containers']]
+        assert 'dind' not in container_names
+        assert 'buildkitd' not in container_names
+
+    def test_pod_config_can_override_template_rendered_dind(self):
+        """pod_config merging can override dind container from template."""
+        cluster_yaml = self._base_yaml_with_dind()
+
+        def mock_get_config(cloud, region, keys, default_value=None):
+            if keys == ('pod_config',):
+                return {
+                    'spec': {
+                        'containers': [{
+                            'name': 'dind',
+                            'image': 'docker:custom-image',
+                        }]
+                    }
+                }
+            return default_value
+
+        with patch('sky.skypilot_config.get_effective_region_config',
+                   side_effect=mock_get_config):
+            from sky import clouds as sky_clouds
+            result = utils.combine_pod_config_fields(
+                cluster_yaml,
+                cluster_config_overrides={},
+                cloud=sky_clouds.Kubernetes(),
+                context='test-ctx')
+
+        node_cfg = result['available_node_types']['ray_head_default'][
+            'node_config']
+        dind = next(
+            c for c in node_cfg['spec']['containers'] if c['name'] == 'dind')
+        assert dind['image'] == 'docker:custom-image'
+
+    def test_pod_config_can_add_extra_sidecar(self):
+        """pod_config merging can add an extra container alongside dind."""
+        cluster_yaml = self._base_yaml_with_dind()
+
+        def mock_get_config(cloud, region, keys, default_value=None):
+            if keys == ('pod_config',):
+                return {
+                    'spec': {
+                        'containers': [{
+                            'name': 'my-sidecar',
+                            'image': 'busybox:latest',
+                        }]
+                    }
+                }
+            return default_value
+
+        with patch('sky.skypilot_config.get_effective_region_config',
+                   side_effect=mock_get_config):
+            from sky import clouds as sky_clouds
+            result = utils.combine_pod_config_fields(
+                cluster_yaml,
+                cluster_config_overrides={},
+                cloud=sky_clouds.Kubernetes(),
+                context='test-ctx')
+
+        node_cfg = result['available_node_types']['ray_head_default'][
+            'node_config']
+        container_names = [c['name'] for c in node_cfg['spec']['containers']]
+        assert 'dind' in container_names
+        assert 'my-sidecar' in container_names
+        assert 'ray-node' in container_names
+
+
+class TestInjectDockerCacheVolume(unittest.TestCase):
+    """Tests for inject_docker_cache_volume()."""
+
+    _DIND_CFG = utils.DockerConfig(mode=utils.DockerMode.ALL)
+    _BUILDKIT_CFG = utils.DockerConfig(mode=utils.DockerMode.BUILD)
+
+    def _make_pod_spec(self,
+                       ctr_name='dind',
+                       existing_mounts=None,
+                       existing_volumes=None):
+        """Build a minimal pod spec with one sidecar container."""
+        ctr = {'name': ctr_name}
+        if existing_mounts is not None:
+            ctr['volumeMounts'] = existing_mounts
+        spec: dict = {
+            'metadata': {
+                'name': 'test-pod'
+            },
+            'spec': {
+                'containers': [
+                    {
+                        'name': 'ray-node'
+                    },
+                    ctr,
+                ],
+            },
+        }
+        if existing_volumes is not None:
+            spec['spec']['volumes'] = existing_volumes
+        return spec
+
+    # ---- DinD: emptyDir (no PVC) ----
+
+    def test_dind_no_pvc_adds_emptydir(self):
+        pod = self._make_pod_spec(ctr_name='dind')
+        utils.inject_docker_cache_volume(pod,
+                                         self._DIND_CFG,
+                                         pvc_name=None,
+                                         context='ctx',
+                                         namespace='ns')
+
+        vols = pod['spec']['volumes']
+        assert len(vols) == 1
+        assert vols[0]['name'] == 'dind-storage'
+        assert vols[0]['emptyDir'] == {}
+
+        dind_ctr = next(
+            c for c in pod['spec']['containers'] if c['name'] == 'dind')
+        assert len(dind_ctr['volumeMounts']) == 1
+        assert dind_ctr['volumeMounts'][0]['mountPath'] == '/var/lib/docker'
+        assert 'subPath' not in dind_ctr['volumeMounts'][0]
+
+    # ---- BuildKit: emptyDir (no PVC) ----
+
+    def test_buildkit_no_pvc_adds_emptydir(self):
+        pod = self._make_pod_spec(ctr_name='buildkitd')
+        utils.inject_docker_cache_volume(pod,
+                                         self._BUILDKIT_CFG,
+                                         pvc_name=None,
+                                         context='ctx',
+                                         namespace='ns')
+
+        vols = pod['spec']['volumes']
+        assert len(vols) == 1
+        assert vols[0]['name'] == 'buildkit-cache'
+        assert vols[0]['emptyDir'] == {}
+
+        bk_ctr = next(
+            c for c in pod['spec']['containers'] if c['name'] == 'buildkitd')
+        assert bk_ctr['volumeMounts'][0]['mountPath'] == (
+            '/home/user/.local/share/buildkit')
+
+    # ---- DinD: PVC with subPath ----
+
+    def test_dind_pvc_adds_volume_and_subpath(self):
+        pod = self._make_pod_spec(ctr_name='dind')
+        utils.inject_docker_cache_volume(pod,
+                                         self._DIND_CFG,
+                                         pvc_name='my-pvc',
+                                         context='ctx',
+                                         namespace='ns')
+
+        vols = pod['spec']['volumes']
+        assert len(vols) == 1
+        assert vols[0]['persistentVolumeClaim']['claimName'] == 'my-pvc'
+
+        dind_ctr = next(
+            c for c in pod['spec']['containers'] if c['name'] == 'dind')
+        vm = dind_ctr['volumeMounts'][0]
+        assert vm['mountPath'] == '/var/lib/docker'
+        assert vm['subPath'].startswith('var_lib_docker_')
+        assert len(vm['subPath']) == len('var_lib_docker_') + 12
+
+    def test_dind_pvc_no_fsgroup(self):
+        """DinD runs privileged — no fsGroup needed."""
+        pod = self._make_pod_spec(ctr_name='dind')
+        utils.inject_docker_cache_volume(pod,
+                                         self._DIND_CFG,
+                                         pvc_name='my-pvc',
+                                         context='ctx',
+                                         namespace='ns')
+
+        assert 'securityContext' not in pod['spec']
+
+    # ---- BuildKit: PVC with subPath + fsGroup ----
+
+    def test_buildkit_pvc_adds_volume_and_fsgroup(self):
+        pod = self._make_pod_spec(ctr_name='buildkitd')
+        utils.inject_docker_cache_volume(pod,
+                                         self._BUILDKIT_CFG,
+                                         pvc_name='my-pvc',
+                                         context='ctx',
+                                         namespace='ns')
+
+        vols = pod['spec']['volumes']
+        assert vols[0]['persistentVolumeClaim']['claimName'] == 'my-pvc'
+
+        bk_ctr = next(
+            c for c in pod['spec']['containers'] if c['name'] == 'buildkitd')
+        vm = bk_ctr['volumeMounts'][0]
+        assert vm['mountPath'] == '/home/user/.local/share/buildkit'
+        assert vm['subPath'].startswith('buildkit_cache_')
+
+        sec = pod['spec']['securityContext']
+        assert sec['fsGroup'] == 1000
+        assert sec['fsGroupChangePolicy'] == 'OnRootMismatch'
+
+    def test_buildkit_pvc_preserves_existing_fsgroup(self):
+        """If user already set fsGroup, don't override it."""
+        pod = self._make_pod_spec(ctr_name='buildkitd')
+        pod['spec']['securityContext'] = {'fsGroup': 2000}
+        utils.inject_docker_cache_volume(pod,
+                                         self._BUILDKIT_CFG,
+                                         pvc_name='my-pvc',
+                                         context='ctx',
+                                         namespace='ns')
+
+        assert pod['spec']['securityContext']['fsGroup'] == 2000
+
+    # ---- subPath hashing ----
+
+    def test_subpath_varies_by_pod_name(self):
+        pod1 = self._make_pod_spec(ctr_name='dind')
+        pod1['metadata']['name'] = 'pod-1'
+        pod2 = self._make_pod_spec(ctr_name='dind')
+        pod2['metadata']['name'] = 'pod-2'
+
+        utils.inject_docker_cache_volume(pod1,
+                                         self._DIND_CFG,
+                                         pvc_name='pvc',
+                                         context='ctx',
+                                         namespace='ns')
+        utils.inject_docker_cache_volume(pod2,
+                                         self._DIND_CFG,
+                                         pvc_name='pvc',
+                                         context='ctx',
+                                         namespace='ns')
+
+        sp1 = pod1['spec']['containers'][1]['volumeMounts'][0]['subPath']
+        sp2 = pod2['spec']['containers'][1]['volumeMounts'][0]['subPath']
+        assert sp1 != sp2
+
+    def test_subpath_varies_by_context_and_namespace(self):
+        pod_a = self._make_pod_spec(ctr_name='dind')
+        pod_b = self._make_pod_spec(ctr_name='dind')
+
+        utils.inject_docker_cache_volume(pod_a,
+                                         self._DIND_CFG,
+                                         pvc_name='pvc',
+                                         context='ctx-a',
+                                         namespace='ns')
+        utils.inject_docker_cache_volume(pod_b,
+                                         self._DIND_CFG,
+                                         pvc_name='pvc',
+                                         context='ctx-b',
+                                         namespace='ns')
+
+        sp_a = pod_a['spec']['containers'][1]['volumeMounts'][0]['subPath']
+        sp_b = pod_b['spec']['containers'][1]['volumeMounts'][0]['subPath']
+        assert sp_a != sp_b
+
+    # ---- User-provided mount: no-op ----
+
+    def test_noop_when_user_already_mounted_cache_path(self):
+        """If user already has a volumeMount at the cache path, skip."""
+        existing = [{'name': 'user-vol', 'mountPath': '/var/lib/docker'}]
+        pod = self._make_pod_spec(ctr_name='dind', existing_mounts=existing)
+        utils.inject_docker_cache_volume(pod,
+                                         self._DIND_CFG,
+                                         pvc_name='pvc',
+                                         context='ctx',
+                                         namespace='ns')
+
+        # No new volumes or mounts added.
+        assert 'volumes' not in pod['spec']
+        dind_ctr = next(
+            c for c in pod['spec']['containers'] if c['name'] == 'dind')
+        assert len(dind_ctr['volumeMounts']) == 1
+        assert dind_ctr['volumeMounts'][0]['name'] == 'user-vol'
+
+    # ---- Duplicate PVC reuse ----
+
+    def test_reuses_existing_pvc_volume_entry(self):
+        """If the same PVC is already in spec.volumes, reuse it."""
+        existing_vols = [{
+            'name': 'task-data',
+            'persistentVolumeClaim': {
+                'claimName': 'shared-pvc'
+            },
+        }]
+        pod = self._make_pod_spec(ctr_name='dind',
+                                  existing_volumes=existing_vols)
+        utils.inject_docker_cache_volume(pod,
+                                         self._DIND_CFG,
+                                         pvc_name='shared-pvc',
+                                         context='ctx',
+                                         namespace='ns')
+
+        # Should NOT add a second volume entry.
+        assert len(pod['spec']['volumes']) == 1
+        assert pod['spec']['volumes'][0]['name'] == 'task-data'
+
+        # The volumeMount should reference the existing volume name.
+        dind_ctr = next(
+            c for c in pod['spec']['containers'] if c['name'] == 'dind')
+        assert dind_ctr['volumeMounts'][0]['name'] == 'task-data'
+
+    def test_adds_new_volume_when_pvc_differs(self):
+        """Different PVC -> new volume entry added."""
+        existing_vols = [{
+            'name': 'other-vol',
+            'persistentVolumeClaim': {
+                'claimName': 'other-pvc'
+            },
+        }]
+        pod = self._make_pod_spec(ctr_name='dind',
+                                  existing_volumes=existing_vols)
+        utils.inject_docker_cache_volume(pod,
+                                         self._DIND_CFG,
+                                         pvc_name='cache-pvc',
+                                         context='ctx',
+                                         namespace='ns')
+
+        assert len(pod['spec']['volumes']) == 2
+        pvc_names = [
+            v.get('persistentVolumeClaim', {}).get('claimName')
+            for v in pod['spec']['volumes']
+        ]
+        assert 'cache-pvc' in pvc_names
+
+    # ---- context=None ----
+
+    def test_pvc_subpath_with_none_context(self):
+        """context=None should not crash; subPath uses empty string."""
+        pod = self._make_pod_spec(ctr_name='dind')
+        utils.inject_docker_cache_volume(pod,
+                                         self._DIND_CFG,
+                                         pvc_name='pvc',
+                                         context=None,
+                                         namespace='ns')
+
+        dind_ctr = next(
+            c for c in pod['spec']['containers'] if c['name'] == 'dind')
+        vm = dind_ctr['volumeMounts'][0]
+        assert vm['subPath'].startswith('var_lib_docker_')
+        # Verify a different context produces a different subPath.
+        pod2 = self._make_pod_spec(ctr_name='dind')
+        utils.inject_docker_cache_volume(pod2,
+                                         self._DIND_CFG,
+                                         pvc_name='pvc',
+                                         context='real-ctx',
+                                         namespace='ns')
+        vm2 = next(c for c in pod2['spec']['containers']
+                   if c['name'] == 'dind')['volumeMounts'][0]
+        assert vm['subPath'] != vm2['subPath']
+
+
+def _make_node(cpu_cap: str,
+               mem_cap: str,
+               cpu_alloc: str,
+               mem_alloc: str,
+               ready: bool = True) -> utils.V1Node:
+    """Helper to build a V1Node for adjust_resources_to_allocatable tests."""
+    return utils.V1Node(
+        metadata=utils.V1ObjectMeta(name='node', labels={}),
+        status=utils.V1NodeStatus(
+            capacity={
+                'cpu': cpu_cap,
+                'memory': mem_cap
+            },
+            allocatable={
+                'cpu': cpu_alloc,
+                'memory': mem_alloc
+            },
+            addresses=[],
+            conditions=[
+                utils.V1NodeCondition(type='Ready',
+                                      status='True' if ready else 'False')
+            ],
+        ),
+        spec=utils.V1NodeSpec(unschedulable=False, taints=[]),
+    )
+
+
+class TestAdjustResourcesToAllocatable:
+    """Tests for adjust_resources_to_allocatable."""
+
+    @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
+    def test_dryrun_returns_original(self, mock_nodes):
+        """Dryrun should return original values without querying nodes."""
+        result = utils.adjust_resources_to_allocatable(4.0,
+                                                       16.0,
+                                                       'ctx',
+                                                       dryrun=True)
+        assert result == (4.0, 16.0)
+        mock_nodes.assert_not_called()
+
+    @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
+    def test_larger_node_skips_clamping(self, mock_nodes):
+        """If a node has strictly more CPU and memory, no clamping."""
+        mock_nodes.return_value = [
+            _make_node('16', '64Gi', '15900m', '62Gi'),
+        ]
+        result = utils.adjust_resources_to_allocatable(4.0, 16.0, 'ctx')
+        assert result == (4.0, 16.0)
+
+    @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
+    def test_exact_match_clamps(self, mock_nodes):
+        """Exact capacity match should clamp to allocatable."""
+        mock_nodes.return_value = [
+            _make_node('8', '32Gi', '7910m', '28Gi'),
+        ]
+        cpus, mem = utils.adjust_resources_to_allocatable(8.0, 32.0, 'ctx')
+        assert cpus < 8.0
+        assert mem < 32.0
+
+    @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
+    def test_no_matching_nodes_returns_original(self, mock_nodes):
+        """If no nodes match the request, return original values."""
+        mock_nodes.return_value = [
+            _make_node('16', '64Gi', '15900m', '62Gi'),
+            _make_node('32', '128Gi', '31900m', '126Gi'),
+        ]
+        # Request 4 CPU / 16G — neither node has exact match,
+        # and both are larger so we get early return anyway.
+        result = utils.adjust_resources_to_allocatable(4.0, 16.0, 'ctx')
+        assert result == (4.0, 16.0)
+
+    @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
+    def test_multiple_exact_nodes_takes_minimum(self, mock_nodes):
+        """Min allocatable across matching nodes should be used."""
+        mock_nodes.return_value = [
+            _make_node('8', '32Gi', '7910m', '28Gi'),
+            _make_node('8', '32Gi', '7800m', '27Gi'),
+        ]
+        cpus, mem = utils.adjust_resources_to_allocatable(8.0, 32.0, 'ctx')
+        # Should use the node with less allocatable resources.
+        cpus2, mem2 = utils.adjust_resources_to_allocatable(8.0, 32.0, 'ctx')
+        assert cpus == cpus2
+        assert mem == mem2
+
+    @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
+    def test_independent_cpu_mem_matching(self, mock_nodes):
+        """CPU and memory are matched independently."""
+        # Node A: exact CPU match only (mem is larger)
+        # Node B: exact mem match only (cpu is larger)
+        mock_nodes.return_value = [
+            _make_node('8', '64Gi', '7910m', '62Gi'),
+            _make_node('16', '32Gi', '15900m', '28Gi'),
+        ]
+        cpus, mem = utils.adjust_resources_to_allocatable(8.0, 32.0, 'ctx')
+        # CPU should be clamped (from node A), memory should be clamped
+        # (from node B).
+        assert cpus < 8.0
+        assert mem < 32.0
+
+    @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
+    def test_not_ready_nodes_ignored(self, mock_nodes):
+        """Not-ready nodes should not affect clamping."""
+        mock_nodes.return_value = [
+            _make_node('8', '32Gi', '4000m', '16Gi', ready=False),
+            _make_node('16', '64Gi', '15900m', '62Gi'),
+        ]
+        # The not-ready node has exact CPU match but should be ignored.
+        # The ready node is strictly larger, so no clamping.
+        result = utils.adjust_resources_to_allocatable(8.0, 32.0, 'ctx')
+        assert result == (8.0, 32.0)
+
+    @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
+    def test_larger_node_one_dimension_only(self, mock_nodes):
+        """A node larger in only one dimension should not skip clamping."""
+        # Node has more CPU but exact memory — not strictly larger in both.
+        mock_nodes.return_value = [
+            _make_node('16', '32Gi', '15900m', '28Gi'),
+        ]
+        cpus, mem = utils.adjust_resources_to_allocatable(8.0, 32.0, 'ctx')
+        # CPU doesn't match (16 != 8), memory matches exactly.
+        # Memory should be clamped.
+        assert cpus == 8.0
+        assert mem < 32.0
+
+    @patch('sky.provision.kubernetes.utils.get_kubernetes_nodes')
+    def test_heterogeneous_cluster_with_larger_node(self, mock_nodes):
+        """Heterogeneous cluster: larger node exists, no clamping."""
+        mock_nodes.return_value = [
+            _make_node('4', '16Gi', '3900m', '14Gi'),
+            _make_node('8', '32Gi', '7910m', '28Gi'),
+        ]
+        result = utils.adjust_resources_to_allocatable(4.0, 16.0, 'ctx')
+        assert result == (4.0, 16.0)
+
+
+class TestGetNamespace:
+    """Tests for `get_namespace`: config resolution + kubeconfig fallback."""
+
+    @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
+    @patch('sky.provision.kubernetes.utils.skypilot_config'
+           '.get_effective_namespace')
+    def test_returns_config_value_when_set(self, mock_effective,
+                                           mock_kubeconfig):
+        """When config has a value, kubeconfig fallback is not consulted."""
+        mock_effective.return_value = 'team-a'
+        result = utils.get_namespace(context='shared-ctx',
+                                     workspace='workspaceA')
+        assert result == 'team-a'
+        mock_effective.assert_called_once_with(
+            cloud='kubernetes',
+            region='shared-ctx',
+            workspace='workspaceA',
+            override_configs=None,
+        )
+        mock_kubeconfig.assert_not_called()
+
+    @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
+    @patch('sky.provision.kubernetes.utils.skypilot_config'
+           '.get_effective_namespace')
+    def test_falls_back_to_kubeconfig_when_unset(self, mock_effective,
+                                                 mock_kubeconfig):
+        """No config value → kubeconfig context's default namespace."""
+        mock_effective.return_value = None
+        mock_kubeconfig.return_value = 'kubeconfig-default-ns'
+        result = utils.get_namespace(context='shared-ctx')
+        assert result == 'kubeconfig-default-ns'
+        mock_kubeconfig.assert_called_once_with('shared-ctx')
+
+    @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
+    @patch('sky.provision.kubernetes.utils.skypilot_config'
+           '.get_effective_namespace')
+    def test_passes_override_configs_through(self, mock_effective,
+                                             mock_kubeconfig):
+        """`override_configs` are forwarded to the resolver verbatim."""
+        mock_effective.return_value = 'override-ns'
+        overrides = {'kubernetes': {'namespace': 'override-ns'}}
+        result = utils.get_namespace(context='shared-ctx',
+                                     workspace='workspaceA',
+                                     override_configs=overrides)
+        assert result == 'override-ns'
+        mock_effective.assert_called_once_with(
+            cloud='kubernetes',
+            region='shared-ctx',
+            workspace='workspaceA',
+            override_configs=overrides,
+        )
+        mock_kubeconfig.assert_not_called()
+
+    @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
+    @patch('sky.provision.kubernetes.utils.skypilot_config'
+           '.get_effective_namespace')
+    def test_context_none_propagates_to_kubeconfig_fallback(
+            self, mock_effective, mock_kubeconfig):
+        """`context=None` propagates to the kubeconfig current-context fallback."""
+        mock_effective.return_value = None
+        mock_kubeconfig.return_value = 'current-ctx-default'
+        result = utils.get_namespace()
+        assert result == 'current-ctx-default'
+        mock_kubeconfig.assert_called_once_with(None)
+
+    @patch('sky.provision.kubernetes.utils.get_kube_config_context_namespace')
+    @patch('sky.provision.kubernetes.utils.skypilot_config'
+           '.get_effective_namespace')
+    def test_forwards_explicit_cloud(self, mock_effective, mock_kubeconfig):
+        """Explicit `cloud` arg is forwarded to the resolver.
+
+        Callers reused across cloud classes (e.g. Kubernetes and SSH node
+        pools) need to scope namespace lookups to their own cloud key so
+        configuration set under one cloud does not bleed into another.
+        """
+        mock_effective.return_value = None
+        mock_kubeconfig.return_value = 'kubeconfig-default'
+        result = utils.get_namespace(context='ssh-cluster', cloud='ssh')
+        assert result == 'kubeconfig-default'
+        mock_effective.assert_called_once_with(
+            cloud='ssh',
+            region='ssh-cluster',
+            workspace=None,
+            override_configs=None,
+        )
+
+
+class TestCheckCredentials:
+    """Tests for `check_credentials`: probe namespace resolution.
+
+    The probe ``list_namespaced_pod`` was historically issued against
+    the raw kubeconfig context default. With workspace- and cloud-level
+    namespace overrides supported, the probe must use the resolved
+    namespace so users with RBAC only on their workspace's namespace
+    are not falsely reported as broken by ``sky check``.
+    """
+
+    def _patch_common(self):
+        """Patch the side-effects `check_credentials` triggers besides the probe.
+
+        Returns the active-context patches so individual tests can
+        configure them; everything else is short-circuited.
+        """
+        patches = [
+            patch('sky.provision.kubernetes.utils.kubernetes.core_api'),
+            patch('sky.provision.kubernetes.utils.get_kubernetes_nodes'),
+            patch('sky.provision.kubernetes.utils.get_kubeconfig_paths',
+                  return_value=['~/.kube/config']),
+        ]
+        return [p.start() for p in patches], patches
+
+    def _stop(self, patches):
+        for p in patches:
+            p.stop()
+
+    @patch('sky.provision.kubernetes.utils.get_namespace')
+    def test_probes_workspace_resolved_namespace(self, mock_get_namespace):
+        """Probe uses the workspace/cloud-resolved namespace, not kubeconfig.
+
+        With ``kubernetes.namespace: team-a`` configured, the
+        ``list_namespaced_pod`` call must target ``team-a`` so users
+        without RBAC on the kubeconfig default are not falsely reported
+        as broken by ``sky check``.
+        """
+        mocks, patches = self._patch_common()
+        mock_core_api = mocks[0]
+        try:
+            mock_get_namespace.return_value = 'team-a'
+
+            ok, reason = utils.check_credentials(context='shared-ctx')
+
+            assert ok is True
+            assert reason is None
+            mock_get_namespace.assert_called_once_with(context='shared-ctx',
+                                                       cloud='kubernetes')
+            mock_core_api.return_value.list_namespaced_pod.assert_called_once()
+            args, _ = (mock_core_api.return_value.list_namespaced_pod.call_args)
+            assert args[0] == 'team-a'
+        finally:
+            self._stop(patches)
+
+    @patch('sky.provision.kubernetes.utils.get_namespace')
+    def test_falls_back_to_kubeconfig_default_when_unconfigured(
+            self, mock_get_namespace):
+        """When no namespace override is set the kubeconfig default is used.
+
+        Pinned to preserve pre-feature behaviour: a user without any
+        workspace or global ``kubernetes.namespace`` should see the
+        same probe target as before.
+        """
+        mocks, patches = self._patch_common()
+        mock_core_api = mocks[0]
+        try:
+            mock_get_namespace.return_value = 'kubeconfig-default'
+
+            ok, _ = utils.check_credentials(context='shared-ctx')
+
+            assert ok is True
+            args, _ = (mock_core_api.return_value.list_namespaced_pod.call_args)
+            assert args[0] == 'kubeconfig-default'
+        finally:
+            self._stop(patches)
+
+    @patch('sky.provision.kubernetes.utils.get_namespace')
+    def test_forwards_explicit_cloud(self, mock_get_namespace):
+        """`cloud` arg is forwarded to `get_namespace`.
+
+        Required so that the SSH path's credential check resolves
+        under ``ssh.*`` and a global ``kubernetes.namespace`` setting
+        does not bleed into SSH ``sky check`` results.
+        """
+        mocks, patches = self._patch_common()
+        try:
+            mock_get_namespace.return_value = 'kubeconfig-default'
+
+            utils.check_credentials(context='ssh-cluster', cloud='ssh')
+
+            mock_get_namespace.assert_called_once_with(context='ssh-cluster',
+                                                       cloud='ssh')
+        finally:
+            self._stop(patches)
+
+
+# ----------------------------------------------------------------------------
+# Taint toleration tests (kubernetes.pod_config.spec.tolerations)
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    'taint,tolerations,expected',
+    [
+        # 1. Exact Equal match (the customer's case).
+        ({
+            'key': 'workload_pool',
+            'value': 'research',
+            'effect': 'NoSchedule'
+        }, [{
+            'key': 'workload_pool',
+            'operator': 'Equal',
+            'value': 'research',
+            'effect': 'NoSchedule'
+        }], True),
+        # 2. Value mismatch under Equal.
+        ({
+            'key': 'workload_pool',
+            'value': 'research',
+            'effect': 'NoSchedule'
+        }, [{
+            'key': 'workload_pool',
+            'operator': 'Equal',
+            'value': 'staging',
+            'effect': 'NoSchedule'
+        }], False),
+        # 3. Exists ignores value.
+        ({
+            'key': 'workload_pool',
+            'value': 'research',
+            'effect': 'NoSchedule'
+        }, [{
+            'key': 'workload_pool',
+            'operator': 'Exists',
+            'effect': 'NoSchedule'
+        }], True),
+        # 4. Empty effect on toleration matches all effects.
+        ({
+            'key': 'workload_pool',
+            'value': 'research',
+            'effect': 'NoSchedule'
+        }, [{
+            'key': 'workload_pool',
+            'operator': 'Equal',
+            'value': 'research'
+        }], True),
+        # 5. Effect mismatch.
+        ({
+            'key': 'workload_pool',
+            'value': 'research',
+            'effect': 'NoExecute'
+        }, [{
+            'key': 'workload_pool',
+            'operator': 'Equal',
+            'value': 'research',
+            'effect': 'NoSchedule'
+        }], False),
+        # 6. Empty key + Exists is a universal wildcard.
+        ({
+            'key': 'whatever',
+            'value': 'any',
+            'effect': 'NoSchedule'
+        }, [{
+            'operator': 'Exists'
+        }], True),
+        # 7. Wildcard restricted to a specific effect.
+        ({
+            'key': 'whatever',
+            'value': 'any',
+            'effect': 'NoSchedule'
+        }, [{
+            'operator': 'Exists',
+            'effect': 'NoExecute'
+        }], False),
+        # 8. Default operator (Equal) when unspecified.
+        ({
+            'key': 'workload_pool',
+            'value': 'research',
+            'effect': 'NoSchedule'
+        }, [{
+            'key': 'workload_pool',
+            'value': 'research',
+            'effect': 'NoSchedule'
+        }], True),
+        # 9. Taint with no value, toleration with empty-string value.
+        ({
+            'key': 'workload_pool',
+            'value': None,
+            'effect': 'NoSchedule'
+        }, [{
+            'key': 'workload_pool',
+            'operator': 'Equal',
+            'value': '',
+            'effect': 'NoSchedule'
+        }], True),
+        # 10. Taint with no value, toleration with explicit non-empty value.
+        ({
+            'key': 'workload_pool',
+            'value': None,
+            'effect': 'NoSchedule'
+        }, [{
+            'key': 'workload_pool',
+            'operator': 'Equal',
+            'value': 'research',
+            'effect': 'NoSchedule'
+        }], False),
+        # 11. Any-of-list match (second toleration matches).
+        ({
+            'key': 'a',
+            'value': 'b',
+            'effect': 'NoSchedule'
+        }, [
+            {
+                'key': 'a',
+                'value': 'c',
+                'effect': 'NoSchedule'
+            },
+            {
+                'key': 'a',
+                'value': 'b',
+                'effect': 'NoSchedule'
+            },
+        ], True),
+        # 12. Empty toleration list never matches.
+        ({
+            'key': 'a',
+            'value': 'b',
+            'effect': 'NoSchedule'
+        }, [], False),
+        # 13. Malformed (non-dict) toleration entries are skipped, not errors.
+        ({
+            'key': 'workload_pool',
+            'value': 'research',
+            'effect': 'NoSchedule'
+        }, [
+            'not-a-dict',
+            None,
+            {
+                'key': 'workload_pool',
+                'value': 'research',
+                'effect': 'NoSchedule'
+            },
+        ], True),
+        # 14. Empty-key Equal is invalid (only Exists is valid with empty
+        # key), so it must not match.
+        ({
+            'key': 'a',
+            'value': 'b',
+            'effect': 'NoSchedule'
+        }, [{
+            'operator': 'Equal',
+            'value': 'b',
+            'effect': 'NoSchedule'
+        }], False),
+    ])
+def test_taint_is_tolerated(taint, tolerations, expected):
+    assert utils.taint_is_tolerated(taint, tolerations) is expected
+
+
+def test_get_configured_tolerations_global_only():
+    """When only a global toleration is configured, it's returned."""
+    global_tols = [{
+        'key': 'workload_pool',
+        'operator': 'Equal',
+        'value': 'research',
+        'effect': 'NoSchedule',
+    }]
+    with patch('sky.skypilot_config.get_effective_region_config') as mock_get:
+        mock_get.return_value = {'spec': {'tolerations': global_tols}}
+        result = utils.get_configured_tolerations(context='ctx-a')
+        assert result == global_tols
+        # Goes through resolve_effective_pod_config, which fetches the whole
+        # pod_config dict (so the K8s dict-merge fires for per-context
+        # overrides) with default_value={}.
+        mock_get.assert_called_once_with(cloud='kubernetes',
+                                         region='ctx-a',
+                                         keys=('pod_config',),
+                                         default_value={})
+
+
+def test_get_configured_tolerations_none_configured():
+    """No tolerations configured → None (preserves today's wire shape).
+
+    Returning None ensures downstream get_taints(tolerations=None) skips
+    the tolerated decoration entirely, so users without configured
+    tolerations see byte-identical taint dicts to today.
+    """
+    with patch('sky.skypilot_config.get_effective_region_config') as mock_get:
+        mock_get.return_value = None
+        result = utils.get_configured_tolerations(context='ctx-a')
+        assert result is None
+
+
+def test_get_configured_tolerations_defensive_against_garbage():
+    """Non-dict spec / non-list tolerations / non-dict entries — all
+    defaulted away without crashing the caller.
+
+    `resolve_effective_pod_config` is typed to return `Dict[str, Any]`
+    so we don't defend against the top-level `pod_config` itself being
+    non-dict; only against malformed nested values.
+    """
+    with patch('sky.skypilot_config.get_effective_region_config') as mock_get:
+        # spec isn't a dict.
+        mock_get.return_value = {'spec': 'garbage'}
+        assert utils.get_configured_tolerations(context='ctx-a') is None
+        # tolerations isn't a list.
+        mock_get.return_value = {'spec': {'tolerations': 'garbage'}}
+        assert utils.get_configured_tolerations(context='ctx-a') is None
+        # List with non-dict entries gets filtered.
+        mock_get.return_value = {
+            'spec': {
+                'tolerations': [
+                    {
+                        'key': 'a',
+                        'operator': 'Exists'
+                    },
+                    'garbage-string',
+                    None,
+                    42,
+                ],
+            },
+        }
+        result = utils.get_configured_tolerations(context='ctx-a')
+        assert result == [{'key': 'a', 'operator': 'Exists'}]
+
+
+def test_get_configured_tolerations_empty_list_preserved():
+    """Explicit empty list in config → empty list (not None).
+
+    Distinguishes "I'm setting an empty list" from "I didn't set anything".
+    """
+    with patch('sky.skypilot_config.get_effective_region_config') as mock_get:
+        mock_get.return_value = {'spec': {'tolerations': []}}
+        result = utils.get_configured_tolerations(context='ctx-a')
+        assert result == []
+
+
+def test_get_configured_tolerations_fetches_pod_config_dict():
+    """Fetches `('pod_config',)` (the whole dict) — NOT
+    `('pod_config', 'spec', 'tolerations')` directly.
+
+    Fetching the leaf list bypasses the K8s-specific dict merge in
+    `get_cloud_config_value_from_dict`, letting a per-context
+    `tolerations` list clobber the global one. Fetching the dict
+    triggers `merge_k8s_configs`, which appends list elements — matching
+    what `resolve_effective_pod_config` does for the actual pod spec.
+    """
+    captured_keys = []
+
+    def fake_get(cloud, region, keys, default_value):
+        captured_keys.append(keys)
+        return default_value
+
+    with patch('sky.skypilot_config.get_effective_region_config',
+               side_effect=fake_get):
+        utils.get_configured_tolerations(context='ctx-a')
+        assert ('pod_config',) in captured_keys, (
+            f'Expected pod_config dict to be fetched (so the merge fires), '
+            f'got: {captured_keys}')
+
+
+def test_get_configured_tolerations_ssh_context_uses_ssh_namespace():
+    """An `ssh-<pool>` context must be read under the `ssh.*` config
+    namespace with the `ssh-` prefix stripped before applying
+    `context_configs.<pool>` overrides — matching the SSH branch of
+    `resolve_effective_pod_config`. The Kubernetes branch (cloud=None)
+    would read the wrong namespace AND skip the prefix-stripping, so an
+    `ssh-cluster1`-scoped toleration would be missed and a global
+    `kubernetes.pod_config` toleration would leak onto SSH node health.
+    """
+    captured = []
+
+    def fake_get(cloud, region, keys, default_value):
+        captured.append((cloud, region))
+        return default_value
+
+    with patch('sky.skypilot_config.get_effective_region_config',
+               side_effect=fake_get):
+        utils.get_configured_tolerations(context='ssh-cluster1')
+        # Expect (cloud='ssh', region='cluster1') — NOT
+        # (cloud='kubernetes', region='ssh-cluster1').
+        assert ('ssh', 'cluster1') in captured, (
+            f'Expected SSH namespace + stripped prefix; got {captured}')
+
+
+def test_get_configured_tolerations_extracts_from_pod_config_dict():
+    """Merged pod_config dict → extract spec.tolerations."""
+    with patch('sky.skypilot_config.get_effective_region_config') as mock_get:
+        mock_get.return_value = {
+            'metadata': {
+                'labels': {
+                    'team': 'research'
+                }
+            },
+            'spec': {
+                'tolerations': [
+                    {
+                        'key': 'global-key',
+                        'operator': 'Exists'
+                    },
+                    {
+                        'key': 'context-key',
+                        'operator': 'Equal',
+                        'value': 'v',
+                        'effect': 'NoSchedule'
+                    },
+                ],
+            },
+        }
+        result = utils.get_configured_tolerations(context='ctx-a')
+        assert result == [
+            {
+                'key': 'global-key',
+                'operator': 'Exists'
+            },
+            {
+                'key': 'context-key',
+                'operator': 'Equal',
+                'value': 'v',
+                'effect': 'NoSchedule'
+            },
+        ]
+
+
+@pytest.mark.parametrize(
+    'case_id,taint_value,tol_value,expected',
+    [
+        # YAML-parsed int taint/toleration values must still match via
+        # str(). Without coercion, `value: 123` (unquoted YAML → int)
+        # would not match a K8s taint value of '123' (str).
+        ('yaml-int', '123', 123, True),
+        # YAML-parsed bool: `value: true` → Python True must match a
+        # taint string 'true' (lowercase). K8s stores taint values as
+        # whatever Go's YAML serializer emits, which is always lowercase
+        # for booleans. Without the bool-lowercase coercion, Python's
+        # `str(True)` would yield 'True' and silently mismatch.
+        ('yaml-bool', 'true', True, True),
+        # Falsy YAML-int (`value: 0`) survives coercion. Regression for
+        # the `str(x or '')` idiom which silently collapses 0 → ''.
+        ('yaml-int-zero', '0', 0, True),
+        # Falsy YAML-bool (`value: false`) — same regression risk as
+        # int-zero, plus the same lowercase requirement as `yaml-bool`.
+        ('yaml-bool-false', 'false', False, True),
+        # Defensive: a Python-cased 'True'/'False' string on the K8s
+        # side must NOT match a Python-bool toleration. The lowercase
+        # coercion is strict; mismatches against 'True'/'False' don't
+        # accidentally pass.
+        ('python-cased-bool-no-match', 'True', True, False),
+        ('python-cased-bool-false-no-match', 'False', False, False),
+        # Inverse collapse: taint has value='' and toleration has
+        # value=0. Must NOT match (toleration's 0 → '0' ≠ taint's '').
+        ('inverse-collapse', '', 0, False),
+    ],
+    ids=lambda v: v if isinstance(v, str) else repr(v))
+def test_taint_is_tolerated_str_coercion(case_id, taint_value, tol_value,
+                                         expected):
+    """YAML-parsed non-string taint/toleration values must coerce to str
+    before comparison. Guards against the `str(x or '')` idiom which
+    silently collapses falsy values (`0`, `False`) to `''`."""
+    del case_id  # for pytest id only
+    taint = {'key': 'foo', 'value': taint_value, 'effect': 'NoSchedule'}
+    tolerations = [{
+        'key': 'foo',
+        'operator': 'Equal',
+        'value': tol_value,
+        'effect': 'NoSchedule',
+    }]
+    assert utils.taint_is_tolerated(taint, tolerations) is expected
+
+
+@pytest.mark.parametrize('taints,expected', [
+    (None, False),
+    ([], False),
+    ([{
+        'key': 'a',
+        'effect': 'NoSchedule'
+    }], True),
+    ([{
+        'key': 'a',
+        'effect': 'NoSchedule',
+        'tolerated': True
+    }], False),
+    ([{
+        'key': 'a',
+        'effect': 'NoSchedule',
+        'tolerated': False
+    }], True),
+    ([{
+        'key': 'a',
+        'effect': 'NoSchedule',
+        'tolerated': True
+    }, {
+        'key': 'b',
+        'effect': 'NoSchedule'
+    }], True),
+])
+def test_has_untolerated_taint(taints, expected):
+    """The shared predicate used by catalog / get_kubernetes_node_info /
+    sky-show-gpus aggregation.
+
+    A missing `tolerated` key counts as un-tolerated (backwards-compat
+    with servers that don't decorate the field), and an empty/None list
+    is never un-tolerated.
+    """
+    assert utils.has_untolerated_taint(taints) is expected
+
+
+def _make_v1node_with_taints(taints):
+    """Helper to build a V1Node with the supplied taints."""
+    return utils.V1Node.from_dict({
+        'metadata': {
+            'name': 'worker-1',
+            'labels': {},
+        },
+        'status': {
+            'allocatable': {},
+            'capacity': {},
+            'addresses': [],
+            'conditions': [{
+                'type': 'Ready',
+                'status': 'True',
+            }],
+        },
+        'spec': {
+            'unschedulable': False,
+            'taints': taints,
+        },
+    })
+
+
+def test_v1node_get_taints_tolerations_none_is_backward_compatible():
+    """tolerations=None: dicts have no 'tolerated' key (identical to today)."""
+    node = _make_v1node_with_taints([{
+        'key': 'workload_pool',
+        'value': 'research',
+        'effect': 'NoSchedule',
+    }])
+    out = node.get_taints()
+    assert out == [{
+        'key': 'workload_pool',
+        'value': 'research',
+        'effect': 'NoSchedule',
+    }]
+    # And explicit None matches.
+    assert node.get_taints(tolerations=None) == out
+
+
+def test_v1node_get_taints_tolerations_empty_marks_all_false():
+    """tolerations=[]: every retained taint gets tolerated=False."""
+    node = _make_v1node_with_taints([{
+        'key': 'workload_pool',
+        'value': 'research',
+        'effect': 'NoSchedule',
+    }])
+    out = node.get_taints(tolerations=[])
+    assert out == [{
+        'key': 'workload_pool',
+        'value': 'research',
+        'effect': 'NoSchedule',
+        'tolerated': False,
+    }]
+
+
+def test_v1node_get_taints_tolerations_matches_user_taint():
+    """A matching configured toleration sets tolerated=True."""
+    node = _make_v1node_with_taints([{
+        'key': 'workload_pool',
+        'value': 'research',
+        'effect': 'NoSchedule',
+    }])
+    tols = [{
+        'key': 'workload_pool',
+        'operator': 'Equal',
+        'value': 'research',
+        'effect': 'NoSchedule',
+    }]
+    out = node.get_taints(tolerations=tols)
+    assert out == [{
+        'key': 'workload_pool',
+        'value': 'research',
+        'effect': 'NoSchedule',
+        'tolerated': True,
+    }]
+
+
+def test_v1node_get_taints_exclude_filters_still_apply_with_tolerations():
+    """exclude_* filters drop taints regardless of tolerations.
+
+    A tolerated handled-key taint is still dropped by exclude_keys, so it
+    doesn't appear in the output. The non-excluded taint comes through
+    with tolerated=True from the user toleration.
+    """
+    node = _make_v1node_with_taints([
+        {
+            'key': 'nvidia.com/gpu',
+            'effect': 'NoSchedule',
+        },
+        {
+            'key': 'workload_pool',
+            'value': 'research',
+            'effect': 'NoSchedule',
+        },
+    ])
+    tols = [{
+        # Wildcard toleration that would otherwise mark every taint
+        # tolerated.
+        'operator': 'Exists',
+    }]
+    out = node.get_taints(
+        exclude_keys=['nvidia.com/gpu'],
+        tolerations=tols,
+    )
+    assert out == [{
+        'key': 'workload_pool',
+        'value': 'research',
+        'effect': 'NoSchedule',
+        'tolerated': True,
+    }]
+
+
+def test_v1node_get_taints_mixed_tolerated_and_untolerated():
+    """Mixed taints get individual tolerated flags."""
+    node = _make_v1node_with_taints([
+        {
+            'key': 'workload_pool',
+            'value': 'research',
+            'effect': 'NoSchedule',
+        },
+        {
+            'key': 'dangerous',
+            'value': 'true',
+            'effect': 'NoSchedule',
+        },
+    ])
+    tols = [{
+        'key': 'workload_pool',
+        'operator': 'Equal',
+        'value': 'research',
+        'effect': 'NoSchedule',
+    }]
+    out = node.get_taints(tolerations=tols)
+    by_key = {t['key']: t['tolerated'] for t in out}
+    assert by_key == {'workload_pool': True, 'dangerous': False}
+
+
+# ---------------------------------------------------------------------------
+# Pod termination reason / OOM diagnosis helpers
+# (get_condensed_pod_reason, pod_terminated_abnormally,
+#  diagnose_terminated_pod)
+# ---------------------------------------------------------------------------
+
+
+def _make_container_status(*,
+                           terminated_reason=None,
+                           terminated_exit_code=None,
+                           last_terminated_reason=None,
+                           last_terminated_exit_code=None,
+                           waiting_reason=None,
+                           waiting_message=None):
+    """Build a V1ContainerStatus with the given current/last/waiting state."""
+    state = kubernetes.client.V1ContainerState()
+    if terminated_reason is not None or terminated_exit_code is not None:
+        state.terminated = kubernetes.client.V1ContainerStateTerminated(
+            exit_code=terminated_exit_code or 0, reason=terminated_reason)
+    if waiting_reason is not None:
+        state.waiting = kubernetes.client.V1ContainerStateWaiting(
+            reason=waiting_reason, message=waiting_message)
+    last_state = kubernetes.client.V1ContainerState()
+    if last_terminated_reason is not None or last_terminated_exit_code is not None:
+        last_state.terminated = kubernetes.client.V1ContainerStateTerminated(
+            exit_code=last_terminated_exit_code or 0,
+            reason=last_terminated_reason)
+    return kubernetes.client.V1ContainerStatus(name='c',
+                                               image='img',
+                                               image_id='',
+                                               ready=False,
+                                               restart_count=0,
+                                               state=state,
+                                               last_state=last_state)
+
+
+def _make_pod(*,
+              phase=None,
+              conditions=None,
+              container_statuses=None,
+              reason=None,
+              message=None):
+    return kubernetes.client.V1Pod(status=kubernetes.client.V1PodStatus(
+        phase=phase,
+        conditions=conditions,
+        container_statuses=container_statuses,
+        reason=reason,
+        message=message))
+
+
+def test_get_condensed_pod_reason_oomkilled():
+    pod = _make_pod(phase='Failed',
+                    container_statuses=[
+                        _make_container_status(terminated_reason='OOMKilled',
+                                               terminated_exit_code=137)
+                    ])
+    assert utils.get_condensed_pod_reason(pod) == 'OOMKilled (exit code 137)'
+
+
+def test_get_condensed_pod_reason_uses_last_state():
+    # OOMKilled recorded only in last_state (e.g. mid-restart).
+    pod = _make_pod(phase='Running',
+                    container_statuses=[
+                        _make_container_status(
+                            last_terminated_reason='OOMKilled',
+                            last_terminated_exit_code=137)
+                    ])
+    assert utils.get_condensed_pod_reason(pod) == 'OOMKilled (exit code 137)'
+
+
+def test_get_condensed_pod_reason_no_reason_has_exit_code():
+    pod = _make_pod(
+        phase='Failed',
+        container_statuses=[_make_container_status(terminated_exit_code=1)])
+    assert utils.get_condensed_pod_reason(pod) == 'Terminated with exit code 1'
+
+
+def test_get_condensed_pod_reason_kueue_preemption_wins():
+    cond = kubernetes.client.V1PodCondition(type='TerminationTarget',
+                                            status='True',
+                                            reason='Preempted',
+                                            message='by higher priority')
+    pod = _make_pod(phase='Failed',
+                    conditions=[cond],
+                    container_statuses=[
+                        _make_container_status(terminated_reason='OOMKilled',
+                                               terminated_exit_code=137)
+                    ])
+    assert utils.get_condensed_pod_reason(pod) == (
+        'Preempted by Kueue: Preempted (by higher priority)')
+
+
+def test_get_condensed_pod_reason_fallback():
+    pod = _make_pod(phase='Failed', container_statuses=[])
+    assert utils.get_condensed_pod_reason(pod) == 'Terminated unexpectedly'
+
+
+def test_get_condensed_pod_reason_evicted_ephemeral():
+    # Ephemeral-storage eviction is recorded at the pod level, not in
+    # container statuses.
+    pod = _make_pod(
+        phase='Failed',
+        reason='Evicted',
+        message='Pod ephemeral local storage usage exceeds the total limit '
+        'of containers 1Gi.',
+        container_statuses=[])
+    reason = utils.get_condensed_pod_reason(pod)
+    assert reason.startswith('Evicted: ')
+    assert 'ephemeral' in reason
+
+
+def test_get_condensed_pod_reason_oomkilled_not_masked_by_pod_reason():
+    # Container OOMKilled (no pod-level reason set) still wins.
+    pod = _make_pod(phase='Failed',
+                    container_statuses=[
+                        _make_container_status(terminated_reason='OOMKilled',
+                                               terminated_exit_code=137)
+                    ])
+    assert utils.get_condensed_pod_reason(pod) == 'OOMKilled (exit code 137)'
+
+
+def test_get_condensed_pod_reason_status_none():
+    # A pod with no status (e.g. not yet scheduled) must not crash.
+    pod = kubernetes.client.V1Pod(status=None)
+    assert utils.get_condensed_pod_reason(pod) == 'Terminated unexpectedly'
+
+
+def test_pod_terminated_abnormally_failed_phase():
+    assert utils.pod_terminated_abnormally(_make_pod(phase='Failed')) is True
+
+
+def test_pod_terminated_abnormally_nonzero_container_exit():
+    pod = _make_pod(phase='Running',
+                    container_statuses=[
+                        _make_container_status(terminated_reason='OOMKilled',
+                                               terminated_exit_code=137)
+                    ])
+    assert utils.pod_terminated_abnormally(pod) is True
+
+
+def test_pod_terminated_abnormally_crashloopbackoff():
+    pod = _make_pod(
+        phase='Running',
+        container_statuses=[
+            _make_container_status(waiting_reason='CrashLoopBackOff')
+        ])
+    assert utils.pod_terminated_abnormally(pod) is True
+
+
+def test_pod_terminated_abnormally_clean_success():
+    pod = _make_pod(phase='Succeeded',
+                    container_statuses=[
+                        _make_container_status(terminated_reason='Completed',
+                                               terminated_exit_code=0)
+                    ])
+    assert utils.pod_terminated_abnormally(pod) is False
+
+
+def test_pod_terminated_abnormally_status_none():
+    # A pod with no status must not crash and is not considered abnormal.
+    pod = kubernetes.client.V1Pod(status=None)
+    assert utils.pod_terminated_abnormally(pod) is False
+
+
+def _patch_read_pod(monkeypatch, pod=None, side_effect=None):
+    core_api = mock.MagicMock()
+    if side_effect is not None:
+        core_api.read_namespaced_pod.side_effect = side_effect
+    else:
+        core_api.read_namespaced_pod.return_value = pod
+    monkeypatch.setattr(utils.kubernetes, 'core_api', lambda context: core_api)
+    return core_api
+
+
+def test_diagnose_terminated_pod_oom_includes_reason_and_hint(monkeypatch):
+    pod = _make_pod(phase='Failed',
+                    container_statuses=[
+                        _make_container_status(terminated_reason='OOMKilled',
+                                               terminated_exit_code=137)
+                    ])
+    _patch_read_pod(monkeypatch, pod=pod)
+    msg = utils.diagnose_terminated_pod('ctx', 'ns', 'mypod')
+    assert msg is not None
+    assert 'OOMKilled (exit code 137)' in msg
+    assert 'mypod' in msg
+    assert 'Hint:' in msg
+    assert 'ran out of memory' in msg
+
+
+def test_diagnose_terminated_pod_healthy_returns_none(monkeypatch):
+    pod = _make_pod(phase='Running',
+                    container_statuses=[_make_container_status()])
+    _patch_read_pod(monkeypatch, pod=pod)
+    assert utils.diagnose_terminated_pod('ctx', 'ns', 'mypod') is None
+
+
+def test_diagnose_terminated_pod_read_error_returns_none(monkeypatch):
+    _patch_read_pod(monkeypatch, side_effect=RuntimeError('api down'))
+    assert utils.diagnose_terminated_pod('ctx', 'ns', 'mypod') is None
+
+
+def test_diagnose_terminated_pod_non_oom_has_no_hint(monkeypatch):
+    pod = _make_pod(phase='Failed',
+                    container_statuses=[
+                        _make_container_status(terminated_reason='Error',
+                                               terminated_exit_code=1)
+                    ])
+    _patch_read_pod(monkeypatch, pod=pod)
+    msg = utils.diagnose_terminated_pod('ctx', 'ns', 'mypod')
+    assert msg is not None
+    assert 'Error (exit code 1)' in msg
+    assert 'Hint:' not in msg
+
+
+def test_diagnose_terminated_pod_evicted_ephemeral(monkeypatch):
+    pod = _make_pod(
+        phase='Failed',
+        reason='Evicted',
+        message='Pod ephemeral local storage usage exceeds the total limit '
+        'of containers 1Gi.',
+        container_statuses=[])
+    _patch_read_pod(monkeypatch, pod=pod)
+    msg = utils.diagnose_terminated_pod('ctx', 'ns', 'mypod')
+    assert msg is not None
+    assert 'Evicted' in msg
+    assert 'ephemeral' in msg
+    assert 'Hint:' in msg
+
+
+def test_match_kubernetes_failure_hint_oom():
+    assert 'ran out of memory' in utils.match_kubernetes_failure_hint(
+        'OOMKilled (exit code 137)')
+
+
+def test_match_kubernetes_failure_hint_multi_substring():
+    # ErrImagePull is one of two substrings mapped to the image hint.
+    assert 'image tag' in utils.match_kubernetes_failure_hint('ErrImagePull')
+
+
+def test_match_kubernetes_failure_hint_no_match_returns_none():
+    assert utils.match_kubernetes_failure_hint('SomeUnknownReason') is None
+
+
+def test_match_kubernetes_failure_hint_ephemeral_precedes_evicted():
+    # An ephemeral-storage eviction reason contains both substrings; the more
+    # specific 'ephemeral' hint must win.
+    hint = utils.match_kubernetes_failure_hint(
+        'Evicted: Pod ephemeral local storage usage exceeds the total limit')
+    assert hint is not None
+    assert 'ephemeral' in hint
+
+
+def test_match_kubernetes_failure_hint_generic_eviction():
+    # A non-ephemeral eviction falls to the general eviction hint.
+    hint = utils.match_kubernetes_failure_hint(
+        'Evicted: The node was low on resource: memory')
+    assert hint is not None
+    assert hint.startswith(
+        'The pod was evicted by the node under resource pressure.')
+
+
+def test_match_kubernetes_failure_hint_ignores_a_token_inside_a_longer_word():
+    """A queue controller's eviction must not trip the node-pressure hint.
+
+    A queue admission controller that evicts an admitted workload names the
+    eviction `WorkloadEvictedDueToPodsReadyTimeout`, which contains 'Evicted'
+    as part of a camelCase identifier. Matched as a substring, the provision
+    failure told the user to increase `resources.memory` / `resources.disk_size`
+    -- advice that cannot fix a workload a queue evicted.
+    """
+    pod_names = ['sky-cluster-head']
+    cluster = 'sky-cluster'
+    reason = (f'Pod(s) {pod_names} of cluster {cluster!r} were deleted while '
+              'SkyPilot was waiting for them to be scheduled: '
+              'sky-cluster-head: Preempted by Kueue: '
+              'WorkloadEvictedDueToPodsReadyTimeout (Exceeded the PodsReady '
+              'timeout default/sky-cluster).')
+    assert utils.match_kubernetes_failure_hint(reason) is None
+
+
+def test_reason_matches_failure_token_word_boundaries():
+    # Named as a word of its own, whatever punctuation surrounds it.
+    assert utils.reason_matches_failure_token('Evicted: low on memory',
+                                              'Evicted')
+    assert utils.reason_matches_failure_token('pod-0 (Evicted)', 'Evicted')
+    assert utils.reason_matches_failure_token('Evicted', 'Evicted')
+    # Buried in a longer word: not this failure.
+    assert not utils.reason_matches_failure_token(
+        'WorkloadEvictedDueToPodsReadyTimeout', 'Evicted')
+    assert not utils.reason_matches_failure_token('PodEvicted', 'Evicted')
+    assert not utils.reason_matches_failure_token('Evicted2', 'Evicted')
+    # Only alphanumeric edges are anchored, so a multi-word marker wrapped in
+    # punctuation still matches.
+    assert utils.reason_matches_failure_token(
+        f'OOMKilled (exit code 137, {utils.NO_MEMORY_LIMIT_MARKER})',
+        utils.NO_MEMORY_LIMIT_MARKER)
+
+
+# ---------------------------------------------------------------------------
+#  Deriving a reason from a pod's own events (reason_from_pod_events,
+#  last_pod_event_context), which outlive the pod they describe.
+# ---------------------------------------------------------------------------
+
+_POD_CREATED_AT = datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def _make_pod_event(reason, message, type_='Normal', at=0):
+    """A pod event, shaped like what the API server returns.
+
+    *at* is seconds relative to _POD_CREATED_AT; a negative value is an event
+    left behind by whatever held the same pod name before this pod.
+    """
+    event = mock.MagicMock()
+    event.reason = reason
+    event.message = message
+    event.type = type_
+    # event_last_observed prefers these over the creation timestamp; leaving
+    # them as auto-created MagicMocks would make the event read as undated.
+    event.series = None
+    event.last_timestamp = None
+    event.event_time = None
+    event.metadata.creation_timestamp = (_POD_CREATED_AT +
+                                         datetime.timedelta(seconds=at))
+    return event
+
+
+def test_a_deletion_cause_outranks_a_newer_generic_event():
+    """The informative event is usually not the last one: the kubelet's
+    Killing follows whatever actually caused the deletion."""
+    events = [
+        _make_pod_event('Killing', 'Stopping container ray-node', at=12),
+        _make_pod_event('Stopped',
+                        'Exceeded the PodsReady timeout default/wl',
+                        at=10),
+    ]
+    assert utils.reason_from_pod_events(events) == (
+        'Stopped by Kueue: Exceeded the PodsReady timeout default/wl')
+
+
+def test_events_that_do_not_name_a_deletion_cause_do_not_count():
+    """Callers report whatever comes back as an identified cause, so the
+    scheduler's complaint and the kubelet's kill notice must not."""
+    assert utils.reason_from_pod_events([
+        _make_pod_event('FailedScheduling',
+                        '0/1 nodes are available: 1 Insufficient cpu.',
+                        type_='Warning',
+                        at=5),
+        _make_pod_event('Scheduled', 'Successfully assigned ns/p to n'),
+    ]) is None
+    assert utils.reason_from_pod_events(
+        [_make_pod_event('Killing', 'Stopping container ray-node')]) is None
+    assert utils.reason_from_pod_events([]) is None
+
+
+def test_a_reason_reads_like_a_pod_status_reason():
+    """The shape is '<Reason>: <message>', the same as what
+    get_condensed_pod_reason produces, so the two are interchangeable in a
+    failure message. The kubelet is not the only thing that emits Evicted --
+    node autoscalers emit it for every pod they drain -- so the message is
+    left to name the actor."""
+    assert utils.reason_from_pod_events([
+        _make_pod_event('Evicted',
+                        'The node was low on resource: ephemeral-storage',
+                        type_='Warning')
+    ]) == 'Evicted: The node was low on resource: ephemeral-storage'
+    # 'Stopped' alone reads like the user stopped something, so that one
+    # reason is reported with its actor.
+    assert utils.reason_from_pod_events([_make_pod_event('Stopped', '')
+                                        ]) == 'Stopped by Kueue'
+
+
+def test_events_from_before_the_pod_are_not_evidence():
+    """An event older than the pod describes whatever held its name before
+    it."""
+    old = [
+        _make_pod_event('Stopped',
+                        'Exceeded the PodsReady timeout default/old',
+                        at=-1800)
+    ]
+    assert utils.reason_from_pod_events(old, _POD_CREATED_AT) is None
+    # Without a creation time to compare against, nothing is filtered.
+    assert utils.reason_from_pod_events(old) is not None
+    # Clock skew between this process and the API server that stamps the
+    # events must not throw away the pod's own events.
+    recent = [
+        _make_pod_event('Stopped',
+                        'Exceeded the PodsReady timeout default/wl',
+                        at=-5)
+    ]
+    assert utils.reason_from_pod_events(recent, _POD_CREATED_AT) is not None
+
+
+def test_an_undated_event_is_not_assumed_to_be_stale():
+    event = _make_pod_event('Stopped', 'Exceeded the PodsReady timeout')
+    event.metadata.creation_timestamp = None
+    assert utils.reason_from_pod_events([event], _POD_CREATED_AT) is not None
+
+
+def test_the_last_event_is_offered_as_context():
+    """Not as a cause -- see the tests above -- but it is still the last thing
+    anything said about the pod."""
+    assert utils.last_pod_event_context([
+        _make_pod_event('Scheduled', 'Successfully assigned ns/p to n', at=6),
+        _make_pod_event('FailedScheduling',
+                        '0/1 nodes are available',
+                        type_='Warning',
+                        at=5),
+    ]) == 'FailedScheduling: 0/1 nodes are available'
+    assert utils.last_pod_event_context(
+        [_make_pod_event('Killing', 'Stopping container ray-node',
+                         at=5)]) == 'Killing: Stopping container ray-node'
+    assert utils.last_pod_event_context([
+        _make_pod_event('Scheduled', 'Successfully assigned ns/p to n')
+    ]) is None
+
+
+def _patch_pod_events(monkeypatch, core_api, events):
+    core_api.list_namespaced_event.return_value = mock.MagicMock(items=events)
+    monkeypatch.setattr(utils.kubernetes, 'core_api', lambda context: core_api)
+
+
+def test_diagnose_terminated_pod_deleted_pod_reports_its_events(monkeypatch):
+    """The runtime-setup path shares the gap this change is about: a pod that
+    something else deleted reads back as a 404, and the diagnosis used to
+    return nothing at all. Its events outlive it and say who did it."""
+    core_api = _patch_read_pod(monkeypatch,
+                               side_effect=kubernetes.client.rest.ApiException(
+                                   status=404, reason='Not Found'))
+    _patch_pod_events(monkeypatch, core_api, [
+        _make_pod_event('Stopped', 'Exceeded the PodsReady timeout default/wl')
+    ])
+    msg = utils.diagnose_terminated_pod('ctx', 'ns', 'mypod')
+    assert msg == ('Pod mypod was deleted: Stopped by Kueue: Exceeded the '
+                   'PodsReady timeout default/wl.')
+
+
+def test_diagnose_terminated_pod_deleted_pod_keeps_its_hint(monkeypatch):
+    core_api = _patch_read_pod(monkeypatch,
+                               side_effect=kubernetes.client.rest.ApiException(
+                                   status=404, reason='Not Found'))
+    _patch_pod_events(monkeypatch, core_api, [
+        _make_pod_event('Evicted',
+                        'The node was low on resource: ephemeral-storage.',
+                        type_='Warning')
+    ])
+    msg = utils.diagnose_terminated_pod('ctx', 'ns', 'mypod')
+    assert msg is not None
+    assert 'was deleted: Evicted' in msg
+    assert 'Hint:' in msg
+    assert 'resources.disk_size' in msg
+
+
+def test_diagnose_terminated_pod_deleted_pod_with_nothing_to_say(monkeypatch):
+    """Every `sky down` leaves a pod that reads back as a 404; only one whose
+    events name a cause is worth reporting."""
+    core_api = _patch_read_pod(monkeypatch,
+                               side_effect=kubernetes.client.rest.ApiException(
+                                   status=404, reason='Not Found'))
+    _patch_pod_events(monkeypatch, core_api,
+                      [_make_pod_event('Killing', 'Stopping container ray')])
+    assert utils.diagnose_terminated_pod('ctx', 'ns', 'mypod') is None
+
+
+def test_diagnose_terminated_pod_other_api_error_returns_none(monkeypatch):
+    _patch_read_pod(monkeypatch,
+                    side_effect=kubernetes.client.rest.ApiException(
+                        status=500, reason='Internal Server Error'))
+    assert utils.diagnose_terminated_pod('ctx', 'ns', 'mypod') is None
+
+
+def test_get_failure_hint_reasons_flattens_table():
+    reasons = utils.get_failure_hint_reasons()
+    # Every reason with a hint must report as a specific cause; otherwise each
+    # reason has a match_kubernetes_failure_hint hit.
+    for reason in reasons:
+        assert utils.match_kubernetes_failure_hint(reason) is not None
+    assert 'OOMKilled' in reasons and 'Evicted' in reasons
+
+
+def test_diagnose_terminated_pod_substitutes_dashboard_url_token(monkeypatch):
+    # A matched hint containing {dashboard_url} is rendered with a generic
+    # phrase, since this module can't resolve the real URL.
+    pod = _make_pod(phase='Failed',
+                    container_statuses=[
+                        _make_container_status(
+                            terminated_reason='Insufficient memory',
+                            terminated_exit_code=1)
+                    ])
+    _patch_read_pod(monkeypatch, pod=pod)
+    msg = utils.diagnose_terminated_pod('ctx', 'ns', 'mypod')
+    assert msg is not None
+    assert '{dashboard_url}' not in msg
+    assert 'the SkyPilot dashboard infra page' in msg
+
+
+def test_get_spot_label_karpenter():
+    """use_spot on a Karpenter context maps to karpenter.sh/capacity-type."""
+    kat = utils.kubernetes_enums.KubernetesAutoscalerType
+    with mock.patch.object(utils, 'get_kubernetes_nodes', return_value=[]), \
+         mock.patch.object(utils, 'get_autoscaler_type',
+                           return_value=kat.KARPENTER):
+        assert utils.get_spot_label('ctx') == ('karpenter.sh/capacity-type',
+                                               'spot')
+
+
+def test_get_spot_label_gke_unchanged():
+    """GKE spot label is unchanged by the Karpenter addition."""
+    kat = utils.kubernetes_enums.KubernetesAutoscalerType
+    with mock.patch.object(utils, 'get_kubernetes_nodes', return_value=[]), \
+         mock.patch.object(utils, 'get_autoscaler_type',
+                           return_value=kat.GKE):
+        assert utils.get_spot_label('ctx') == ('cloud.google.com/gke-spot',
+                                               'true')
+
+
+def test_get_spot_label_none_without_known_autoscaler():
+    """No autoscaler (or one without a known spot label) -> no spot label."""
+    with mock.patch.object(utils, 'get_kubernetes_nodes', return_value=[]), \
+         mock.patch.object(utils, 'get_autoscaler_type', return_value=None):
+        assert utils.get_spot_label('ctx') == (None, None)
+
+
+def test_match_kubernetes_failure_hint_text_realistic_eviction_reason():
+    """The display helper maps a real kubelet eviction reason to the hint.
+
+    Uses the full reason string as it appears in the abnormal->INIT cluster
+    event (see backend_utils._update_cluster_status), exercising the display
+    (`_text`) variant end to end. The reason contains both 'ephemeral' and
+    'Evicted'; the 'ephemeral' entry must win, so the resolved hint points at
+    `resources.disk_size`.
+    """
+    reason = ('Evicted: The node was low on resource: ephemeral-storage. '
+              'Threshold quantity: 380764701840, available: 13249836Ki. '
+              'Container ray-node was using 4943246992Ki, request is 0, has '
+              'larger consumption of ephemeral-storage.')
+    hint = utils.match_kubernetes_failure_hint_text(reason)
+    assert hint is not None
+    assert 'resources.disk_size' in hint
+
+
+def test_get_node_accelerator_count_neuron():
+    """AWS Neuron count is read from the aws.amazon.com/neuron resource key."""
+    with unittest.mock.patch(
+            'sky.provision.kubernetes.utils.get_gpu_resource_key',
+            return_value='nvidia.com/gpu'):
+        # Neuron node: count from the Neuron resource key.
+        assert utils.get_node_accelerator_count(
+            None, {'aws.amazon.com/neuron': '16'}) == 16
+        # GPU / TPU paths unchanged.
+        assert utils.get_node_accelerator_count(None,
+                                                {'nvidia.com/gpu': '8'}) == 8
+        assert utils.get_node_accelerator_count(None,
+                                                {'google.com/tpu': '4'}) == 4
+        # No accelerator -> 0.
+        assert utils.get_node_accelerator_count(None, {'cpu': '4'}) == 0
+
+
+def test_get_node_accelerator_count_multiple_families_no_crash():
+    """A node advertising multiple accelerator families must not crash the
+    caller (e.g. sky status/show-gpus); it warns and returns the first family
+    found (GPU > TPU > Neuron)."""
+    with unittest.mock.patch(
+            'sky.provision.kubernetes.utils.get_gpu_resource_key',
+            return_value='nvidia.com/gpu'):
+        # GPU + Neuron on the same node -> GPU wins, no exception.
+        assert utils.get_node_accelerator_count(None, {
+            'nvidia.com/gpu': '8',
+            'aws.amazon.com/neuron': '16',
+        }) == 8
+
+
+def test_get_handled_taint_keys_includes_neuron():
+    assert utils.NEURON_RESOURCE_KEY in utils.get_handled_taint_keys()
+
+
+class TestOCINetworkEnvVars:
+    """OCI network_tier: best NCCL env-var injection per GPU shape."""
+
+    _NET = utils.KubernetesHighPerformanceNetworkType.OCI_ROCE
+
+    def test_gb200_profile(self):
+        """GB200 gets the MNNVL/NVLS InfiniBand profile, not RoCEv2."""
+        env = self._NET.get_network_env_vars('GB200')
+        # The rack-scale NVLink knobs that make GB200 distinct.
+        assert env['NCCL_MNNVL_ENABLE'] == '1'
+        assert env['NCCL_NVLS_ENABLE'] == '1'
+        assert env['NCCL_NET_PLUGIN'] == 'sys'
+        assert env['NCCL_CUMEM_ENABLE'] == '1'
+        assert env['NCCL_IB_HCA'] == 'mlx5_0,mlx5_1,mlx5_3,mlx5_4'
+        assert env['NCCL_SOCKET_IFNAME'] == 'eth0'
+
+    def test_pod_local_rdma_widens_both_grace_profiles(self):
+        """A VF pod cannot see the PF names these two profiles enumerate.
+
+        The deploy-var tests cover GB300 only, so this is where the GB200
+        branch's widening is pinned. NCCL answers a list matching no device by
+        falling back to TCP, so getting this wrong costs bandwidth silently.
+        """
+        for acc in ('GB200', 'GB300'):
+            env = self._NET.get_network_env_vars(acc, pod_local_rdma=True)
+            assert env['NCCL_IB_HCA'] == 'mlx5', acc
+            # Everything else about the profile is unrelated to delivery.
+            assert env['NCCL_MNNVL_ENABLE'] == '1', acc
+
+    def test_pod_local_rdma_leaves_the_roce_profile_alone(self):
+        # The RoCEv2 shapes already match the family prefix, so the VF model
+        # changes nothing for them.
+        for acc in ('H100', 'H200', 'B200'):
+            assert self._NET.get_network_env_vars(
+                acc,
+                pod_local_rdma=True) == self._NET.get_network_env_vars(acc), acc
+
+    def test_gb200_is_replacement_not_union(self):
+        """GB200 must drop the RoCEv2-only knobs, not merge them in.
+
+        The official OCI GB200 configmap omits DSCP/GID/UCX; folding the
+        RoCE defaults in would inject values OCI does not ship for GB200.
+        """
+        env = self._NET.get_network_env_vars('GB200')
+        for absent in ('NCCL_IB_GID_INDEX', 'NCCL_IB_TC', 'UCX_TLS',
+                       'UCX_NET_DEVICES'):
+            assert absent not in env, absent
+
+    def test_gb200_case_insensitive(self):
+        env = self._NET.get_network_env_vars('gb200')
+        assert env['NCCL_MNNVL_ENABLE'] == '1'
+
+    def test_gb300_profile(self):
+        """GB300 is MNNVL/NVLS but keeps IB tuning and NET_PLUGIN=none."""
+        env = self._NET.get_network_env_vars('GB300')
+        assert env['NCCL_MNNVL_ENABLE'] == '1'
+        assert env['NCCL_NVLS_ENABLE'] == '1'
+        assert env['NCCL_NET_PLUGIN'] == 'none'
+        # Leading '=' is NCCL's exact-name-match prefix; must be preserved.
+        assert env['NCCL_IB_HCA'] == ('=mlx5_0,mlx5_1,mlx5_2,mlx5_3,'
+                                      'mlx5_5,mlx5_6,mlx5_7,mlx5_8')
+        # GB300-specific knobs absent from GB200.
+        assert env['NCCL_NET_GDR_C2C'] == '1'
+        assert env['NCCL_DMABUF_ENABLE'] == '1'
+        assert env['NCCL_IB_TIMEOUT'] == '22'
+
+    def test_gb300_widens_gdr_level(self):
+        """GB300 sets NCCL_NET_GDR_LEVEL=PHB, and only GB300.
+
+        With NET_GDR_C2C on, NCCL's GDR cutoff is PATH_P2C; a GPU whose NIC is
+        one PCIe host bridge away lands outside it and loses GDR silently. PHB
+        widens the cutoff by that one level. Scoped to GB300: the GB200 and
+        RoCEv2 profiles mirror OCI's published sets, which omit it.
+        """
+        assert self._NET.get_network_env_vars(
+            'GB300')['NCCL_NET_GDR_LEVEL'] == 'PHB'
+        assert 'NCCL_NET_GDR_LEVEL' not in self._NET.get_network_env_vars(
+            'GB200')
+        assert 'NCCL_NET_GDR_LEVEL' not in self._NET.get_network_env_vars(
+            'H100')
+
+    def test_gb300_still_mirrors_oci_published_values(self):
+        """The rest of the GB300 profile must stay OCI's published set.
+
+        Guards against widening the GDR level turning into a general licence
+        to deviate: these are the values OCI ships for BM.GPU.GB300.4, and the
+        two a customer was observed overriding (IB_SL=1, IB_TIMEOUT=19) are
+        deliberately *not* adopted -- 19 is a tightening, and defaults should
+        fail lenient.
+        """
+        env = self._NET.get_network_env_vars('GB300')
+        assert env['NCCL_IB_SL'] == '0'
+        assert env['NCCL_IB_TIMEOUT'] == '22'
+        assert env['NCCL_BUFFSIZE'] == '16777216'
+        assert env['NCCL_IB_SPLIT_DATA_ON_QPS'] == '0'
+        # Workload/framework knobs must never be injected:
+        # CUDA_DEVICE_MAX_CONNECTIONS=32 suits FSDP/expert-parallel overlap and
+        # is actively wrong for Megatron tensor-parallel overlap, which needs 1.
+        for absent in ('CUDA_DEVICE_MAX_CONNECTIONS',
+                       'TORCH_NCCL_HIGH_PRIORITY',
+                       'TORCH_NCCL_AVOID_RECORD_STREAMS', 'NCCL_SHM_DISABLE'):
+            assert absent not in env, absent
+
+    def test_gb200_and_gb300_are_distinct(self):
+        """The two GB profiles must not be identical (NET_PLUGIN differs)."""
+        gb200 = self._NET.get_network_env_vars('GB200')
+        gb300 = self._NET.get_network_env_vars('GB300')
+        assert gb200 != gb300
+        assert gb200['NCCL_NET_PLUGIN'] == 'sys'
+        assert gb300['NCCL_NET_PLUGIN'] == 'none'
+
+    def test_default_roce_profile_for_other_shapes(self):
+        """H100/None fall back to the existing RoCEv2 profile unchanged."""
+        expected = {
+            'NCCL_IB_HCA': 'mlx5',
+            'NCCL_IB_GID_INDEX': '3',
+            'NCCL_IB_TC': '41',
+            'NCCL_SOCKET_IFNAME': 'eth0',
+            'UCX_TLS': 'tcp',
+            'UCX_NET_DEVICES': 'eth0',
+        }
+        assert self._NET.get_network_env_vars('H100') == expected
+        assert self._NET.get_network_env_vars(None) == expected
+        # GB200/GB300 must NOT return the default RoCE profile.
+        assert self._NET.get_network_env_vars('GB200') != expected
+        assert self._NET.get_network_env_vars('GB300') != expected
+
+    def test_non_oci_types_ignore_acc_type(self):
+        """acc_type only affects OCI; other types return their fixed dict."""
+        coreweave = utils.KubernetesHighPerformanceNetworkType.COREWEAVE
+        assert (coreweave.get_network_env_vars('GB200') ==
+                coreweave.get_network_env_vars(None))
+
+
+class TestGetNodeAffinity:
+    """Tests for utils.get_node_affinity."""
+
+    def test_none_when_no_terms(self):
+        """No accelerator key and no avoid keys -> no affinity."""
+        assert utils.get_node_affinity(None, None, None) is None
+
+    def test_none_when_key_without_values(self):
+        """A key with None values does not produce a required term."""
+        assert utils.get_node_affinity('skypilot.co/accelerator', None,
+                                       None) is None
+
+    def test_required_term_single_value(self):
+        affinity = utils.get_node_affinity('skypilot.co/accelerator', ['H100'],
+                                           None)
+        assert affinity == {
+            'requiredDuringSchedulingIgnoredDuringExecution': {
+                'nodeSelectorTerms': [{
+                    'matchExpressions': [{
+                        'key': 'skypilot.co/accelerator',
+                        'operator': 'In',
+                        'values': ['H100'],
+                    }],
+                }],
+            },
+        }
+
+    def test_required_term_multiple_values(self):
+        affinity = utils.get_node_affinity('skypilot.co/accelerator',
+                                           ['A100', 'A100-80GB'], None)
+        assert affinity == {
+            'requiredDuringSchedulingIgnoredDuringExecution': {
+                'nodeSelectorTerms': [{
+                    'matchExpressions': [{
+                        'key': 'skypilot.co/accelerator',
+                        'operator': 'In',
+                        'values': ['A100', 'A100-80GB'],
+                    }],
+                }],
+            },
+        }
+
+    def test_preferred_term_only(self):
+        """CPU-only: avoid keys steer away from accelerator nodes."""
+        affinity = utils.get_node_affinity(
+            None, None, ['nvidia.com/gpu.present', 'gke-tpu-accelerator'])
+        assert affinity == {
+            'preferredDuringSchedulingIgnoredDuringExecution': [{
+                'weight': 1,
+                'preference': {
+                    'matchExpressions': [
+                        {
+                            'key': 'nvidia.com/gpu.present',
+                            'operator': 'DoesNotExist',
+                        },
+                        {
+                            'key': 'gke-tpu-accelerator',
+                            'operator': 'DoesNotExist',
+                        },
+                    ],
+                },
+            }],
+        }
+
+    def test_both_terms(self):
+        affinity = utils.get_node_affinity('skypilot.co/accelerator', ['H100'],
+                                           ['some-other-key'])
+        assert affinity is not None
+        assert set(affinity.keys()) == {
+            'requiredDuringSchedulingIgnoredDuringExecution',
+            'preferredDuringSchedulingIgnoredDuringExecution',
+        }
+
+
+def _make_pod_with_spec(*,
+                        container_name='c',
+                        memory_limit=None,
+                        container_statuses=None,
+                        phase='Failed'):
+    """A pod whose spec declares `container_name`, optionally with a limit."""
+    limits = {'memory': memory_limit} if memory_limit is not None else None
+    container = kubernetes.client.V1Container(
+        name=container_name,
+        resources=kubernetes.client.V1ResourceRequirements(
+            requests={'memory': '2Gi'}, limits=limits))
+    return kubernetes.client.V1Pod(
+        spec=kubernetes.client.V1PodSpec(containers=[container]),
+        status=kubernetes.client.V1PodStatus(
+            phase=phase, container_statuses=container_statuses))
+
+
+def test_is_unbounded_oom_only_when_limit_absent():
+    unbounded = _make_pod_with_spec()
+    bounded = _make_pod_with_spec(memory_limit='4Gi')
+    assert utils.is_unbounded_oom('OOMKilled', unbounded, 'c')
+    # A container that OOMed against its own limit is not a node-level OOM.
+    assert not utils.is_unbounded_oom('OOMKilled', bounded, 'c')
+    # Only OOM kills are classified.
+    assert not utils.is_unbounded_oom('Error', unbounded, 'c')
+
+
+def test_is_unbounded_oom_false_when_container_not_in_spec():
+    # We cannot confirm the container was unbounded, so we must not claim it
+    # was: a confidently wrong node-level hint is worse than the generic one.
+    pod = _make_pod_with_spec(container_name='other')
+    assert not utils.is_unbounded_oom('OOMKilled', pod, 'c')
+    assert utils.annotate_oom_reason('OOMKilled', pod, 'c') == 'OOMKilled'
+
+
+def test_annotate_oom_reason_tags_only_unbounded():
+    assert utils.annotate_oom_reason(
+        'OOMKilled', _make_pod_with_spec(),
+        'c') == f'OOMKilled ({utils.NO_MEMORY_LIMIT_MARKER})'
+    assert utils.annotate_oom_reason('OOMKilled',
+                                     _make_pod_with_spec(memory_limit='4Gi'),
+                                     'c') == 'OOMKilled'
+    assert utils.annotate_oom_reason('Evicted', _make_pod_with_spec(),
+                                     'c') == 'Evicted'
+
+
+def test_get_condensed_pod_reason_marks_unbounded_oom():
+    pod = _make_pod_with_spec(container_statuses=[
+        _make_container_status(terminated_reason='OOMKilled',
+                               terminated_exit_code=137)
+    ])
+    assert utils.get_condensed_pod_reason(pod) == (
+        f'OOMKilled (exit code 137, {utils.NO_MEMORY_LIMIT_MARKER})')
+
+
+def test_get_condensed_pod_reason_bounded_oom_unchanged():
+    # With a limit set the message must stay exactly as it was.
+    pod = _make_pod_with_spec(memory_limit='4Gi',
+                              container_statuses=[
+                                  _make_container_status(
+                                      terminated_reason='OOMKilled',
+                                      terminated_exit_code=137)
+                              ])
+    assert utils.get_condensed_pod_reason(pod) == 'OOMKilled (exit code 137)'
+
+
+def test_unbounded_oom_hint_recommends_set_pod_resource_limits():
+    hint = utils.match_kubernetes_failure_hint(
+        f'OOMKilled (exit code 137, {utils.NO_MEMORY_LIMIT_MARKER})')
+    assert hint is not None
+    assert 'set_pod_resource_limits' in hint
+    # The hint must link the docs section, not just name the config.
+    assert utils.SET_POD_RESOURCE_LIMITS_DOC_URL in hint
+    assert '#kubernetes-set-pod-resource-limits' in (
+        utils.SET_POD_RESOURCE_LIMITS_DOC_URL)
+
+
+def test_unbounded_oom_hint_precedes_plain_oomkilled():
+    # The unbounded reason contains 'OOMKilled' too, so ordering decides which
+    # hint wins; the node-level one is the specific (and correct) advice.
+    unbounded = utils.match_kubernetes_failure_hint(
+        f'OOMKilled (exit code 137, {utils.NO_MEMORY_LIMIT_MARKER})')
+    bounded = utils.match_kubernetes_failure_hint('OOMKilled (exit code 137)')
+    assert unbounded != bounded
+    assert 'no memory limit' in unbounded
+    assert bounded.startswith('The container ran out of memory.')
+
+
+# ---------------------------------------------------------------------------
+# Control vs. execution context
+# ---------------------------------------------------------------------------
+# The two are the same string for every cluster today. What these tests pin is
+# the shape that keeps it that way -- the fallback, and the in-cluster
+# handling -- so that the day a provisioner records a real placement, the
+# blast radius is one accessor and everything here still holds.
+
+_EXECUTION_KEY = k8s_constants.PROVIDER_EXECUTION_CONTEXT_KEY
+
+
+def test_control_and_execution_context_agree_by_default():
+    provider_config = {'context': 'ctx-a'}
+    assert utils.get_control_context_from_config(provider_config) == 'ctx-a'
+    assert utils.get_execution_context_from_config(provider_config) == 'ctx-a'
+
+
+def test_execution_context_falls_back_to_control_context():
+    """Every cluster provisioned before the key existed must still resolve."""
+    provider_config = {'context': 'ctx-a'}
+    assert _EXECUTION_KEY not in provider_config
+    assert utils.get_execution_context_from_config(provider_config) == 'ctx-a'
+
+
+def test_recorded_execution_context_wins():
+    """The one behaviour that matters once placements can differ: the
+    execution reader follows the recorded placement, and the control reader
+    keeps addressing the cluster the objects were submitted to."""
+    provider_config = {'context': 'ctx-manager', _EXECUTION_KEY: 'ctx-worker'}
+    assert utils.get_execution_context_from_config(
+        provider_config) == 'ctx-worker'
+    assert utils.get_control_context_from_config(
+        provider_config) == 'ctx-manager'
+
+
+def test_in_cluster_execution_context_resolves_to_none():
+    """A recorded in-cluster context has to be mapped to None just as
+    `provider.context` is -- it is not a kubeconfig entry, and passing it to
+    the client would defeat in-cluster auth."""
+    provider_config = {
+        'context': 'ctx-a',
+        _EXECUTION_KEY: kubernetes_adaptor.in_cluster_context_name(),
+    }
+    assert utils.get_execution_context_from_config(provider_config) is None
+
+
+def test_in_cluster_control_context_resolves_to_none():
+    provider_config = {'context': kubernetes_adaptor.in_cluster_context_name()}
+    assert utils.get_control_context_from_config(provider_config) is None
+    # ... and the fallback inherits that, rather than the raw name.
+    assert utils.get_execution_context_from_config(provider_config) is None
+
+
+def test_set_execution_context_records_alongside_the_control_context():
+    provider_config = {'context': 'ctx-a'}
+    utils.set_execution_context_in_config(provider_config, 'ctx-worker')
+    assert provider_config[_EXECUTION_KEY] == 'ctx-worker'
+    # `provider.context` is untouched: teardown, status and resource cleanup
+    # all read it and must keep pointing at the submitting cluster.
+    assert provider_config['context'] == 'ctx-a'
+
+
+def test_set_execution_context_ignores_none():
+    """Nothing to record for a cluster with no context: leaving the key out
+    keeps the fallback in charge rather than pinning a null placement."""
+    provider_config = {'context': 'ctx-a'}
+    utils.set_execution_context_in_config(provider_config, None)
+    assert _EXECUTION_KEY not in provider_config
+    assert utils.get_execution_context_from_config(provider_config) == 'ctx-a'

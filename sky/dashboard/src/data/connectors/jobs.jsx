@@ -1,0 +1,1206 @@
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { showToast } from '@/data/connectors/toast';
+import {
+  API_VERSION_HEADER,
+  CLIENT_API_VERSION,
+  CLIENT_VERSION,
+  CLUSTER_NOT_UP_ERROR,
+  CLUSTER_DOES_NOT_EXIST,
+  NOT_SUPPORTED_ERROR,
+  ENDPOINT,
+  VERSION_HEADER,
+} from '@/data/connectors/constants';
+import dashboardCache from '@/lib/cache';
+import jobsCacheManager from '@/lib/jobs-cache-manager';
+import { apiClient } from './client';
+import { trackJobAction } from '@/lib/analytics';
+import { applyEnhancements } from '@/plugins/dataEnhancement';
+
+/**
+ * Tooltip for a job's status badge: pending reason for PENDING jobs, the
+ * failure details (which carry the failure attribution and exit code,
+ * e.g. "Job exited with exit code 7 (user program failure). ...") for
+ * FAILED* jobs, and who requested the cancellation (e.g. "Cancellation
+ * requested by user alice (request ID: ...)") for CANCELLING/CANCELLED
+ * jobs. Same text as the details column, surfaced on hover.
+ */
+function getStatusTooltip(job) {
+  if (job.status === 'PENDING' || job.status?.startsWith('FAILED')) {
+    return job.details || job.failure_reason || null;
+  }
+  if (job.status === 'CANCELLING' || job.status === 'CANCELLED') {
+    return job.details || null;
+  }
+  return null;
+}
+
+// ============ Pagination Plugin Integration ============
+
+/**
+ * Check if the jobs pagination plugin is available.
+ * The plugin sets window.__skyJobsPaginationFetch when loaded.
+ * With requires_early_init=True, the plugin is guaranteed to be
+ * loaded before any API calls complete.
+ */
+function isJobsPaginationPluginAvailable() {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.__skyJobsPaginationFetch === 'function'
+  );
+}
+
+/**
+ * Get the jobs pagination plugin fetch function
+ */
+function getJobsPaginationFetch() {
+  return typeof window !== 'undefined' ? window.__skyJobsPaginationFetch : null;
+}
+
+// Configuration
+const DEFAULT_TAIL_LINES = 5000;
+const DEFAULT_FIELDS = [
+  'job_id',
+  '_job_id',
+  'job_name',
+  'user_name',
+  'user_hash',
+  'workspace',
+  'submitted_at',
+  'job_duration',
+  'status',
+  'resources',
+  'cloud',
+  'region',
+  'accelerators',
+  'cluster_resources',
+  'cluster_resources_full',
+  'recovery_count',
+  'pool',
+  'pool_hash',
+  'details',
+  'failure_reason',
+  'user_yaml',
+  'entrypoint',
+  'is_job_group',
+  'execution',
+  'is_primary_in_job_group',
+  'links',
+  'is_batch',
+  'batch_total_batches',
+  'batch_completed_batches',
+  'node_names',
+  'priority_class',
+  // Where a job launched from inside another managed job sits in its tree.
+  'root_job_id',
+  'parent_job_id',
+  'parent_task_id',
+  'dynamic_task_index',
+  'depends_on',
+];
+
+/**
+ * Compute the job group status based on primary tasks.
+ * For job groups with primary/auxiliary tasks, the job status is determined
+ * only by the primary tasks. If all primary tasks succeed, the job is
+ * considered successful even if auxiliary tasks were cancelled.
+ *
+ * Uses is_primary_in_job_group per task:
+ * - null: Non-job-group task (counts for status)
+ * - true: Primary task in job group (counts for status)
+ * - false: Auxiliary task in job group (does not count for status)
+ *
+ * @param {Array} tasks - Array of task objects with status and is_primary_in_job_group fields
+ * @returns {string} - The computed job group status
+ */
+export function computeJobGroupStatus(tasks) {
+  if (!tasks || tasks.length === 0) {
+    return null;
+  }
+
+  // Filter to only primary tasks for status determination.
+  // is_primary_in_job_group: true/false for job groups, null for non-groups.
+  // For non-job-groups (null), all tasks count for status.
+  // For job groups, only tasks with is_primary_in_job_group=true count.
+  const primaryTasks = tasks.filter(
+    (t) =>
+      t.is_primary_in_job_group === null ||
+      t.is_primary_in_job_group === undefined ||
+      t.is_primary_in_job_group === true
+  );
+
+  // Use primary tasks for status; fall back to all tasks if none match
+  const tasksForStatus = primaryTasks.length > 0 ? primaryTasks : tasks;
+
+  // Return the first non-SUCCEEDED status, or SUCCEEDED if all succeeded
+  for (const task of tasksForStatus) {
+    if (task.status !== 'SUCCEEDED') {
+      return task.status;
+    }
+  }
+  return 'SUCCEEDED';
+}
+
+export async function getManagedJobs(options = {}) {
+  try {
+    const {
+      allUsers = true,
+      skipFinished = false,
+      allFields = false,
+      jobIdMatch,
+      nameMatch,
+      userMatch,
+      workspaceMatch,
+      poolMatch,
+      infraMatch,
+      page,
+      limit,
+      statuses,
+      fields,
+      jobIDs,
+      includeTree = false,
+    } = options;
+
+    const body = {
+      all_users: allUsers,
+      verbose: true,
+      skip_finished: skipFinished,
+    };
+    if (nameMatch !== undefined) body.name_match = nameMatch;
+    if (userMatch !== undefined) body.user_match = userMatch;
+    if (workspaceMatch !== undefined) body.workspace_match = workspaceMatch;
+    if (poolMatch !== undefined) body.pool_match = poolMatch;
+    if (infraMatch !== undefined) body.infra_match = infraMatch;
+    if (page !== undefined) body.page = page;
+    if (limit !== undefined) body.limit = limit;
+    if (statuses !== undefined && statuses.length > 0) body.statuses = statuses;
+    // Support both jobIdMatch (from filter UI) and jobIDs (direct usage)
+    const resolvedJobIDs = jobIdMatch ? [jobIdMatch] : jobIDs;
+    if (resolvedJobIDs !== undefined && resolvedJobIDs.length > 0)
+      body.job_ids = resolvedJobIDs;
+    // With job_ids, also return the jobs launched under those jobs, so a
+    // job group and its dynamic tasks come back in one answer.
+    if (includeTree && body.job_ids) body.include_tree = true;
+    if (!allFields) {
+      if (fields && fields.length > 0) {
+        body.fields = fields;
+      } else {
+        body.fields = DEFAULT_FIELDS;
+      }
+    }
+
+    const response = await apiClient.post(`/jobs/queue/v2`, body);
+    if (!response.ok) {
+      const msg = `Failed to get managed jobs with status ${response.status}`;
+      throw new Error(msg);
+    }
+    const id = response.headers.get('X-Skypilot-Request-ID');
+    // Handle empty request ID
+    if (!id) {
+      const msg = 'No request ID received from server for managed jobs';
+      throw new Error(msg);
+    }
+    const fetchedData = await apiClient.get(`/api/get?request_id=${id}`);
+    let errorMessage = fetchedData.statusText;
+    // Recorded rather than thrown from inside the parse below: a throw there
+    // lands in that block's own catch and is reported as a parse failure.
+    let infraFilterUnsupported = null;
+    let includeTreeUnsupported = null;
+    if (fetchedData.status === 500) {
+      try {
+        const data = await fetchedData.json();
+        if (data.detail && data.detail.error) {
+          try {
+            const error = JSON.parse(data.detail.error);
+            // Handle specific error types
+            if (error.type && error.type === CLUSTER_NOT_UP_ERROR) {
+              return { jobs: [], total: 0, controllerStopped: true };
+            } else if (
+              error.type === NOT_SUPPORTED_ERROR &&
+              (infraMatch !== undefined || includeTree)
+            ) {
+              // The controller is too old for the infra filter or for
+              // include_tree. Tag the error with what was requested so each
+              // caller can react: the list page reports a refused infra
+              // filter instead of showing an unfiltered table, and a detail
+              // page falls back to reading the tree out of the full listing.
+              // No caller asks for both on one request. If one did, both
+              // tags are set, because exactly one of the two was refused.
+              if (infraMatch !== undefined) {
+                infraFilterUnsupported =
+                  error.message || 'Filtering by infra is not supported.';
+              }
+              if (includeTree) {
+                includeTreeUnsupported =
+                  error.message || 'Loading the job tree is not supported.';
+              }
+            } else {
+              errorMessage = error.message || String(data.detail.error);
+            }
+          } catch (jsonError) {
+            console.error(
+              'Error parsing JSON from data.detail.error:',
+              jsonError
+            );
+            errorMessage = String(data.detail.error);
+          }
+        }
+      } catch (parseError) {
+        console.error('Error parsing response JSON:', parseError);
+        errorMessage = String(parseError);
+      }
+    }
+    if (infraFilterUnsupported || includeTreeUnsupported) {
+      const unsupported = new Error(
+        infraFilterUnsupported || includeTreeUnsupported
+      );
+      unsupported.infraFilterUnsupported = Boolean(infraFilterUnsupported);
+      unsupported.includeTreeUnsupported = Boolean(includeTreeUnsupported);
+      throw unsupported;
+    }
+    // Handle all error status codes (4xx, 5xx, etc.)
+    if (!fetchedData.ok) {
+      const msg = `API request to get managed jobs result failed with status ${fetchedData.status}, error: ${errorMessage}`;
+      throw new Error(msg);
+    }
+    // print out the response for debugging
+    const data = await fetchedData.json();
+    const parsed = data.return_value ? JSON.parse(data.return_value) : [];
+    const managedJobs = Array.isArray(parsed) ? parsed : parsed?.jobs || [];
+    const total = Array.isArray(parsed)
+      ? managedJobs.length
+      : (parsed?.total ?? managedJobs.length);
+    const totalNoFilter = parsed?.total_no_filter || total;
+    const statusCounts = parsed?.status_counts || {};
+    // The distinct `--infra` specs across everything the other filters select,
+    // computed server-side because the queue is paginated. Absent from a server
+    // or jobs controller that predates the field, in which case the page falls
+    // back to deriving the options from the rows it has.
+    const infraOptions = parsed?.infra_options || [];
+
+    // Process jobs data
+    const jobData = managedJobs.map((job) => {
+      let total_duration = 0;
+      if (job.end_at && job.submitted_at) {
+        total_duration = job.end_at - job.submitted_at;
+      } else if (job.submitted_at) {
+        total_duration = Date.now() / 1000 - job.submitted_at;
+      }
+
+      const events = [];
+      if (job.submitted_at) {
+        events.push({
+          type: 'PENDING',
+          timestamp: job.submitted_at,
+        });
+      }
+      if (job.start_at) {
+        events.push({
+          type: 'RUNNING',
+          timestamp: job.start_at,
+        });
+      }
+      if (job.end_at) {
+        events.push({
+          type: job.status,
+          timestamp: job.end_at,
+        });
+      }
+
+      let cloud = '';
+      let region = '';
+      let cluster_resources = '';
+      let infra = '';
+      let full_infra = '';
+
+      try {
+        cloud = job.cloud || '';
+        cluster_resources = job.cluster_resources;
+        region = job.region || '';
+        if (region === '-') {
+          region = '';
+        }
+
+        if (cloud) {
+          infra = cloud;
+          if (region) {
+            infra += ` (${region})`;
+          }
+        }
+
+        full_infra = infra;
+        if (job.accelerators) {
+          const accel_str = Object.entries(job.accelerators)
+            .map(([key, value]) => `${value}x${key}`)
+            .join(', ');
+          if (accel_str) {
+            full_infra += ` (${accel_str})`;
+          }
+        }
+      } catch (e) {
+        cluster_resources = job.cluster_resources;
+      }
+
+      return {
+        id: job.job_id,
+        task_job_id: job._job_id,
+        task: job.task_name,
+        name: job.job_name,
+        job_duration: job.job_duration,
+        total_duration: total_duration,
+        workspace: job.workspace,
+        status: job.status,
+        requested_resources: job.resources,
+        resources_str: cluster_resources,
+        resources_str_full: job.cluster_resources_full || cluster_resources,
+        cloud: cloud,
+        region: job.region,
+        // Zone; for Slurm this is the partition the job was scheduled to.
+        zone: job.zone && job.zone !== '-' ? job.zone : null,
+        infra: infra,
+        full_infra: full_infra,
+        recoveries: job.recovery_count,
+        details: job.details || job.failure_reason,
+        // Mirror the cluster INIT tooltip: surface the pending reason on
+        // the status badge so users can see why a job is stuck in PENDING,
+        // and the failure attribution (user program vs SkyPilot/infra) on
+        // FAILED* badges, without opening the job details view.
+        statusTooltip: getStatusTooltip(job),
+        user: job.user_name,
+        user_hash: job.user_hash,
+        submitted_at: job.submitted_at
+          ? new Date(job.submitted_at * 1000)
+          : null,
+        started_at: job.start_at ? new Date(job.start_at * 1000) : null,
+        events: events,
+        dag_yaml: job.user_yaml,
+        entrypoint: job.entrypoint,
+        git_commit: job.metadata?.git_commit || '-',
+        links: job.links || {},
+        pool: job.pool,
+        pool_hash: job.pool_hash,
+        schedule_state: job.schedule_state,
+        current_cluster_name: job.current_cluster_name,
+        cluster_name_on_cloud: job.cluster_name_on_cloud,
+        job_id_on_pool_cluster: job.job_id_on_pool_cluster,
+        accelerators: job.accelerators, // Include accelerators field
+        labels: job.labels || {}, // Include labels field
+        node_names: job.node_names, // Node names for dashboard display
+        // JobGroup fields
+        is_job_group: job.is_job_group,
+        execution: job.execution,
+        is_primary_in_job_group: job.is_primary_in_job_group,
+        // Job tree fields, null for a top-level job: root_job_id is the
+        // top-level job of the tree, parent_job_id/parent_task_id the job
+        // and task that launched this one.
+        root_job_id: job.root_job_id ?? null,
+        parent_job_id: job.parent_job_id ?? null,
+        parent_task_id: job.parent_task_id ?? null,
+        // A dynamic task's ordinal within its root's tree (declared tasks are
+        // 0..n-1, dynamic tasks number on); `<root>-<index>` names it.
+        dynamic_task_index: job.dynamic_task_index ?? null,
+        // Managed job IDs this job waits for; null without dependencies.
+        depends_on: job.depends_on ?? null,
+        // Batch progress
+        batch_total_batches: job.batch_total_batches,
+        batch_completed_batches: job.batch_completed_batches,
+      };
+    });
+
+    // Apply plugin data enhancements
+    // Pass raw backend data so enhancements can extract fields directly
+    const enhancedJobs = await applyEnhancements(jobData, 'jobs', {
+      dashboardCache,
+      rawData: managedJobs, // Raw backend response for field extraction
+    });
+
+    return {
+      jobs: enhancedJobs,
+      total,
+      totalNoFilter,
+      controllerStopped: false,
+      statusCounts,
+      infraOptions,
+    };
+  } catch (error) {
+    console.error('Error fetching managed job data:', error);
+    // Signal to the cache to not overwrite previously cached data
+    throw error;
+  }
+}
+
+/**
+ * Enhanced getManagedJobs function that supports client-side pagination
+ * This function fetches all jobs data once and caches it, then performs filtering and pagination on the client side
+ * @param {Object} options - Query options
+ * @param {boolean} options.allUsers - Whether to fetch jobs for all users
+ * @param {string} options.nameMatch - Filter by job name
+ * @param {string} options.userMatch - Filter by user
+ * @param {string} options.workspaceMatch - Filter by workspace
+ * @param {string} options.poolMatch - Filter by pool
+ * @param {Array} options.jobIDs - Filter by job IDs
+ * @param {number} options.page - Page page (1-based)
+ * @param {number} options.limit - Page size
+ * @param {Array} options.fields - Fields to return
+ * @param {boolean} options.allFields - Whether to return all fields (default: false)
+ * @param {boolean} options.useClientPagination - Whether to use client-side pagination (default: true)
+ * @returns {Promise<{jobs: Array, total: number, controllerStopped: boolean, __skipCache?: boolean}>}
+ */
+export async function getManagedJobsWithClientPagination(options) {
+  const {
+    allUsers = true,
+    nameMatch,
+    userMatch,
+    workspaceMatch,
+    poolMatch,
+    page = 1,
+    limit = 10,
+    jobIDs,
+    fields,
+    allFields = false,
+    useClientPagination = true,
+  } = options || {};
+
+  try {
+    // If client pagination is disabled, fall back to server-side pagination
+    if (!useClientPagination) {
+      return await getManagedJobs(options);
+    }
+
+    // Create cache key for full dataset (without pagination params)
+    const cacheKey = {
+      allUsers,
+      nameMatch,
+      userMatch,
+      workspaceMatch,
+      poolMatch,
+      jobIDs,
+      fields,
+      allFields,
+    };
+
+    // Fetch all data without pagination parameters
+    const fullDataResponse = await getManagedJobs(cacheKey);
+
+    if (fullDataResponse.controllerStopped || !fullDataResponse.jobs) {
+      return fullDataResponse;
+    }
+
+    const allJobs = fullDataResponse.jobs;
+    const total = allJobs.length;
+
+    // Apply client-side pagination
+    const startIndex = (page - 1) * limit;
+    const endIndex = startIndex + limit;
+    const paginatedJobs = allJobs.slice(startIndex, endIndex);
+
+    return {
+      jobs: paginatedJobs,
+      total: total,
+      controllerStopped: false,
+    };
+  } catch (error) {
+    console.error(
+      'Error fetching managed job data with client pagination:',
+      error
+    );
+    throw error;
+  }
+}
+
+export async function getPoolStatus() {
+  try {
+    const response = await apiClient.post(`/jobs/pool_status`, {
+      pool_names: null, // null means get all pools
+    });
+    if (!response.ok) {
+      const msg = `Initial API request to get pool status failed with status ${response.status}`;
+      throw new Error(msg);
+    }
+    const id = response.headers.get('X-Skypilot-Request-ID');
+    if (!id) {
+      const msg = 'No request ID received from server for getting pool status';
+      throw new Error(msg);
+    }
+    const fetchedData = await apiClient.get(`/api/get?request_id=${id}`);
+    let errorMessage = fetchedData.statusText;
+    if (fetchedData.status === 500) {
+      try {
+        const data = await fetchedData.json();
+        if (data.detail && data.detail.error) {
+          try {
+            const error = JSON.parse(data.detail.error);
+            if (error.type && error.type === CLUSTER_NOT_UP_ERROR) {
+              return { pools: [], controllerStopped: true };
+            } else {
+              errorMessage = error.message || String(data.detail.error);
+            }
+          } catch (jsonError) {
+            console.error(
+              'Error parsing JSON from data.detail.error:',
+              jsonError
+            );
+            errorMessage = String(data.detail.error);
+          }
+        }
+      } catch (dataError) {
+        console.error('Error parsing response JSON:', dataError);
+        errorMessage = String(dataError);
+      }
+    }
+
+    if (!fetchedData.ok) {
+      const msg = `API request to get pool status result failed with status ${fetchedData.status}, error: ${errorMessage}`;
+      throw new Error(msg);
+    }
+
+    // Parse the pools data from the response
+    const data = await fetchedData.json();
+    const poolData = data.return_value ? JSON.parse(data.return_value) : [];
+
+    // Skip the active-jobs fetch entirely when there are no pools — the
+    // job counts it computes have nothing to attach to.
+    if (poolData.length === 0) {
+      return { pools: [], controllerStopped: false };
+    }
+
+    // Also fetch managed jobs to get job counts by pool
+    let jobsData = { jobs: [] };
+    try {
+      const jobsResponse = await dashboardCache.get(getManagedJobs, [
+        {
+          allUsers: true,
+          skipFinished: true,
+          fields: ['pool', 'status'],
+        },
+      ]);
+      if (!jobsResponse.controllerStopped) {
+        jobsData = jobsResponse;
+      }
+    } catch (jobsError) {
+      console.warn('Failed to fetch jobs for pool job counts:', jobsError);
+    }
+
+    // Process job counts by pool and status
+    const jobCountsByPool = {};
+    const terminalStatuses = [
+      'SUCCEEDED',
+      'FAILED',
+      'FAILED_SETUP',
+      'FAILED_PRECHECKS',
+      'FAILED_NO_RESOURCE',
+      'FAILED_CONTROLLER',
+      'CANCELLED',
+    ];
+
+    if (jobsData.jobs && Array.isArray(jobsData.jobs)) {
+      jobsData.jobs.forEach((job) => {
+        const poolName = job.pool;
+        const status = job.status;
+
+        if (poolName && !terminalStatuses.includes(status)) {
+          if (!jobCountsByPool[poolName]) {
+            jobCountsByPool[poolName] = {};
+          }
+          jobCountsByPool[poolName][status] =
+            (jobCountsByPool[poolName][status] || 0) + 1;
+        }
+      });
+    }
+
+    // Add job counts to each pool
+    const pools = poolData.map((pool) => ({
+      ...pool,
+      jobCounts: jobCountsByPool[pool.name] || {},
+      // Normalize the owning user onto the same `user`/`user_hash` shape the
+      // clusters and jobs tables use, so the shared UserDisplay/filtering
+      // helpers work unchanged.
+      user: pool.user_name,
+      user_hash: pool.user_hash,
+    }));
+
+    return { pools, controllerStopped: false };
+  } catch (error) {
+    console.error('Error fetching pools:', error);
+    throw error;
+  }
+}
+
+// Fields needed to list the jobs launched under a job on its detail page,
+// for the fallback that reads them out of the full listing (see
+// useSingleManagedJob).
+const JOB_TREE_MEMBER_FIELDS = [
+  'job_id',
+  '_job_id',
+  'job_name',
+  'task_name',
+  'status',
+  'job_duration',
+  'submitted_at',
+  'user_name',
+  'resources',
+  'cloud',
+  'region',
+  'accelerators',
+  'cluster_resources',
+  'cluster_resources_full',
+  'recovery_count',
+  // A launched job can itself be a job group: its status is aggregated
+  // over its primary tasks, like its own detail page does.
+  'is_primary_in_job_group',
+  'root_job_id',
+  'parent_job_id',
+  'parent_task_id',
+  'dynamic_task_index',
+];
+
+// Set once a jobs controller refuses `include_tree` because it predates the
+// field (it updates itself on the next managed job launch). After that,
+// job pages skip the refused request and go straight to the fallback. An
+// explicit Refresh tries the tree fetch again, so an upgraded controller is
+// picked up without reloading the dashboard.
+let treeFetchUnsupported = false;
+
+// The one queue call a job's detail page makes. It returns the job's own
+// rows and the rows of every job launched under it. All fields are
+// requested because the page shows everything about the job. The tree is
+// small.
+function jobTreeCacheArgs(jobId) {
+  return [
+    { allUsers: true, allFields: true, jobIDs: [jobId], includeTree: true },
+  ];
+}
+
+// The two calls the detail page made before `include_tree` existed. Kept as
+// the fallback for a controller that predates it: one call for the job's own
+// rows, one for the full listing that the members are filtered out of.
+function legacyJobCacheArgs(jobId) {
+  return [{ allUsers: true, allFields: true, jobIDs: [jobId] }];
+}
+const LEGACY_TREE_CACHE_ARGS = [
+  { allUsers: true, fields: JOB_TREE_MEMBER_FIELDS },
+];
+
+/**
+ * A job and the jobs launched under it, for the job detail pages.
+ *
+ * One `include_tree` queue call returns every row of the job's tree.
+ * `jobData.jobs` is the job's own rows, one per task. `members` is the rows
+ * of every job launched from inside it, directly or through another
+ * launched job: the rows whose root_job_id is `jobId`. It is empty when the
+ * job is not the top of its tree. Both arrive in the same response, so the
+ * Tasks table does not show the declared tasks first and the dynamic tasks
+ * seconds later.
+ *
+ * `membersLoaded` tells "no members" apart from "not fetched yet".
+ *
+ * `options.preloaded` is `{ jobs, controllerStopped }` for a job whose rows
+ * the caller already has, from a tree it fetched. The hook then fetches
+ * nothing and returns those rows: the dynamic task page renders a member
+ * out of the group's tree instead of fetching it again by id. A member is
+ * never the top of its tree, so `members` is empty there.
+ */
+export function useSingleManagedJob(jobId, refreshTrigger = 0, options = {}) {
+  const { preloaded = null } = options;
+  const [jobData, setJobData] = useState(null);
+  const [members, setMembers] = useState([]);
+  const [membersLoaded, setMembersLoaded] = useState(false);
+  const [loadingJobData, setLoadingJobData] = useState(true);
+  // Track the last seen refresh trigger so we only invalidate the cache when
+  // it actually increments (a manual refresh), not on every effect run.
+  const prevRefreshTriggerRef = useRef(refreshTrigger);
+  const loading = loadingJobData;
+
+  useEffect(() => {
+    if (preloaded) return undefined;
+    let cancelled = false;
+
+    // Drop the cached entries only when the refresh trigger actually
+    // increments (a manual refresh), so the click fetches fresh data.
+    // Guarding on `> 0` instead would also invalidate the new job's cache
+    // when navigating between jobs while the trigger stays elevated (the
+    // parent keeps refreshTrigger state across jobId changes), defeating
+    // the cache on initial load.
+    //
+    // Decided once, and the ref is updated here, before any await: a later
+    // effect run (navigating to another job while this fetch is in flight)
+    // must see the trigger as already handled. Both fetch paths below read
+    // the same answer.
+    const refreshed = refreshTrigger > prevRefreshTriggerRef.current;
+    prevRefreshTriggerRef.current = refreshTrigger;
+    function invalidateIfRefreshed(cacheArgsList) {
+      if (refreshed) {
+        cacheArgsList.forEach((args) =>
+          dashboardCache.invalidate(getManagedJobs, args)
+        );
+      }
+    }
+
+    const isOwnRow = (j) => String(j.id) === String(jobId);
+    const isMemberRow = (j) =>
+      j.root_job_id != null && String(j.root_job_id) === String(jobId);
+
+    async function fetchTree() {
+      const cacheArgs = jobTreeCacheArgs(jobId);
+      invalidateIfRefreshed([cacheArgs]);
+      const data = await dashboardCache.get(getManagedJobs, cacheArgs);
+      const rows = data?.jobs || [];
+      return {
+        jobs: rows.filter(isOwnRow),
+        members: rows.filter(isMemberRow),
+        controllerStopped: data?.controllerStopped || false,
+      };
+    }
+
+    async function fetchTreeLegacy() {
+      const jobArgs = legacyJobCacheArgs(jobId);
+      invalidateIfRefreshed([jobArgs, LEGACY_TREE_CACHE_ARGS]);
+      const [data, listing] = await Promise.all([
+        dashboardCache.get(getManagedJobs, jobArgs),
+        dashboardCache
+          .get(getManagedJobs, LEGACY_TREE_CACHE_ARGS)
+          .catch((error) => {
+            console.error('Error fetching jobs launched from job:', error);
+            return { jobs: [] };
+          }),
+      ]);
+      return {
+        jobs: (data?.jobs || []).filter(isOwnRow),
+        members: (listing?.jobs || []).filter(isMemberRow),
+        controllerStopped: data?.controllerStopped || false,
+      };
+    }
+
+    async function fetchJobData() {
+      if (!jobId) return;
+      try {
+        setLoadingJobData(true);
+        let tree;
+        if (treeFetchUnsupported && !refreshed) {
+          tree = await fetchTreeLegacy();
+        } else {
+          try {
+            tree = await fetchTree();
+            treeFetchUnsupported = false;
+          } catch (error) {
+            if (!error?.includeTreeUnsupported) throw error;
+            treeFetchUnsupported = true;
+            tree = await fetchTreeLegacy();
+          }
+        }
+        if (cancelled) return;
+        setJobData({
+          jobs: tree.jobs,
+          controllerStopped: tree.controllerStopped,
+        });
+        setMembers(tree.members);
+      } catch (error) {
+        console.error('Error fetching single managed job data:', error);
+        if (cancelled) return;
+        setJobData({ jobs: [], controllerStopped: false });
+        setMembers([]);
+      } finally {
+        if (!cancelled) {
+          setMembersLoaded(true);
+          setLoadingJobData(false);
+        }
+      }
+    }
+    fetchJobData();
+    return () => {
+      cancelled = true;
+    };
+  }, [jobId, refreshTrigger, preloaded]);
+
+  if (preloaded) {
+    return {
+      jobData: preloaded,
+      loading: false,
+      members: [],
+      membersLoaded: true,
+    };
+  }
+  return { jobData, loading, members, membersLoaded };
+}
+
+export async function streamManagedJobLogs({
+  jobId,
+  task = null,
+  controller = false,
+  signal,
+  onNewLog,
+}) {
+  // Measure timeout from last received data, not from start of request.
+  const inactivityTimeout = 30000; // 30 seconds of no data activity
+  let lastActivity = Date.now();
+  let timeoutId;
+
+  // Create an activity-based timeout promise
+  const createTimeoutPromise = () => {
+    return new Promise((resolve) => {
+      const checkActivity = () => {
+        const timeSinceLastActivity = Date.now() - lastActivity;
+
+        if (timeSinceLastActivity >= inactivityTimeout) {
+          resolve({ timeout: true });
+        } else {
+          // Check again after remaining time
+          timeoutId = setTimeout(
+            checkActivity,
+            inactivityTimeout - timeSinceLastActivity
+          );
+        }
+      };
+
+      timeoutId = setTimeout(checkActivity, inactivityTimeout);
+    });
+  };
+
+  const timeoutPromise = createTimeoutPromise();
+
+  // Create the fetch promise
+  const fetchPromise = (async () => {
+    try {
+      const requestBody = {
+        controller: controller,
+        follow: false,
+        job_id: jobId,
+        tail: DEFAULT_TAIL_LINES,
+        task: task,
+      };
+
+      const response = await apiClient.fetchImmediate(
+        '/jobs/logs',
+        requestBody,
+        'POST',
+        { signal }
+      );
+
+      // Stream the logs
+      const reader = response.body.getReader();
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          // Update activity timestamp when we receive data
+          lastActivity = Date.now();
+
+          const chunk = new TextDecoder().decode(value);
+          onNewLog(chunk);
+        }
+      } finally {
+        // Only cancel the reader if the signal hasn't been aborted
+        // If signal is aborted, the reader should already be canceling
+        if (!signal || !signal.aborted) {
+          try {
+            reader.cancel();
+          } catch (cancelError) {
+            // Ignore errors from reader cancellation
+            if (cancelError.name !== 'AbortError') {
+              console.warn('Error canceling reader:', cancelError);
+            }
+          }
+        }
+        // Clear the timeout when streaming completes successfully
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+        }
+      }
+      return { timeout: false };
+    } catch (error) {
+      // Clear timeout on any error
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+
+      // If this was an abort, just return silently
+      if (error.name === 'AbortError') {
+        return { timeout: false };
+      }
+      throw error;
+    }
+  })();
+
+  // Race the fetch against the activity-based timeout
+  const result = await Promise.race([fetchPromise, timeoutPromise]);
+
+  // Clear any remaining timeout
+  if (timeoutId) {
+    clearTimeout(timeoutId);
+  }
+
+  // If we timed out due to inactivity, show a more informative message
+  if (result.timeout) {
+    showToast(
+      `Log request for job ${jobId} timed out after ${inactivityTimeout / 1000}s of inactivity`,
+      'warning'
+    );
+    return;
+  }
+}
+
+export async function handleJobAction(action, jobId, cluster) {
+  let logStarter = '';
+  let logMiddle = '';
+  let apiPath = '';
+  let requestBody = {};
+  switch (action) {
+    case 'restartcontroller':
+      logStarter = 'Restarting';
+      logMiddle = 'restarted';
+      apiPath = 'jobs/queue/v2';
+      requestBody = {
+        all_users: true,
+        refresh: true,
+        skip_finished: true,
+        fields: ['status'],
+      };
+      jobId = 'controller';
+      break;
+    default:
+      throw new Error(`Invalid action: ${action}`);
+  }
+
+  // Show initial notification
+  showToast(`${logStarter} job ${jobId}...`, 'info');
+
+  try {
+    try {
+      const response = await apiClient.fetchImmediate(
+        `/${apiPath}`,
+        requestBody
+      );
+      if (!response.ok) {
+        console.error(
+          `Initial API request ${apiPath} failed with status ${response.status}`
+        );
+        showToast(
+          `${logStarter} job ${jobId} failed with status ${response.status}.`,
+          'error'
+        );
+        return;
+      }
+
+      const id = response.headers.get('X-Skypilot-Request-ID');
+      if (!id) {
+        console.error(`No request ID received from server for ${apiPath}`);
+        showToast(
+          `${logStarter} job ${jobId} failed with no request ID.`,
+          'error'
+        );
+        return;
+      }
+      const finalResponse = await apiClient.fetchImmediate(
+        `/api/get?request_id=${id}`,
+        undefined,
+        'GET'
+      );
+
+      // Check the status code of the final response
+      if (finalResponse.status === 200) {
+        showToast(`Job ${jobId} ${logMiddle} successfully.`, 'success');
+      } else {
+        if (finalResponse.status === 500) {
+          try {
+            const data = await finalResponse.json();
+
+            if (data.detail && data.detail.error) {
+              try {
+                const error = JSON.parse(data.detail.error);
+
+                // Handle specific error types
+                if (error.type && error.type === NOT_SUPPORTED_ERROR) {
+                  showToast(
+                    `${logStarter} job ${jobId} is not supported!`,
+                    'error',
+                    10000
+                  );
+                } else if (
+                  error.type &&
+                  error.type === CLUSTER_DOES_NOT_EXIST
+                ) {
+                  showToast(`Cluster ${cluster} does not exist.`, 'error');
+                } else if (error.type && error.type === CLUSTER_NOT_UP_ERROR) {
+                  showToast(`Cluster ${cluster} is not up.`, 'error');
+                } else {
+                  showToast(
+                    `${logStarter} job ${jobId} failed: ${error.type}`,
+                    'error'
+                  );
+                }
+              } catch (jsonError) {
+                showToast(
+                  `${logStarter} job ${jobId} failed: ${data.detail.error}`,
+                  'error'
+                );
+              }
+            } else {
+              showToast(
+                `${logStarter} job ${jobId} failed with no details.`,
+                'error'
+              );
+            }
+          } catch (parseError) {
+            showToast(
+              `${logStarter} job ${jobId} failed with parse error.`,
+              'error'
+            );
+          }
+        } else {
+          showToast(
+            `${logStarter} job ${jobId} failed with status ${finalResponse.status}.`,
+            'error'
+          );
+        }
+      }
+    } catch (fetchError) {
+      console.error('Fetch error:', fetchError);
+      showToast(
+        `Network error ${logStarter} job ${jobId}: ${fetchError.message}`,
+        'error'
+      );
+    }
+  } catch (outerError) {
+    console.error('Error in handleStop:', outerError);
+    showToast(
+      `Critical error ${logStarter} job ${jobId}: ${outerError.message}`,
+      'error'
+    );
+  }
+}
+
+/**
+ * Downloads managed job logs as a zip via the API server.
+ * Flow:
+ * 1) POST /jobs/download_logs - copy logs from cluster to API server tmp dir
+ * 2) POST /download - server zips and streams it back as a binary response
+ * 3) Save the response blob via `<a download>` (createObjectURL).
+ */
+// Long-poll /jobs/download_logs by hand instead of using apiClient.fetch.
+// For multi-GB running jobs sync_down can take 5+ minutes — well past
+// the ~100s edge timeouts (Cloudflare 524 etc.) of a single GET.
+// Retry the polling GET when we hit a 5xx so the user-visible request
+// resumes waiting on the SAME server-side request_id until it
+// completes. (sync_down already passes follow=False, so the underlying
+// stream_logs reads to EOF and exits — it just takes a while.)
+async function downloadLogsWithRetry(body, maxAttempts = 30) {
+  // Step 1: dispatch the request and grab its server-side ID.
+  const baseUrl = window.location.origin;
+  const userInfo = await (async () => {
+    // Mirror what apiClient.fetch does — the env_vars path matters.
+    const r = await fetch(`${baseUrl}/internal/dashboard/users/role`).catch(
+      () => null
+    );
+    if (r && r.ok) return r.json();
+    return { id: 'local', name: 'local' };
+  })();
+  const dispatch = await fetch(`${baseUrl}${ENDPOINT}/jobs/download_logs`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      // /jobs/download_logs is a queued (executor.schedule_request_async)
+      // route, so the worker-side gate honors this header to pick up
+      // the resolver path — without it, users without 'default'
+      // workspace access would be rejected at
+      // reject_request_for_unauthorized_workspace. Both
+      // API_VERSION_HEADER and VERSION_HEADER are required — the server
+      // middleware drops the ContextVar write if either is missing.
+      [API_VERSION_HEADER]: CLIENT_API_VERSION,
+      [VERSION_HEADER]: CLIENT_VERSION,
+    },
+    body: JSON.stringify({
+      ...body,
+      env_vars: {
+        SKYPILOT_IS_FROM_DASHBOARD: 'true',
+        SKYPILOT_USER_ID: userInfo.id,
+        SKYPILOT_USER: userInfo.name,
+      },
+    }),
+  });
+  if (!dispatch.ok) {
+    throw new Error(`download_logs dispatch failed: ${dispatch.status}`);
+  }
+  const requestId = dispatch.headers.get('X-Skypilot-Request-ID');
+  if (!requestId) {
+    throw new Error('download_logs dispatch missing X-Skypilot-Request-ID');
+  }
+
+  // Step 2: long-poll /api/get, retrying on edge-timeout responses.
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const r = await fetch(
+      `${baseUrl}${ENDPOINT}/api/get?request_id=${requestId}`
+    );
+    // 524 Cloudflare timeout / 502/503/504 transient — retry against
+    // the same request_id; the server's long-poll resumes waiting.
+    if (
+      r.status === 524 ||
+      r.status === 502 ||
+      r.status === 503 ||
+      r.status === 504
+    ) {
+      // Linear backoff capped at 5s. Cloudflare 524 self-paces at
+      // ~100s so most attempts gain nothing, but a server-side 502/503
+      // hiccup would otherwise hammer the API server back-to-back.
+      const backoffMs = Math.min(1000 * (attempt + 1), 5000);
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
+      continue;
+    }
+    if (!r.ok) {
+      const text = await r.text();
+      throw new Error(`/api/get ${r.status}: ${text}`);
+    }
+    const data = await r.json();
+    return data.return_value ? JSON.parse(data.return_value) : [];
+  }
+  throw new Error('download_logs timed out after retries');
+}
+
+// Prepare a zip via sync_down + /download, read the response as a
+// blob, and save via createObjectURL. The wait scales with rsync time
+// on the worker, so multi-GB running logs can take a few minutes —
+// downloadLogsWithRetry tolerates Cloudflare 524 during that window.
+export async function downloadManagedJobLogs({
+  jobId = null,
+  name = null,
+  controller = false,
+}) {
+  try {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const namePart = jobId ? `job-${jobId}` : name ? `job-${name}` : 'job';
+    const logType = controller ? 'controller-logs' : 'logs';
+    const filename = `managed-${namePart}-${logType}-${ts}.zip`;
+
+    const mapping = await downloadLogsWithRetry({
+      job_id: jobId,
+      name: name,
+      controller: controller,
+      refresh: false,
+    });
+    const folderPaths = Object.values(mapping || {});
+    if (!folderPaths.length) {
+      showToast('No logs found to download.', 'warning');
+      return;
+    }
+    const resp = await apiClient.fetchImmediate('/download?relative=items', {
+      folder_paths: folderPaths,
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`Download failed: ${resp.status} ${text}`);
+    }
+    const blob = await resp.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+    trackJobAction('download_logs', { controller });
+  } catch (error) {
+    console.error('Error downloading managed job logs:', error);
+    showToast(`Error downloading managed job logs: ${error.message}`, 'error');
+  }
+}

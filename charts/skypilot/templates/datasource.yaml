@@ -1,0 +1,21 @@
+{{- if and .Values.grafana.enabled .Values.grafana.sidecar.datasources.enabled }}
+{{- $fullName := include "skypilot.fullname" . -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullName }}-prometheus-datasource
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ $fullName }}-api
+    grafana_datasource: "true"
+data:
+  prometheus.yaml: |-
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        url: http://{{ $fullName }}-prometheus-server:80
+        editable: false
+        uid: prometheus
+        access: proxy
+{{- end }}

@@ -1,0 +1,557 @@
+"""skylet events"""
+import math
+import os
+import re
+import subprocess
+import time
+import traceback
+from typing import Dict, List, Optional
+
+import psutil
+
+from sky import clouds
+from sky import sky_logging
+from sky.backends import cloud_vm_ray_backend
+from sky.jobs import constants as managed_job_constants
+from sky.jobs import scheduler
+from sky.jobs import state as managed_job_state
+from sky.jobs import utils as managed_job_utils
+from sky.serve import serve_utils
+from sky.skylet import autostop_lib
+from sky.skylet import constants
+from sky.skylet import hook_executor
+from sky.skylet import job_lib
+from sky.usage import usage_lib
+from sky.utils import cluster_utils
+from sky.utils import registry
+from sky.utils import subprocess_utils
+from sky.utils import ux_utils
+from sky.utils import yaml_utils
+
+# Seconds of sleep between the processing of skylet events.
+EVENT_CHECKING_INTERVAL_SECONDS = 20
+logger = sky_logging.init_logger(__name__)
+
+
+class SkyletEvent:
+    """Skylet event.
+
+    The event is triggered every EVENT_INTERVAL_SECONDS seconds.
+
+    Usage: override the EVENT_INTERVAL_SECONDS and _run method in subclass.
+    """
+    # Run this event every this many seconds.
+    EVENT_INTERVAL_SECONDS = -1
+
+    def __init__(self):
+        self._event_interval = int(
+            math.ceil(self.EVENT_INTERVAL_SECONDS /
+                      EVENT_CHECKING_INTERVAL_SECONDS))
+        self._n = 0
+
+    def start(self):
+        pass
+
+    def run(self):
+        self._n = (self._n + 1) % self._event_interval
+        if self._n % self._event_interval == 0:
+            logger.debug(f'{self.__class__.__name__} triggered')
+            try:
+                self._run()
+            except Exception as e:  # pylint: disable=broad-except
+                # Keep the skylet running even if an event fails.
+                logger.error(f'{self.__class__.__name__} error: {e}')
+                with ux_utils.enable_traceback():
+                    logger.error(traceback.format_exc())
+
+    def _run(self):
+        raise NotImplementedError
+
+
+class JobSchedulerEvent(SkyletEvent):
+    """Skylet event for scheduling jobs"""
+    EVENT_INTERVAL_SECONDS = 300
+
+    def _run(self):
+        job_lib.scheduler.schedule_step(force_update_jobs=True)
+
+
+class ManagedJobEvent(SkyletEvent):
+    """Skylet event for updating and scheduling managed jobs."""
+    EVENT_INTERVAL_SECONDS = 300
+
+    def start(self):
+        cpus_env_var = os.environ.get('SKYPILOT_POD_CPU_CORE_LIMIT')
+        if cpus_env_var is not None:
+            with open(os.path.expanduser(constants.CONTROLLER_K8S_CPU_FILE),
+                      'w',
+                      encoding='utf-8') as f:
+                f.write(cpus_env_var)
+        memory_env_var = os.environ.get('SKYPILOT_POD_MEMORY_GB_LIMIT')
+        if memory_env_var is not None:
+            with open(os.path.expanduser(constants.CONTROLLER_K8S_MEMORY_FILE),
+                      'w',
+                      encoding='utf-8') as f:
+                f.write(memory_env_var)
+
+    def _run(self):
+        if not os.path.exists(
+                os.path.expanduser(
+                    managed_job_constants.JOB_CONTROLLER_INDICATOR_FILE)
+        ) and not managed_job_utils.is_consolidation_mode():
+            # Note: since the skylet is started before the user setup (in
+            # jobs-controller.yaml.j2) runs, it's possible that we hit this
+            # before the indicator file is written. However, since we will wait
+            # EVENT_INTERVAL_SECONDS before the first run, this should be very
+            # unlikely.
+            logger.info('No jobs controller indicator file found.')
+            all_job_ids = managed_job_state.get_all_job_ids_by_name(None)
+            if not all_job_ids:
+                logger.info('No jobs running. Stopping controllers.')
+                # TODO(cooperc): Move this to a shared function also called by
+                # sdk.api_stop(). (#7229)
+                try:
+                    records = scheduler.get_controller_process_records()
+                    if records is not None:
+                        for record in records:
+                            if managed_job_utils.controller_process_alive(
+                                    record, quiet=False):
+                                subprocess_utils.kill_children_processes(
+                                    parent_pids=[record.pid], force=True)
+                        os.remove(
+                            os.path.expanduser(
+                                scheduler.JOB_CONTROLLER_PID_PATH))
+                except Exception as e:  # pylint: disable=broad-except
+                    # in case we get perm issues or something is messed up, just
+                    # ignore it and assume the process is dead
+                    logger.error(
+                        f'Error looking at job controller pid file: {e}')
+                    pass
+            logger.info(f'{len(all_job_ids)} jobs running. Assuming the '
+                        'indicator file hasn\'t been written yet.')
+            return
+
+        logger.info('=== Updating managed job status ===')
+        managed_job_utils.update_managed_jobs_statuses()
+        scheduler.maybe_start_controllers()
+
+
+class ServiceUpdateEvent(SkyletEvent):
+    """Skylet event for updating sky serve service status.
+
+    This is needed to handle the case that controller process is somehow
+    terminated and the service status is not updated.
+    """
+    EVENT_INTERVAL_SECONDS = 300
+
+    def __init__(self, pool: bool) -> None:
+        super().__init__()
+        self._pool = pool
+
+    def _run(self):
+        serve_utils.update_service_status(self._pool)
+
+
+class UsageHeartbeatReportEvent(SkyletEvent):
+    """Skylet event for reporting usage."""
+    EVENT_INTERVAL_SECONDS = 600
+
+    def _run(self):
+        # Cluster placement, accelerator, and provenance context are
+        # exported into skylet's environment by
+        # start_skylet_on_head_node at provisioning time. Forward
+        # whatever is set.
+        def _int_env(name: str) -> Optional[int]:
+            value = os.environ.get(name)
+            if value is None or value == '':
+                return None
+            try:
+                return int(value)
+            except ValueError:
+                return None
+
+        def _bool_env(name: str) -> Optional[bool]:
+            value = os.environ.get(name)
+            if value is None or value == '':
+                return None
+            return value not in ('0', 'false', 'False', 'FALSE')
+
+        usage_lib.send_heartbeat(
+            interval_seconds=self.EVENT_INTERVAL_SECONDS,
+            cloud=os.environ.get('SKYPILOT_HEARTBEAT_CLOUD'),
+            region=os.environ.get('SKYPILOT_HEARTBEAT_REGION'),
+            zone=os.environ.get('SKYPILOT_HEARTBEAT_ZONE'),
+            gpu_type=os.environ.get('SKYPILOT_HEARTBEAT_GPU_TYPE'),
+            num_nodes=_int_env('SKYPILOT_HEARTBEAT_NUM_NODES'),
+            gpus_per_node=_int_env('SKYPILOT_HEARTBEAT_GPUS_PER_NODE'),
+            user=os.environ.get('SKYPILOT_HEARTBEAT_USER'),
+            use_spot=_bool_env('SKYPILOT_HEARTBEAT_USE_SPOT'),
+            instance_type=os.environ.get('SKYPILOT_HEARTBEAT_INSTANCE_TYPE'),
+        )
+
+
+class JobLogLinkScanEvent(SkyletEvent):
+    """Harvest candidate URLs from running jobs' logs into job metadata.
+
+    Scanning at the producer (this cluster) means an external link printed by a
+    task is captured into the local jobs.db ``metadata`` even if no one ever
+    streams the logs. The controller / API server read these candidates and
+    match them against the configured ``dashboard.external_links`` patterns;
+    matching deliberately does not happen here, so the worker needs no config.
+
+    Incremental and bounded: only newly written bytes are scanned each tick, up
+    to a per-job byte budget, and scanning stops once enough distinct URLs have
+    been harvested. The controller's terminal-state scan reads the complete log
+    as the definitive backstop, so anything missed here is still recovered.
+    """
+    EVENT_INTERVAL_SECONDS = 60
+
+    # Stop scanning a job's log past this many bytes; links of interest are
+    # printed early, and this bounds work for chatty multi-GB logs.
+    _MAX_SCAN_BYTES = 10 * 1024 * 1024
+
+    def __init__(self) -> None:
+        super().__init__()
+        # job_id -> byte offset already scanned in run.log.
+        self._offsets: Dict[int, int] = {}
+        # job_id -> distinct candidate URLs already harvested.
+        self._harvested: Dict[int, List[str]] = {}
+
+    def _run(self) -> None:
+        # Imported lazily so this stays cheap; only newer skylets register the
+        # event, so the import always resolves where it runs.
+        # pylint: disable=import-outside-toplevel
+        from sky.utils import log_links
+        job_log_dirs = job_lib.get_nonterminal_job_log_dirs()
+        active_ids = set(job_log_dirs)
+        # Drop bookkeeping for jobs that are no longer active.
+        for job_id in [j for j in self._offsets if j not in active_ids]:
+            self._offsets.pop(job_id, None)
+            self._harvested.pop(job_id, None)
+        for job_id, log_dir in job_log_dirs.items():
+            if log_dir is None:
+                continue
+            harvested = self._harvested.get(job_id, [])
+            offset = self._offsets.get(job_id, 0)
+            # Stop once enough URLs are harvested, or once the remaining byte
+            # budget is tiny: a small trailing read may contain no newline,
+            # which would never advance the offset and would re-read the same
+            # bytes every tick.
+            if (len(harvested) >= log_links.DEFAULT_CANDIDATE_CAP or
+                    self._MAX_SCAN_BYTES - offset < 1024):
+                continue
+            run_log = os.path.join(os.path.expanduser(log_dir), 'run.log')
+            try:
+                with open(run_log, 'rb') as f:
+                    f.seek(offset)
+                    chunk = f.read(self._MAX_SCAN_BYTES - offset)
+            except OSError:
+                continue
+            # Only consume complete lines so a URL is never split across a chunk
+            # boundary (and thus skipped once we advance the offset).
+            last_newline = chunk.rfind(b'\n')
+            if last_newline == -1:
+                continue
+            consumed = last_newline + 1
+            self._offsets[job_id] = offset + consumed
+            lines = chunk[:consumed].decode('utf-8',
+                                            errors='replace').split('\n')
+            new_harvested = log_links.extract_candidate_urls(lines,
+                                                             existing=harvested)
+            self._harvested[job_id] = new_harvested
+            if len(new_harvested) != len(harvested):
+                job_lib.update_job_metadata(
+                    job_id,
+                    {log_links.EXTRACTED_URLS_METADATA_KEY: new_harvested})
+
+
+class StopEvent(SkyletEvent):
+    """Skylet event for the idle-timer-driven teardown path.
+
+    Fires either the ``stop`` hook (when ``autostop.down`` is false)
+    or the ``down`` hook (autodown, when ``autostop.down`` is true)
+    before issuing the actual cluster teardown.
+
+    Idleness timer gets set to 0 whenever:
+      - A first autostop setting is set. By "first", either there's never any
+        autostop setting set, or the last autostop setting is a cancel (idle
+        minutes < 0); or
+      - This event wakes up and job_lib.is_cluster_idle() returns False; or
+      - The cluster has restarted; or
+      - A job is submitted (handled in the backend; not here).
+    """
+    EVENT_INTERVAL_SECONDS = 60
+
+    _UPSCALING_PATTERN = re.compile(r'upscaling_speed: (\d+)')
+    _CATCH_NODES = re.compile(r'cache_stopped_nodes: (.*)')
+
+    def __init__(self):
+        super().__init__()
+        autostop_lib.set_last_active_time_to_now()
+
+    def _run(self):
+        autostop_config = autostop_lib.get_autostop_config()
+
+        if (autostop_config.autostop_idle_minutes < 0 or
+                autostop_config.boot_time != psutil.boot_time()):
+            autostop_lib.set_last_active_time_to_now()
+            logger.debug('autostop_config not set. Skipped.')
+            return
+
+        ignore_idle_check = (
+            autostop_config.wait_for == autostop_lib.AutostopWaitFor.NONE)
+        is_idle = True
+        if not ignore_idle_check:
+            if not job_lib.is_cluster_idle(
+            ) or managed_job_state.get_num_alive_jobs() or (
+                    autostop_config.wait_for
+                    == autostop_lib.AutostopWaitFor.JOBS_AND_SSH and
+                    autostop_lib.has_active_ssh_sessions()):
+                is_idle = False
+
+        if ignore_idle_check or is_idle:
+            minutes_since_last_active = (
+                time.time() - autostop_lib.get_last_active_time()) // 60
+            logger.debug(
+                f'Minutes since last active: {minutes_since_last_active}, '
+                f'AutoStop idle minutes: '
+                f'{autostop_config.autostop_idle_minutes}, '
+                f'Wait for: {autostop_config.wait_for.value}')
+        else:
+            autostop_lib.set_last_active_time_to_now()
+            minutes_since_last_active = -1
+            logger.debug('Not idle. Reset idle minutes. '
+                         f'AutoStop idle minutes: '
+                         f'{autostop_config.autostop_idle_minutes}, '
+                         f'Wait for: {autostop_config.wait_for.value}')
+        if minutes_since_last_active >= autostop_config.autostop_idle_minutes:
+            logger.info(
+                f'{minutes_since_last_active} minute(s) since last active; '
+                f'threshold: {autostop_config.autostop_idle_minutes} minutes. '
+                f'Stopping.')
+            self._stop_cluster(autostop_config)
+
+    def _execute_hook_if_present(self, autostop_config) -> None:
+        """Run stored hooks via hook_executor under CAS.
+
+        Routes idle-timer-driven teardown to the right event:
+          - ``autostop.down=False`` (pause): fires ``stop`` hooks.
+          - ``autostop.down=True`` (autodown): fires ``down`` hooks
+            (same event as ``sky down`` — both are teardowns).
+
+        The CAS first-in-wins flag ensures we don't double-fire if
+        another teardown trigger (SIGTERM from preemption, etc.) has
+        already claimed this teardown.
+        """
+        event = (hook_executor.DOWN
+                 if autostop_config.down else hook_executor.STOP)
+        if not hook_executor.try_claim_teardown(event):
+            logger.info('Teardown already claimed by '
+                        f'{hook_executor.current_teardown_event()!r}; skipping '
+                        f'{event!r} hooks.')
+            return
+        hooks = autostop_lib.get_hooks()
+        if hooks:
+            logger.info(f'Executing {len(hooks)} stored lifecycle hook(s) for '
+                        f'{event!r}.')
+            hook_executor.run(event, hooks)
+
+    def _stop_cluster(self, autostop_config):
+        if (autostop_config.backend ==
+                cloud_vm_ray_backend.CloudVmRayBackend.NAME):
+            autostop_lib.set_autostopping_started()
+
+            config_path = os.path.abspath(
+                os.path.expanduser(cluster_utils.SKY_CLUSTER_YAML_REMOTE_PATH))
+            config = yaml_utils.read_yaml(config_path)
+            provider_name = cluster_utils.get_provider_name(config)
+            cloud = registry.CLOUD_REGISTRY.from_str(provider_name)
+            assert cloud is not None, f'Unknown cloud: {provider_name}'
+
+            if (cloud.PROVISIONER_VERSION >= clouds.ProvisionerVersion.
+                    RAY_PROVISIONER_SKYPILOT_TERMINATOR):
+                logger.info('Using new provisioner to stop the cluster.')
+                self._stop_cluster_with_new_provisioner(autostop_config, config,
+                                                        provider_name, cloud)
+                return
+            logger.info('Not using new provisioner to stop the cluster. '
+                        f'Cloud of this cluster: {provider_name}')
+
+            # Execute stop/down event hook if provided (for old provisioner
+            # path). The method claims the `stop` slot when autostop.down is
+            # false and the `down` slot for autodown.
+            self._execute_hook_if_present(autostop_config)
+
+            is_cluster_multinode = config['max_workers'] > 0
+
+            # Even for !is_cluster_multinode, we want to call this to replace
+            # cache_stopped_nodes.
+            self._replace_yaml_for_stopping(config_path, autostop_config.down)
+
+            # Use environment variables to disable the ray usage collection (to
+            # avoid overheads and potential issues with the usage) as sdk does
+            # not take the argument for disabling the usage collection.
+            #
+            # Also clear any cloud-specific credentials set as env vars (e.g.,
+            # AWS's two env vars). Reason: for single-node AWS SSO clusters, we
+            # have seen a weird bug where user image's /etc/profile.d may
+            # contain the two AWS env vars, and so they take effect in the
+            # bootstrap phase of each of these 3 'ray' commands, throwing a
+            # RuntimeError when some private VPC is not found (since the VPC
+            # only exists in the assumed role, not in the custome principal set
+            # by the env vars).  See #1880 for details.
+            env = dict(os.environ, RAY_USAGE_STATS_ENABLED='0')
+            env.pop('AWS_ACCESS_KEY_ID', None)
+            env.pop('AWS_SECRET_ACCESS_KEY', None)
+
+            # We do "initial ray up + ray down --workers-only" only for
+            # multinode clusters as they are not needed for single-node.
+            if is_cluster_multinode:
+                # `ray up` is required to reset the upscaling speed and min/max
+                # workers. Otherwise, `ray down --workers-only` will
+                # continuously scale down and up.
+                logger.info('Running ray up.')
+                script = (cloud_vm_ray_backend.
+                          write_ray_up_script_with_patched_launch_hash_fn(
+                              config_path,
+                              ray_up_kwargs={'restart_only': True}))
+                # Passing env inherited from os.environ is technically not
+                # needed, because we call `python <script>` rather than `ray
+                # <cmd>`. We just need the {RAY_USAGE_STATS_ENABLED: 0} part.
+                subprocess.run(f'{constants.SKY_PYTHON_CMD} {script}',
+                               check=True,
+                               shell=True,
+                               env=env)
+
+                logger.info('Running ray down.')
+                # Stop the workers first to avoid orphan workers.
+                subprocess.run(
+                    f'{constants.SKY_RAY_CMD} down -y --workers-only '
+                    f'{config_path}',
+                    check=True,
+                    shell=True,
+                    # We pass env inherited from os.environ due to calling `ray
+                    # <cmd>`.
+                    env=env)
+
+            # Stop the ray autoscaler to avoid scaling up, during
+            # stopping/terminating of the cluster. We do not rely `ray down`
+            # below for stopping ray cluster, as it will not use the correct
+            # ray path.
+            logger.info('Stopping the ray cluster.')
+            subprocess.run(f'{constants.SKY_RAY_CMD} stop',
+                           shell=True,
+                           check=True)
+
+            logger.info('Running final ray down.')
+            subprocess.run(
+                f'{constants.SKY_RAY_CMD} down -y {config_path}',
+                check=True,
+                shell=True,
+                # We pass env inherited from os.environ due to calling `ray
+                # <cmd>`.
+                env=env)
+        else:
+            raise NotImplementedError
+
+    def _stop_cluster_with_new_provisioner(self, autostop_config,
+                                           cluster_config, provider_name,
+                                           cloud):
+        # pylint: disable=import-outside-toplevel
+        from sky import provision as provision_lib
+        autostop_lib.set_autostopping_started()
+
+        # Execute stop/down event hook if provided. The method claims the
+        # `stop` slot when autostop.down is false and the `down` slot for
+        # autodown.
+        self._execute_hook_if_present(autostop_config)
+
+        cluster_name_on_cloud = cluster_config['cluster_name']
+        is_cluster_multinode = cluster_config['max_workers'] > 0
+
+        # Clear AWS credentials from environment to force boto3 to use IAM
+        # role attached to the instance (lowest priority in credential chain).
+        # This allows the cluster to stop/terminate itself using its IAM role.
+        os.environ.pop('AWS_ACCESS_KEY_ID', None)
+        os.environ.pop('AWS_SECRET_ACCESS_KEY', None)
+        os.environ.pop('AWS_SESSION_TOKEN', None)
+        # Point boto3 to /dev/null to skip reading credentials from files.
+        os.environ['AWS_SHARED_CREDENTIALS_FILE'] = '/dev/null'
+        os.environ['AWS_CONFIG_FILE'] = '/dev/null'
+
+        # Stop the ray autoscaler to avoid scaling up, during
+        # stopping/terminating of the cluster.
+        if not cloud.uses_ray():
+            logger.info('Skipping ray stop as cloud does not use Ray.')
+        else:
+            logger.info('Stopping the ray cluster.')
+            subprocess.run(f'{constants.SKY_RAY_CMD} stop',
+                           shell=True,
+                           check=True)
+
+        operation_fn = provision_lib.stop_instances
+        if autostop_config.down:
+            operation_fn = provision_lib.terminate_instances
+
+        # For Kubernetes autodown, leave a durable Event breadcrumb on the
+        # cluster before deleting the pods. The pod can finish autodowning
+        # between two server-side status refreshes, in which case the refresh
+        # never observes the AUTOSTOPPING state; the server reads this event
+        # back to still attribute the termination to autostop. Best-effort.
+        if autostop_config.down and isinstance(cloud, clouds.Kubernetes):
+            # pylint: disable=import-outside-toplevel
+            from sky.provision.kubernetes import instance as k8s_instance
+            k8s_instance.emit_autostop_event_best_effort(
+                cluster_config['provider'], cluster_name_on_cloud)
+
+        if is_cluster_multinode:
+            logger.info('Terminating worker nodes first.')
+            try:
+                operation_fn(provider_name=provider_name,
+                             cluster_name_on_cloud=cluster_name_on_cloud,
+                             provider_config=cluster_config['provider'],
+                             worker_only=True)
+            except Exception as e:  # pylint: disable=broad-except
+                if not autostop_config.down:
+                    raise
+                # For autodown, a worker-only failure (e.g. a timed-out wait
+                # for a worker that is slow to delete) must not leave the head
+                # running: the full termination below also covers the
+                # workers, while re-raising would hit the same failure on
+                # every retry.
+                logger.warning(f'Failed to terminate worker nodes: {e}. '
+                               'Continuing to terminate the whole cluster.')
+        logger.info('Terminating head node.')
+        operation_fn(provider_name=provider_name,
+                     cluster_name_on_cloud=cluster_name_on_cloud,
+                     provider_config=cluster_config['provider'])
+
+    def _replace_yaml_for_stopping(self, yaml_path: str, down: bool):
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            yaml_str = f.read()
+        yaml_str = self._UPSCALING_PATTERN.sub(r'upscaling_speed: 0', yaml_str)
+        if down:
+            yaml_str = self._CATCH_NODES.sub(r'cache_stopped_nodes: false',
+                                             yaml_str)
+        else:
+            yaml_str = self._CATCH_NODES.sub(r'cache_stopped_nodes: true',
+                                             yaml_str)
+        config = yaml_utils.safe_load(yaml_str)
+        # Set the private key with the existed key on the remote instance.
+        config['auth']['ssh_private_key'] = '~/ray_bootstrap_key.pem'
+        # NOTE: We must do this, otherwise with ssh_proxy_command still under
+        # 'auth:', `ray up ~/.sky/sky_ray.yaml` on the head node will fail (in
+        # general, the clusters do not need or have the proxy set up).
+        #
+        # Note also that this is ok only because in the local client ->
+        # provision head node code path, we have monkey patched
+        # hash_launch_conf() to exclude ssh_proxy_command from the hash
+        # calculation for the head node. Therefore when this current code is
+        # run again on the head, the hash would match the one at head's
+        # creation (otherwise the head node would be stopped and a new one
+        # would be launched).
+        config['auth'].pop('ssh_proxy_command', None)
+        # Empty the file_mounts.
+        config['file_mounts'] = {}
+        yaml_utils.dump_yaml(yaml_path, config)
+        logger.debug('Replaced upscaling speed to 0.')

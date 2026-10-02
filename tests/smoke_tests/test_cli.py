@@ -1,0 +1,539 @@
+# Smoke tests for SkyPilot for CLI output
+# Default options are set in pyproject.toml
+# Example usage:
+# Run all tests except for AWS and Lambda Cloud
+# > pytest tests/smoke_tests/test_cli.py
+#
+# Terminate failed clusters after test finishes
+# > pytest tests/smoke_tests/test_cli.py --terminate-on-failure
+
+import tempfile
+import textwrap
+from unittest import mock
+from urllib import parse
+
+import pytest
+from smoke_tests import smoke_tests_utils
+from smoke_tests.docker import docker_utils
+
+import sky
+from sky import skypilot_config
+from sky.client import sdk
+from sky.server import common as server_common
+from sky.skylet import constants
+from sky.utils import common_utils
+
+# Check that `sky storage delete` removed the bucket AND that it stays
+# removed. Two lessons baked in (root-caused via CloudTrail, see #10353):
+#   1. The managed-job controller's post-job cleanup used to re-create the
+#      just-deleted bucket a few seconds after deletion (construct() on the
+#      task's storage mounts auto-creates missing buckets). A one-shot
+#      existence check right after delete races ahead of the recreation and
+#      false-passes, silently leaking the bucket. So after the bucket is
+#      first observed gone, hold the assertion open for another 60s and fail
+#      if it reappears.
+#   2. Use `get-bucket-location` rather than `head-bucket`: cross-region
+#      head-bucket keeps returning a redirect the CLI reports as success for
+#      a window after deletion, and this check may run on a cloud-cmd
+#      cluster whose default region differs from the bucket's.
+_CHECK_AWS_BUCKET_DOESNT_EXIST = (
+    'start=$SECONDS; '
+    'while aws s3api get-bucket-location --bucket {bucket_name} '
+    '>/dev/null 2>&1; do '
+    'if (( SECONDS - start > 120 )); then '
+    'echo "Bucket {bucket_name} still exists 120s after deletion"; '
+    'aws sts get-caller-identity || true; '
+    'aws s3api get-bucket-location --bucket {bucket_name} || true; '
+    'exit 1; fi; '
+    'echo "Bucket {bucket_name} still resolves, waiting..."; sleep 5; '
+    'done; '
+    'echo "Bucket {bucket_name} gone; verifying it stays gone '
+    '(no recreation)..."; '
+    'for i in 1 2 3 4 5 6; do '
+    'sleep 10; '
+    'if aws s3api get-bucket-location --bucket {bucket_name} '
+    '>/dev/null 2>&1; then '
+    'echo "Bucket {bucket_name} REAPPEARED after deletion (recreated at '
+    '+$((SECONDS-start))s)"; exit 1; fi; '
+    'done; '
+    'echo "Bucket {bucket_name} confirmed deleted and not recreated."; '
+    'exit 0')
+
+
+@pytest.mark.no_remote_server
+def test_endpoint_output_basic(generic_cloud: str):
+    """Test that sky api info endpoint output is correct."""
+    name = smoke_tests_utils.get_cluster_name()
+    test = smoke_tests_utils.Test('endpoint_output_basic', [
+        f's=$(SKYPILOT_DEBUG=0 sky launch -y -c {name} {smoke_tests_utils.LOW_RESOURCE_ARG} --infra {generic_cloud} tests/test_yamls/minimal.yaml) && {smoke_tests_utils.VALIDATE_LAUNCH_OUTPUT}',
+        f's=$(SKYPILOT_DEBUG=0 sky api info | tee /dev/stderr) && echo "\n===Validating endpoint output===" && echo "$s" | grep "Endpoint set to default local API server."',
+    ],
+                                  timeout=smoke_tests_utils.get_timeout(
+                                      generic_cloud),
+                                  teardown=f'sky down -y {name}')
+    smoke_tests_utils.run_one_test(test)
+
+
+@pytest.mark.no_remote_server
+def test_endpoint_output_basic_no_pg_conn_closed_errors(generic_cloud: str):
+    """Test that sky api info endpoint output is correct and no pg conn closed errors are raised."""
+    name = smoke_tests_utils.get_cluster_name()
+    test = smoke_tests_utils.Test(
+        'endpoint_output_basic_no_pg_conn_closed_errors', [
+            f's=$(SKYPILOT_DEBUG=0 sky launch -y -c {name} {smoke_tests_utils.LOW_RESOURCE_ARG} --infra {generic_cloud} tests/test_yamls/minimal.yaml) && {smoke_tests_utils.VALIDATE_LAUNCH_OUTPUT_NO_PG_CONN_CLOSED_ERROR}',
+        ],
+        timeout=smoke_tests_utils.get_timeout(generic_cloud),
+        teardown=f'sky down -y {name}')
+    smoke_tests_utils.run_one_test(test)
+
+
+@pytest.mark.no_remote_server
+def test_endpoint_output_config(generic_cloud: str):
+    """Test that sky api info endpoint output is correct when config is set."""
+
+    endpoint = server_common.get_default_server_url()
+
+    config = textwrap.dedent(f"""
+    api_server:
+        endpoint: {endpoint}
+    """)
+
+    with tempfile.NamedTemporaryFile(delete=True) as f:
+        f.write(config.encode('utf-8'))
+        f.flush()
+
+        name = smoke_tests_utils.get_cluster_name()
+        test = smoke_tests_utils.Test('endpoint_output_config', [
+            f's=$(SKYPILOT_DEBUG=0 sky launch -y -c {name} {smoke_tests_utils.LOW_RESOURCE_ARG} --infra {generic_cloud} tests/test_yamls/minimal.yaml) && {smoke_tests_utils.VALIDATE_LAUNCH_OUTPUT}',
+            f's=$(SKYPILOT_DEBUG=0 sky api info | tee /dev/stderr) && echo "\n===Validating endpoint output===" && echo "$s" | grep "Endpoint set via {f.name}"',
+        ],
+                                      timeout=smoke_tests_utils.get_timeout(
+                                          generic_cloud),
+                                      teardown=f'sky down -y {name}',
+                                      env={
+                                          skypilot_config.ENV_VAR_GLOBAL_CONFIG:
+                                              f.name
+                                      })
+
+        smoke_tests_utils.run_one_test(test, check_sky_status=False)
+
+
+@pytest.mark.no_remote_server
+def test_endpoint_output_env(generic_cloud: str):
+    """Test that sky api info output is correct when env endpoint is set."""
+    name = smoke_tests_utils.get_cluster_name()
+    expected_string = f"Endpoint set via the environment variable {constants.SKY_API_SERVER_URL_ENV_VAR}"
+    test = smoke_tests_utils.Test('endpoint_output_env', [
+        f's=$(SKYPILOT_DEBUG=0 sky launch -y -c {name} {smoke_tests_utils.LOW_RESOURCE_ARG} --infra {generic_cloud} tests/test_yamls/minimal.yaml) && {smoke_tests_utils.VALIDATE_LAUNCH_OUTPUT}',
+        f's=$(SKYPILOT_DEBUG=0 sky api info | tee /dev/stderr) && echo "\n===Validating endpoint output===" && echo "Expecting to see: {expected_string}\n" && echo "$s" | grep "{expected_string}"',
+    ],
+                                  timeout=smoke_tests_utils.get_timeout(
+                                      generic_cloud),
+                                  teardown=f'sky down -y {name}',
+                                  env={
+                                      constants.SKY_API_SERVER_URL_ENV_VAR:
+                                          server_common.get_default_server_url(
+                                          )
+                                  })
+    smoke_tests_utils.run_one_test(test)
+
+
+@pytest.mark.no_remote_server
+def test_sky_logout_wih_env_endpoint(generic_cloud: str):
+    """Test that sky api logout with env endpoint fails."""
+    test = smoke_tests_utils.Test(
+        'sky_logout_wih_env_endpoint', [
+            f's=$(SKYPILOT_DEBUG=0 sky api logout 2>&1 | tee /dev/stderr) && echo "\n===Validating endpoint output===" && echo "$s" | grep "Cannot logout of API server when the endpoint is set via the environment variable. Run unset"',
+        ],
+        timeout=smoke_tests_utils.get_timeout(generic_cloud),
+        env={
+            constants.SKY_API_SERVER_URL_ENV_VAR: "https://SUPERFAKE_ENDPOINT.unreachable"
+        })
+    smoke_tests_utils.run_one_test(test, check_sky_status=False)
+
+
+@pytest.mark.no_remote_server
+def test_sky_login_wih_env_endpoint(generic_cloud: str):
+    """Test that sky api login uses the env endpoint, unless -e conflicts."""
+    test = smoke_tests_utils.Test(
+        'sky_login_wih_env_endpoint',
+        [
+            # A different -e is ambiguous, so it is rejected.
+            f's=$(SKYPILOT_DEBUG=0 sky api login -e https://OTHERFAKE_ENDPOINT.unreachable 2>&1 | tee /dev/stderr) && echo "\n===Validating endpoint output===" && echo "$s" | grep "the endpoint is already set to https://SUPERFAKE_ENDPOINT.unreachable by the environment variable"',
+            # Without -e, the env endpoint is used, so login gets as far as
+            # connecting to it (and fails, since it does not exist).
+            f's=$(SKYPILOT_DEBUG=0 sky api login 2>&1 | tee /dev/stderr) && echo "\n===Validating endpoint output===" && echo "$s" | grep "Using endpoint from {constants.SKY_API_SERVER_URL_ENV_VAR}: https://SUPERFAKE_ENDPOINT.unreachable" && echo "$s" | grep "Could not connect to SkyPilot API server at https://SUPERFAKE_ENDPOINT.unreachable"',
+        ],
+        timeout=smoke_tests_utils.get_timeout(generic_cloud),
+        env={
+            constants.SKY_API_SERVER_URL_ENV_VAR: "https://SUPERFAKE_ENDPOINT.unreachable"
+        })
+    smoke_tests_utils.run_one_test(test, check_sky_status=False)
+
+
+@pytest.mark.no_remote_server
+def test_cli_invalid_config_details(generic_cloud: str):
+    """Test that invalid config overrides surface detailed CLI errors."""
+    invalid_override = 'gcp.label.smoke-test=test-value'
+    details_msg = 'Details: Invalid config YAML from (CLI).'
+    suggestion_msg = "Instead of 'label', did you mean 'labels'?"
+    command = (
+        's=$(SKYPILOT_DEBUG=0 sky launch --config '
+        f'{invalid_override} tests/test_yamls/minimal.yaml 2>&1 | tee /dev/stderr) && '
+        'echo "\\n===Validating config error details===\\n" && '
+        f'echo "$s" | grep "{details_msg}" && '
+        f'echo "$s" | grep "{suggestion_msg}"')
+
+    test = smoke_tests_utils.Test(
+        'cli_invalid_config_details', [command],
+        timeout=smoke_tests_utils.get_timeout(generic_cloud))
+    smoke_tests_utils.run_one_test(test, check_sky_status=False)
+
+
+def test_cli_auto_retry(generic_cloud: str):
+    """Test that cli auto retry works."""
+    name = smoke_tests_utils.get_cluster_name()
+    port = common_utils.find_free_port(23456)
+    server_url = smoke_tests_utils.get_api_server_url()
+    parsed = parse.urlparse(server_url)
+    if parsed.scheme == 'https':
+        pytest.skip(
+            'chaos_proxy does not support HTTPS upstreams; the test cannot '
+            'exercise CLI auto-retry with a TLS API server endpoint.')
+    api_proxy_url = f'http://127.0.0.1:{port}'
+    if parsed.username and parsed.password:
+        api_proxy_url = f'http://{parsed.username}:{parsed.password}@127.0.0.1:{port}'
+    run_command = 'for i in {1..120}; do echo "output $i" && sleep 1; done'
+    job_run_command = 'for i in {1..60}; do echo "job output $i" && sleep 1; done'
+    test = smoke_tests_utils.Test(
+        'cli_auto_retry',
+        [
+            # Chaos proxy kills TCP connections roughly every 30 seconds.
+            # The +/-10s jitter keeps the kill schedule from phase-locking
+            # to the client's reconnect cadence: without it, a kill landing
+            # in the small window between the job finishing and the log
+            # stream closing repeats on every attempt (the job runtime and
+            # reconnect timing are ~deterministic), turning a rare race into
+            # a deterministic failure. See #9246.
+            f'python tests/chaos/chaos_proxy.py --port {port} --interval 30 --jitter 10 & echo $! > /tmp/{name}-chaos.pid',
+            # Wait until the proxy is actually listening on the port. The
+            # background `&` returns control immediately and on slower CI
+            # workers the first sky-launch would otherwise race the proxy
+            # startup and fail with ApiServerConnectionError before any
+            # connection is ever established.
+            f'for i in $(seq 1 30); do (echo > /dev/tcp/127.0.0.1/{port}) >/dev/null 2>&1 && break; sleep 0.5; done',
+            # Both launch streaming and logs streaming should survive the chaos.
+            f'SKYPILOT_API_SERVER_ENDPOINT={api_proxy_url} sky launch -y -c {name} {smoke_tests_utils.LOW_RESOURCE_ARG} --infra {generic_cloud} \'{run_command}\'',
+            # Test managed job controller logs streaming through the chaos
+            # proxy. Launch a job that runs long enough (~60s) to survive at
+            # least one connection drop (30s interval), then verify
+            # sky jobs logs --controller in follow mode completes successfully.
+            f'SKYPILOT_API_SERVER_ENDPOINT={api_proxy_url} sky jobs launch -n {name} --infra {generic_cloud} {smoke_tests_utils.LOW_RESOURCE_ARG} -y -d \'{job_run_command}\'',
+            # Exercise the *resumable* log streaming path. `sky jobs logs
+            # --tail 0` (without --controller) tails job output with
+            # `tail=0`, which the SDK maps to `resumable=True` (see
+            # sky/jobs/client/sdk.py::tail_logs). After a chaos-proxy
+            # disconnect the server replays from line 1; the client must
+            # skip already-printed lines via RetryContext.line_processed
+            # rather than double-printing them. Default `--controller`
+            # paths use `--tail 1000` (`resumable=False`) and don't cover
+            # this branch.
+            f'SKYPILOT_API_SERVER_ENDPOINT={api_proxy_url} sky jobs logs --tail 0 -n {name}',
+            f'SKYPILOT_API_SERVER_ENDPOINT={api_proxy_url} sky jobs logs --controller -n {name}',
+            f'kill $(cat /tmp/{name}-chaos.pid)',
+        ],
+        timeout=smoke_tests_utils.get_timeout(generic_cloud),
+        teardown=(f'sky down -y {name}; sky jobs cancel -y -n {name};'
+                  f' kill $(cat /tmp/{name}-chaos.pid) || true'))
+    smoke_tests_utils.run_one_test(test)
+
+
+@pytest.mark.aws
+def test_storage_delete(generic_cloud: str):
+    """Test that storage delete works."""
+    name = smoke_tests_utils.get_cluster_name()
+    bucket_name = f'{name}-bucket'
+    bucket_job_yaml = textwrap.dedent(f"""
+    name: {name}-job
+    resources:
+        cpus: 2
+        infra: aws
+    file_mounts:
+        /output:
+            name: {bucket_name}
+            mode: MOUNT
+            store: s3
+    run: |
+        echo "Data" > /output/data.txt
+    """)
+    with tempfile.NamedTemporaryFile(delete=True) as job_yaml:
+        job_yaml.write(bucket_job_yaml.encode('utf-8'))
+        job_yaml.flush()
+
+        test = smoke_tests_utils.Test('storage_delete', [
+            f'echo "bucket name: {bucket_name}"',
+            smoke_tests_utils.launch_cluster_for_cloud_cmd(
+                'aws', name, skip_remote_server_check=True),
+            f's=$(SKYPILOT_DEBUG=0 sky jobs launch -y {job_yaml.name}) && echo "$s" | grep "Job finished (status: SUCCEEDED)."',
+            f's=$(SKYPILOT_DEBUG=0 sky storage delete -y {bucket_name}) && echo "$s" && echo "$s" | grep "Deleted S3 bucket {bucket_name}"',
+            smoke_tests_utils.run_cloud_cmd_on_cluster(
+                name,
+                cmd=_CHECK_AWS_BUCKET_DOESNT_EXIST.format(
+                    bucket_name=bucket_name)),
+        ],
+                                      teardown=smoke_tests_utils.
+                                      down_cluster_for_cloud_cmd(
+                                          name, skip_remote_server_check=True),
+                                      timeout=smoke_tests_utils.get_timeout(
+                                          generic_cloud))
+        smoke_tests_utils.run_one_test(test, check_sky_status=False)
+
+
+def test_debug_dump_recent(generic_cloud: str):
+    """Test sky debug-dump --recent-minutes flag creates a valid dump."""
+    test = smoke_tests_utils.Test(
+        'debug_dump_recent',
+        [
+            # Any positive value works for --recent-minutes: the server always
+            # injects a handful of system daemon request IDs into every dump
+            # regardless of the time window, so request_count > 0 is always
+            # satisfied. We use 5 rather than 60 because on a shared CI server
+            # that runs tests continuously, a 60-minute window collects
+            # thousands of user requests and takes 5+ minutes to zip up,
+            # blowing the per-command timeout.
+            'sky debug-dump --recent-minutes 5 --output /tmp/test_debug_dump_recent.zip',
+            # Verify the zip file was created and is a valid zip
+            'test -f /tmp/test_debug_dump_recent.zip',
+            's=$(unzip -l /tmp/test_debug_dump_recent.zip) && echo "$s" && '
+            'echo "$s" | grep "summary.json" && '
+            'echo "$s" | grep "server_info.json" && '
+            'echo "$s" | grep "errors.json"',
+            # Extract and verify summary.json structure
+            'unzip -o /tmp/test_debug_dump_recent.zip'
+            ' -d /tmp/test_debug_dump_recent && '
+            'cd /tmp/test_debug_dump_recent/debug_dump_* && '
+            's=$(cat summary.json) && echo "$s" && '
+            'echo "$s" | python3 -c "'
+            'import sys, json; d = json.load(sys.stdin); '
+            'assert \\\"requested\\\" in d; '
+            'assert \\\"collected\\\" in d; '
+            'assert d[\\\"collected\\\"][\\\"request_count\\\"] > 0, '
+            '\\\"system daemon requests should always be collected\\\"; '
+            '"',
+            # Verify server_info.json has enriched fields
+            'cd /tmp/test_debug_dump_recent/debug_dump_* && '
+            's=$(cat server_info.json) && echo "$s" && '
+            'echo "$s" | python3 -c "'
+            'import sys, json; d = json.load(sys.stdin); '
+            'assert \\\"skypilot_version\\\" in d; '
+            'assert \\\"python_version\\\" in d; '
+            'assert \\\"os_platform\\\" in d; '
+            'assert \\\"dump_timestamp_human\\\" in d; '
+            'assert isinstance(d[\\\"enabled_clouds\\\"], dict), '
+            '\\\"enabled_clouds should be a dict keyed by workspace\\\"; '
+            'assert len(d[\\\"enabled_clouds\\\"]) > 0; '
+            '"',
+        ],
+        teardown='rm -f /tmp/test_debug_dump_recent.zip && '
+        'rm -rf /tmp/test_debug_dump_recent',
+        # On shared staging servers the dump collects active managed jobs via
+        # controller SSH, which takes several minutes. 10 minutes is safe.
+        timeout=10 * 60,
+    )
+    smoke_tests_utils.run_one_test(test)
+
+
+def test_debug_dump_cluster(generic_cloud: str):
+    """Test sky debug-dump -c flag with a real cluster."""
+    name = smoke_tests_utils.get_cluster_name()
+    test = smoke_tests_utils.Test(
+        'debug_dump_cluster',
+        [
+            # Launch a minimal cluster
+            f'sky launch -y -c {name}'
+            f' {smoke_tests_utils.LOW_RESOURCE_ARG}'
+            f' --infra {generic_cloud} tests/test_yamls/minimal.yaml',
+            # Create a debug dump for the cluster
+            f'sky debug-dump -c {name}'
+            ' --output /tmp/test_debug_dump_cluster.zip',
+            # Verify the cluster directory exists in the dump
+            's=$(unzip -l /tmp/test_debug_dump_cluster.zip) && echo "$s" && '
+            f'echo "$s" | grep "clusters/{name}/cluster_info.json" && '
+            'echo "$s" | grep "requests/" && '
+            'echo "$s" | grep "summary.json"',
+            # Extract and verify cluster_info.json
+            'unzip -o /tmp/test_debug_dump_cluster.zip'
+            ' -d /tmp/test_debug_dump_cluster && '
+            'cd /tmp/test_debug_dump_cluster/debug_dump_* && '
+            f's=$(cat clusters/{name}/cluster_info.json) && echo "$s" && '
+            'echo "$s" | python3 -c "'
+            'import sys, json; d = json.load(sys.stdin); '
+            'assert \\\"name\\\" in d; '
+            'assert \\\"status\\\" in d; '
+            '"',
+            # Verify summary shows the cluster was collected
+            'cd /tmp/test_debug_dump_cluster/debug_dump_* && '
+            's=$(cat summary.json) && echo "$s" && '
+            'echo "$s" | python3 -c "'
+            'import sys, json; d = json.load(sys.stdin); '
+            f'assert \\\"{name}\\\" in d[\\\"collected\\\"][\\\"cluster_names\\\"]; '
+            'assert d[\\\"collected\\\"][\\\"cluster_count\\\"] >= 1; '
+            # Cross-linked requests from the launch should be present
+            'assert d[\\\"collected\\\"][\\\"request_count\\\"] > 0; '
+            '"',
+        ],
+        teardown=f'sky down -y {name} && '
+        'rm -f /tmp/test_debug_dump_cluster.zip && '
+        'rm -rf /tmp/test_debug_dump_cluster',
+        timeout=smoke_tests_utils.get_timeout(generic_cloud),
+    )
+    smoke_tests_utils.run_one_test(test)
+
+
+def test_debug_dump_request_id(generic_cloud: str):
+    """Test sky debug-dump -r flag with a real request ID."""
+    name = smoke_tests_utils.get_cluster_name()
+    test = smoke_tests_utils.Test(
+        'debug_dump_request_id',
+        [
+            # Launch a cluster and capture the request ID
+            f'sky launch -y -c {name} --async'
+            f' {smoke_tests_utils.LOW_RESOURCE_ARG}'
+            f' --infra {generic_cloud} tests/test_yamls/minimal.yaml'
+            ' | tee /tmp/test_debug_dump_reqid_launch.txt',
+            # Extract request ID from async output
+            # Output format: "Submitted sky.launch request: <uuid>"
+            'req_id=$(grep "Submitted.*request:" /tmp/test_debug_dump_reqid_launch.txt'
+            ' | head -1 | sed "s/.*request: //") && '
+            'echo "Captured request ID: $req_id" && '
+            'test -n "$req_id" && '
+            # Wait for the request to finish
+            f'sky launch -y -c {name}'
+            f' {smoke_tests_utils.LOW_RESOURCE_ARG}'
+            f' --infra {generic_cloud} tests/test_yamls/minimal.yaml',
+            # Create a debug dump for the request ID
+            'req_id=$(grep "Submitted.*request:" /tmp/test_debug_dump_reqid_launch.txt'
+            ' | head -1 | sed "s/.*request: //") && '
+            'sky debug-dump -r "$req_id"'
+            ' --output /tmp/test_debug_dump_reqid.zip',
+            # Verify the request directory exists in the dump
+            'req_id=$(grep "Submitted.*request:" /tmp/test_debug_dump_reqid_launch.txt'
+            ' | head -1 | sed "s/.*request: //") && '
+            's=$(unzip -l /tmp/test_debug_dump_reqid.zip) && echo "$s" && '
+            'echo "$s" | grep "requests/$req_id/request_info.json"',
+            # Verify request_info.json contents
+            'req_id=$(grep "Submitted.*request:" /tmp/test_debug_dump_reqid_launch.txt'
+            ' | head -1 | sed "s/.*request: //") && '
+            'unzip -o /tmp/test_debug_dump_reqid.zip'
+            ' -d /tmp/test_debug_dump_reqid && '
+            'cd /tmp/test_debug_dump_reqid/debug_dump_* && '
+            's=$(cat requests/$req_id/request_info.json) && echo "$s" && '
+            'echo "$s" | python3 -c "'
+            'import sys, json; d = json.load(sys.stdin); '
+            'assert \\\"request_id\\\" in d; '
+            'assert \\\"name\\\" in d; '
+            'assert \\\"status\\\" in d; '
+            '"',
+        ],
+        teardown=f'sky down -y {name} && '
+        'rm -f /tmp/test_debug_dump_reqid.zip '
+        '/tmp/test_debug_dump_reqid_launch.txt && '
+        'rm -rf /tmp/test_debug_dump_reqid',
+        timeout=smoke_tests_utils.get_timeout(generic_cloud),
+    )
+    smoke_tests_utils.run_one_test(test)
+
+
+def test_debug_dump_job(generic_cloud: str):
+    """Test sky debug-dump -j flag with a real managed job."""
+    name = smoke_tests_utils.get_cluster_name()
+    test = smoke_tests_utils.Test(
+        'debug_dump_job',
+        [
+            # Launch a managed job
+            f'sky jobs launch -y -n {name}'
+            f' {smoke_tests_utils.LOW_RESOURCE_ARG}'
+            f' --infra {generic_cloud} -- echo hello',
+            smoke_tests_utils.
+            get_cmd_wait_until_managed_job_status_contains_matching_job_name(
+                job_name=name,
+                job_status=[sky.ManagedJobStatus.SUCCEEDED],
+                timeout=smoke_tests_utils.get_timeout(generic_cloud)),
+            # Get the job ID
+            f'job_id=$(sky jobs queue | grep {name}'
+            ' | head -1 | awk \'{print $1}\') && '
+            'echo "Job ID: $job_id" && test -n "$job_id" && '
+            # Create a debug dump for the managed job
+            'sky debug-dump -j "$job_id"'
+            ' --output /tmp/test_debug_dump_job.zip',
+            # Verify the managed_jobs directory exists in the dump
+            f'job_id=$(sky jobs queue | grep {name}'
+            ' | head -1 | awk \'{print $1}\') && '
+            's=$(unzip -l /tmp/test_debug_dump_job.zip) && echo "$s" && '
+            'echo "$s" | grep "managed_jobs/" && '
+            'echo "$s" | grep "summary.json"',
+            # Verify summary shows the managed job was collected
+            'unzip -o /tmp/test_debug_dump_job.zip'
+            ' -d /tmp/test_debug_dump_job && '
+            'cd /tmp/test_debug_dump_job/debug_dump_* && '
+            's=$(cat summary.json) && echo "$s" && '
+            'echo "$s" | python3 -c "'
+            'import sys, json; d = json.load(sys.stdin); '
+            'assert d[\\\"collected\\\"][\\\"managed_job_count\\\"] >= 1; '
+            '"',
+        ],
+        teardown=f'sky jobs cancel -y -n {name} || true && '
+        'rm -f /tmp/test_debug_dump_job.zip && '
+        'rm -rf /tmp/test_debug_dump_job',
+        timeout=smoke_tests_utils.get_timeout(generic_cloud) + 2 * 60,
+    )
+    smoke_tests_utils.run_one_test(test)
+
+
+def test_debug_dump_no_args(generic_cloud: str):
+    """Test that sky debug-dump with no arguments shows usage error."""
+    test = smoke_tests_utils.Test(
+        'debug_dump_no_args',
+        [
+            'sky debug-dump > /tmp/test_debug_dump_noargs.txt 2>&1;'
+            ' grep -qi "at least one of" /tmp/test_debug_dump_noargs.txt',
+        ],
+        teardown='rm -f /tmp/test_debug_dump_noargs.txt',
+        timeout=2 * 60,
+    )
+    smoke_tests_utils.run_one_test(test)
+
+
+def test_debug_dump_nonexistent_resources(generic_cloud: str):
+    """Test debug-dump with nonexistent cluster and request IDs."""
+    test = smoke_tests_utils.Test(
+        'debug_dump_nonexistent_resources',
+        [
+            # Should succeed even with nonexistent resources
+            'sky debug-dump -c nonexistent-cluster-xyz'
+            ' -r nonexistent-request-xyz'
+            ' --output /tmp/test_debug_dump_nonexistent.zip',
+            # Verify the zip file was created and is valid
+            'test -f /tmp/test_debug_dump_nonexistent.zip',
+            's=$(unzip -l /tmp/test_debug_dump_nonexistent.zip) && echo "$s"'
+            ' && echo "$s" | grep "summary.json"'
+            ' && echo "$s" | grep "errors.json"',
+            # Verify summary records the requested resources
+            'rm -rf /tmp/test_debug_dump_nonexistent_d && '
+            'unzip -o /tmp/test_debug_dump_nonexistent.zip'
+            ' -d /tmp/test_debug_dump_nonexistent_d && '
+            'cd /tmp/test_debug_dump_nonexistent_d/debug_dump_* && '
+            's=$(cat summary.json) && echo "$s" && '
+            'echo "$s" | python3 -c "'
+            'import sys, json; d = json.load(sys.stdin); '
+            'assert \\\"nonexistent-cluster-xyz\\\" in '
+            'd[\\\"requested\\\"][\\\"cluster_names\\\"]; '
+            'assert \\\"nonexistent-request-xyz\\\" in '
+            'd[\\\"requested\\\"][\\\"request_ids\\\"]; '
+            '"',
+        ],
+        teardown='rm -f /tmp/test_debug_dump_nonexistent.zip && '
+        'rm -rf /tmp/test_debug_dump_nonexistent_d',
+        timeout=2 * 60,
+    )
+    smoke_tests_utils.run_one_test(test)

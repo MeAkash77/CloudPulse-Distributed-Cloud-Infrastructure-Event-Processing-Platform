@@ -1,0 +1,245 @@
+syntax = "proto3";
+
+package managed_jobs.v1;
+
+service ManagedJobsService {
+  // Get controller version.
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+  // Get the managed job queue with advanced filtering.
+  rpc GetJobTable(GetJobTableRequest) returns (GetJobTableResponse);
+  // Get all job IDs by name.
+  rpc GetAllJobIdsByName(GetAllJobIdsByNameRequest) returns (GetAllJobIdsByNameResponse);
+  // Cancel managed jobs.
+  rpc CancelJobs(CancelJobsRequest) returns (CancelJobsResponse);
+  // Stream managed job logs.
+  rpc StreamLogs(StreamLogsRequest) returns (stream StreamLogsResponse);
+}
+
+enum ManagedJobStatus {
+  MANAGED_JOB_STATUS_UNSPECIFIED = 0;
+  MANAGED_JOB_STATUS_PENDING = 1;
+  MANAGED_JOB_STATUS_SUBMITTED = 2;
+  MANAGED_JOB_STATUS_STARTING = 3;
+  MANAGED_JOB_STATUS_RUNNING = 4;
+  MANAGED_JOB_STATUS_RECOVERING = 5;
+  MANAGED_JOB_STATUS_CANCELLING = 6;
+  MANAGED_JOB_STATUS_SUCCEEDED = 7;
+  MANAGED_JOB_STATUS_CANCELLED = 8;
+  MANAGED_JOB_STATUS_FAILED = 9;
+  MANAGED_JOB_STATUS_FAILED_SETUP = 10;
+  MANAGED_JOB_STATUS_FAILED_PRECHECKS = 11;
+  MANAGED_JOB_STATUS_FAILED_NO_RESOURCE = 12;
+  MANAGED_JOB_STATUS_FAILED_CONTROLLER = 13;
+  MANAGED_JOB_STATUS_WINDING_DOWN = 14;
+}
+
+enum ManagedJobScheduleState {
+  MANAGED_JOB_SCHEDULE_STATE_UNSPECIFIED = 0;
+  // Old servers mapped `None` to INVALID, instead of omitting the field. Keep
+  // the enum value so we can deserialize the response properly. On the client,
+  // this should be mapped to `None` / missing field. See #8105.
+  // TODO(cooperc): Remove in 0.13.0
+  DEPRECATED_MANAGED_JOB_SCHEDULE_STATE_INVALID = 1 [deprecated = true];
+  MANAGED_JOB_SCHEDULE_STATE_INACTIVE = 2;
+  MANAGED_JOB_SCHEDULE_STATE_WAITING = 3;
+  MANAGED_JOB_SCHEDULE_STATE_ALIVE_WAITING = 4;
+  MANAGED_JOB_SCHEDULE_STATE_LAUNCHING = 5;
+  MANAGED_JOB_SCHEDULE_STATE_ALIVE_BACKOFF = 6;
+  MANAGED_JOB_SCHEDULE_STATE_ALIVE = 7;
+  MANAGED_JOB_SCHEDULE_STATE_DONE = 8;
+}
+
+message JobIds {
+  repeated int64 ids = 1;
+}
+
+message UserHashes {
+  repeated string hashes = 1;
+}
+
+message Statuses {
+  repeated string statuses = 1;
+}
+
+message Fields {
+  repeated string fields = 1;
+}
+
+message Workspaces {
+  repeated string workspaces = 1;
+}
+
+message GetVersionRequest {}
+
+message GetVersionResponse {
+  string controller_version = 1;
+}
+
+message GetJobTableRequest {
+  bool skip_finished = 1;
+  optional Workspaces accessible_workspaces = 2;
+  optional JobIds job_ids = 3;
+  optional string workspace_match = 4;
+  optional string name_match = 5;
+  optional string pool_match = 6;
+  optional int32 page = 7;
+  optional int32 limit = 8;
+  optional UserHashes user_hashes = 9;
+  optional Statuses statuses = 10;
+  bool show_jobs_without_user_hash = 11;
+  optional Fields fields = 12;
+  // Sorting parameters, added in ManagedJobsService v14.
+  optional string sort_by = 13;
+  optional string sort_order = 14;
+  // Time-range filter on submitted_at (epoch seconds), added in
+  // ManagedJobsService v22.
+  optional double submitted_after = 15;
+  optional double submitted_before = 16;
+  // `--infra` spec to filter on, added in ManagedJobsService v24. A server
+  // that predates it ignores this field, so the response reports back whether
+  // it was honoured rather than leaving the caller to assume it was.
+  optional string infra_match = 17;
+  // With `job_ids`, also return the rest of each job's tree: the jobs
+  // launched under it, at any depth. Added in ManagedJobsService v27. A server
+  // that predates it ignores this field and returns only the requested jobs'
+  // rows, so the response reports whether the field was applied.
+  optional bool include_tree = 18;
+}
+
+message ManagedJobInfo {
+  int64 job_id = 1;
+  int64 task_id = 2;
+  string job_name = 3;
+  string task_name = 4;
+  double job_duration = 5;
+  optional string workspace = 6;
+  ManagedJobStatus status = 7;
+  ManagedJobScheduleState schedule_state = 8;
+  string resources = 9;
+  string cluster_resources = 10;
+  string cluster_resources_full = 11;
+  string cloud = 12;
+  string region = 13;
+  string infra = 14;
+  map<string, float> accelerators = 15;
+  int32 recovery_count = 16;
+  optional string details = 17;
+  optional string failure_reason = 18;
+  optional string user_name = 19;
+  optional string user_hash = 20;
+  optional double submitted_at = 21;
+  optional double start_at = 22;
+  optional double end_at = 23;
+  optional string user_yaml = 24;
+  optional string entrypoint = 25;
+  map<string, string> metadata = 26;
+  optional string pool = 27;
+  optional string pool_hash = 28;
+  // The `spot.job_id`, which can be used to identify different tasks
+  // for the same job
+  optional int64 _job_id = 29;
+  // Links (e.g., instance console URLs) as key-value pairs
+  map<string, string> links = 30;
+  // Whether this task is a primary task (true) or auxiliary task (false)
+  // within a job group. Auxiliary tasks are terminated when all primary tasks
+  // complete. NULL for non-job-group jobs (single jobs and pipelines).
+  optional bool is_primary_in_job_group = 31;
+  // Zone where the cluster is running (populated from cluster handle)
+  optional string zone = 32;
+  // Labels from the cluster resources (populated from cluster handle)
+  map<string, string> labels = 33;
+  // Name of the cluster on the cloud provider (populated from cluster handle)
+  optional string cluster_name_on_cloud = 34;
+  // Network endpoint information (replaces pickled handle)
+  // List of (internal_ip, external_ip) tuples for all nodes
+  repeated IpPair internal_external_ips = 35;
+  // K8s DNS entries mapping instance_id to internal_svc
+  // Only populated for Kubernetes clusters
+  map<string, string> internal_services = 36;
+  // Named priority class for job scheduling
+  optional string priority_class = 37;
+  // Whether this job is a batch coordinator (ds.map()).
+  optional bool is_batch = 38;
+  // Batch progress: total number of batches (NULL for non-batch jobs).
+  optional int32 batch_total_batches = 39;
+  // Batch progress: number of completed batches (NULL for non-batch jobs).
+  optional int32 batch_completed_batches = 40;
+  // Where this job came from, when launched from inside another managed job.
+  // All unset for top-level jobs. root_job_id is the top-level job of the
+  // tree; parent_job_id/parent_task_id is the job and task that launched it.
+  optional int64 parent_job_id = 41;
+  optional int64 parent_task_id = 42;
+  optional int64 root_job_id = 43;
+  // A dynamic task's ordinal within its root's tree (unset for top-level
+  // jobs); `<root_job_id>-<dynamic_task_index>` names it on the CLI.
+  optional int64 dynamic_task_index = 44;
+}
+
+// A pair of internal and external IP addresses
+message IpPair {
+  string internal_ip = 1;
+  string external_ip = 2;
+}
+
+message GetJobTableResponse {
+  repeated ManagedJobInfo jobs = 1;
+  int32 total = 2;
+  int32 total_no_filter = 3;
+  map<string, int32> status_counts = 4;
+  // Whether `infra_match` was applied, added in ManagedJobsService v24.
+  // Unlike a filter that merely widens the result when it is dropped, an
+  // ignored infra filter returns jobs on other infra -- an answer that looks
+  // right and is wrong. A server that predates the field leaves it false, so
+  // the caller can tell "filtered to none" from "never filtered".
+  bool infra_match_applied = 5;
+  // The distinct `--infra` specs across the jobs the request's other filters
+  // select, for the dashboard's Infra filter to offer. Added in
+  // ManagedJobsService v24. A server that predates the field leaves it empty,
+  // which is not an error the way a dropped `infra_match` is: the caller falls
+  // back to deriving the options from the rows on the page.
+  repeated string infra_options = 6;
+  // Whether `include_tree` was applied. Added in ManagedJobsService v27. A
+  // server that predates the field leaves it false. The caller needs this
+  // because a root-only answer and a tree answer look alike.
+  bool include_tree_applied = 7;
+}
+
+message GetAllJobIdsByNameRequest {
+  optional string job_name = 1;
+}
+
+message GetAllJobIdsByNameResponse {
+  repeated int64 job_ids = 1;
+}
+
+message CancelJobsRequest {
+  string current_workspace = 1;
+  optional string user_hash = 2;
+
+  oneof cancellation_criteria {
+    bool all_users = 3;
+    JobIds job_ids = 4;
+    string job_name = 5;
+    string pool_name = 6;
+  }
+
+  optional bool graceful = 7;
+  optional int64 graceful_timeout = 8;
+}
+
+message CancelJobsResponse {
+  string message = 1;
+}
+
+message StreamLogsRequest {
+  optional string job_name = 1;
+  optional int64 job_id = 2;
+  bool follow = 3;
+  bool controller = 4;
+  optional int32 tail = 5;
+}
+
+message StreamLogsResponse {
+  string log_line = 1;
+  optional int32 exit_code = 2;
+}
