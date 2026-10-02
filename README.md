@@ -1,221 +1,660 @@
+# CloudPulse
+
 <p align="center">
-  <a href="https://skypilot.ai/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/skypilot-org/skypilot/master/docs/source/images/skypilot-wide-dark-1k.png">
-      <img alt="SkyPilot" src="https://raw.githubusercontent.com/skypilot-org/skypilot/master/docs/source/images/skypilot-wide-light-1k.png" width=55%>
-    </picture>
-  </a>
+  <strong>Distributed Cloud Infrastructure & Event Processing Platform</strong>
 </p>
 
 <p align="center">
-  <a href="https://docs.skypilot.co/">
-    <img alt="Documentation" src="https://img.shields.io/badge/docs-gray?logo=readthedocs&logoColor=f5f5f5">
-  </a>
-
-  <a href="https://github.com/skypilot-org/skypilot/releases">
-    <img alt="GitHub Release" src="https://img.shields.io/github/release/skypilot-org/skypilot.svg">
-  </a>
-
-  <a href="http://slack.skypilot.co">
-    <img alt="Join Slack" src="https://img.shields.io/badge/SkyPilot-Join%20Slack-blue?logo=slack">
-  </a>
-
-  <a href="https://github.com/skypilot-org/skypilot/releases">
-    <img alt="Downloads" src="https://img.shields.io/pypi/dm/skypilot">
-  </a>
-
+  <em>Provision, schedule, execute, serve, and observe distributed workloads across heterogeneous cloud infrastructure from one control plane.</em>
 </p>
 
-<h3 align="center">
-    Manage all your AI compute
-</h3>
+<p align="center">
+  <a href="#-overview">Overview</a> ·
+  <a href="#-architecture">Architecture</a> ·
+  <a href="#-capabilities">Capabilities</a> ·
+  <a href="#-quick-start">Quick Start</a> ·
+  <a href="#-deployment">Deployment</a> ·
+  <a href="#-development">Development</a>
+</p>
 
-SkyPilot is a system to run, manage, and scale AI workloads on any AI infrastructure.
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.9%2B-3776AB?logo=python&logoColor=white" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/Kubernetes-native-326CE5?logo=kubernetes&logoColor=white" alt="Kubernetes">
+  <img src="https://img.shields.io/badge/Distributed-Systems-111827" alt="Distributed Systems">
+  <img src="https://img.shields.io/badge/License-Apache--2.0-green" alt="Apache 2.0">
+</p>
 
-SkyPilot gives **AI teams** a simple interface to run jobs on any infra.
-**Infra teams** get a unified control plane to manage any AI compute — with advanced scheduling, scaling, and orchestration.
+---
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="./docs/source/images/skypilot-abstractions-long-2-dark.png">
-  <img src="./docs/source/images/skypilot-abstractions-long-2.png" alt="SkyPilot Abstractions">
-</picture>
+## What is CloudPulse?
 
------
+**CloudPulse** is a distributed cloud infrastructure and event-driven workload platform designed to operate compute-intensive workloads across a mix of public clouds, Kubernetes clusters, Slurm environments, and other infrastructure providers.
 
-:fire: *News* :fire:
-- [Oct 2026] **SkyPilot AI Infra Meetup** with H Company in SF on Oct 8: [**register now**](https://partiful.com/e/kazBr6qiMhabcqdVm4nf)
-- [Sep 2026] **RL is Everything, Everywhere, All at Once**: [**blog**](https://skypilot.ai/blog/rl-everything)
-- [Sep 2026] **SkyPilot Agent Sessions**: Mission Control for Coding Agents, on Your Infrastructure: [**blog**](https://skypilot.ai/blog/agent-sessions)
-- [Jul 2026] **Serving Kimi K3 on your own GPUs with SkyPilot**: [**blog**](https://skypilot.ai/blog/kimi-k3)
-- [Jul 2026] **Run AI workloads on any cloud, store on Hugging Face**, no egress fees to worry about: [**Hugging Face blog**](https://huggingface.co/blog/skypilot-hf-storage)
-- [Jun 2026] **SkyPilot Endpoints**: production-ready inference on every cluster you own: [**blog**](https://skypilot.ai/blog/skypilot-endpoints)
-- [Jun 2026] **Announcing SkyPilot Sandboxes**: run untrusted, LLM-generated code on the Kubernetes clusters you already own. [**Learn more**](https://skypilot.ai/blog/sandboxes), [**join early access**](https://forms.gle/o4keAryXsVazNjyGA)
-- [May 2026] **How Multiverse doubled their GPU utilization with SkyPilot**: [**case study**](https://multiversecomputing.com/papers/2x-gpu-utilization-same-hardware-discover-our-efficiency-playbook)
-- [Apr 2026] Introducing **GPU Compass**: One dashboard to browse, compare pricing, and launch across every GPU cloud. Try it at [**gpus.skypilot.co**](https://gpus.skypilot.co).
-- [Apr 2026] **Research-Driven Agents**: Agents read arxiv papers before coding, landed 5 llama.cpp kernel fusions and +15% faster flash attention in ~3 hours for ~$29: [**blog**](https://skypilot.ai/blog/research-driven-agents), [**HackerNews**](https://news.ycombinator.com/item?id=47706141)
-- [Mar 2026] **Scaling Karpathy's Autoresearch**: Autoresearch runs 1 experiment at a time. We gave it 16 GPUs and let it run in parallel: [**blog**](https://skypilot.ai/blog/scaling-autoresearch), [**HackerNews**](https://news.ycombinator.com/item?id=47442435)
-- [Mar 2026] **How H Company Unlocked Online RL and Unified their AI Platform**: [**case study**](https://hcompany.ai/unlocking-online-rl-skypilot)
+Instead of coupling an application to one provider or one cluster, CloudPulse introduces a unified control plane for:
 
-## Overview
+- **Resource orchestration** — discover, provision, configure, and tear down compute.
+- **Workload scheduling** — place jobs against available CPU, GPU, TPU, memory, storage, and topology constraints.
+- **Event-driven execution** — track workload lifecycle events, state transitions, logs, failures, recovery, and completion.
+- **Multi-cloud operations** — use one workload model across heterogeneous infrastructure.
+- **Production serving** — deploy and autoscale long-running services and inference endpoints.
+- **Fleet efficiency** — bin-pack workloads, reclaim idle capacity, and optimize placement.
+- **Platform APIs** — expose orchestration through a client SDK, CLI, API server, and web-facing services.
+- **Operational visibility** — collect metrics, inspect state, stream logs, and diagnose failures.
 
-SkyPilot **is easy to use for AI users**:
-- Quickly spin up compute on your own infra
-- Environment and job as code — simple and portable
-- Easy job management: queue, run, and auto-recover many jobs
+### The core idea
 
-SkyPilot **makes Kubernetes easy for AI & Infra teams**:
+```text
+                  ┌───────────────────────────────────────┐
+                  │             CloudPulse                │
+                  │        Unified Control Plane          │
+                  └───────────────────┬───────────────────┘
+                                      │
+             ┌────────────────────────┼────────────────────────┐
+             │                        │                        │
+             ▼                        ▼                        ▼
+      Workload API             Scheduler / Optimizer      Event + State
+      CLI / SDK                Placement / Recovery       Metrics / Logs
+             │                        │                        │
+             └────────────────────────┼────────────────────────┘
+                                      │
+                         ┌────────────▼────────────┐
+                         │   Infrastructure Layer  │
+                         └────────────┬────────────┘
+                                      │
+          ┌───────────────┬───────────┼───────────┬───────────────┐
+          ▼               ▼           ▼           ▼               ▼
+      Kubernetes        AWS         GCP        Azure           Slurm
+          │               │           │           │               │
+          └───────────────┴───────────┼───────────┴───────────────┘
+                                      │
+                              Compute / GPU / TPU
+```
 
-- Slurm-like ease of use, cloud-native robustness
-- Local dev experience on K8s: SSH into pods, sync code, or connect IDE
-- Turbocharge your clusters: gang scheduling, multi-cluster, and scaling
+---
 
-SkyPilot **unifies multiple clusters, clouds, and hardware**:
-- One interface to use reserved GPUs, Kubernetes clusters, Slurm clusters, or 20+ clouds
-- [Flexible provisioning](https://docs.skypilot.co/en/latest/examples/auto-failover.html) of GPUs, TPUs, CPUs, with smart failover
-- [Team deployment](https://docs.skypilot.co/en/latest/reference/api-server/api-server.html) and resource sharing
+## ✨ Why CloudPulse?
 
-SkyPilot **maximizes GPU fleet utilization**:
-* Autostop: automatic cleanup of idle resources
-* Binpacking: workload binpacking on shared clusters
-* Intelligent scheduler: automatically schedule on the most available infra
+Modern distributed workloads rarely live on a single machine, cluster, or cloud. Infrastructure changes continuously: capacity appears and disappears, workloads fail, resources become idle, and teams need to move computation without rewriting the application.
 
-SkyPilot supports your existing GPU, TPU, and CPU workloads, with no code changes.
+CloudPulse separates **what a workload needs** from **where that workload runs**.
 
-Install with uv ([also supported](https://docs.skypilot.co/en/latest/getting-started/installation.html): pip, nightly, from source)
+That separation enables:
+
+| Problem | CloudPulse approach |
+|---|---|
+| Provider-specific infrastructure | Unified workload and resource abstractions |
+| Fragmented clusters | Multi-cluster control plane |
+| Capacity shortages | Placement strategies and failover |
+| Idle resources | Automatic lifecycle management |
+| Complex distributed jobs | Multi-node and gang-style scheduling |
+| Long-running services | Serving controllers and autoscaling |
+| Operational debugging | Centralized state, logs, and metrics |
+| Platform integration | Python SDK + CLI + API server |
+| Infrastructure changes | Declarative workload definitions |
+
+---
+
+## 🧩 Capabilities
+
+### Multi-cloud & multi-cluster orchestration
+
+CloudPulse contains provider integrations and provisioning workflows for a broad range of environments, including:
+
+- Kubernetes
+- Slurm
+- AWS
+- Google Cloud
+- Microsoft Azure
+- Oracle Cloud Infrastructure
+- IBM Cloud
+- RunPod
+- Lambda Cloud
+- Vast
+- Paperspace
+- Cudo
+- Fluidstack
+- Nebius
+- DigitalOcean
+- VMware vSphere
+- SSH-based infrastructure
+- Additional provider adapters under `sky/clouds/` and `sky/provision/`
+
+The abstraction is intentionally provider-neutral: workload definitions describe **requirements**, while the platform handles **placement and infrastructure execution**.
+
+### Intelligent workload scheduling
+
+CloudPulse provides the building blocks for:
+
+- Resource-aware placement
+- GPU/accelerator selection
+- Multi-node workloads
+- Gang-style scheduling
+- Queue management
+- Bin-packing
+- Recovery and retry strategies
+- Autostop / idle-resource cleanup
+- Cross-cluster and cross-cloud placement
+- Capacity-aware provisioning
+
+### Distributed jobs
+
+The jobs subsystem manages workloads beyond the initial provisioning step:
+
+```text
+Submit
+  │
+  ▼
+Queue
+  │
+  ▼
+Schedule ───────► Provision
+  │                  │
+  │                  ▼
+  │              Initialize
+  │                  │
+  ▼                  ▼
+Running ◄──────── Execute
+  │
+  ├────────► Logs / Metrics
+  │
+  ├────────► Recovery
+  │
+  └────────► Complete / Cancel
+```
+
+This lifecycle-oriented model makes infrastructure state and workload state first-class concepts.
+
+### Production serving
+
+The serving subsystem supports persistent services with components for:
+
+- Replica management
+- Autoscaling
+- Load balancing
+- Placement
+- Service state
+- Controller coordination
+- Endpoint management
+
+This makes the same infrastructure layer useful for both **batch workloads** and **long-running services**.
+
+### API server & platform control plane
+
+CloudPulse includes a client/server architecture with:
+
+- REST/API server components
+- Authentication and authorization
+- API versioning
+- State management
+- Server-side workload execution
+- Service accounts
+- Metrics endpoints
+- Streaming/logging utilities
+- Administrative policies
+- Database-backed state
+
+The architecture is suitable for turning a local orchestration tool into a shared internal platform.
+
+### Observability
+
+Operational components include:
+
+- Prometheus-compatible metrics
+- Structured state tracking
+- Job and service status
+- Streaming logs
+- Server diagnostics
+- Debug dumps
+- Database-backed operational metadata
+- Health and version checks
+
+---
+
+## 🏗️ Architecture
+
+At a high level, the repository is organized around six layers:
+
+```mermaid
+flowchart TB
+    U[Users / Automation] --> CLI[CLI]
+    U --> SDK[Python SDK]
+    U --> API[API Server]
+
+    CLI --> CORE[CloudPulse Core]
+    SDK --> CORE
+    API --> CORE
+
+    CORE --> TASK[Task & Resource Model]
+    CORE --> OPT[Scheduler / Optimizer]
+    CORE --> JOBS[Distributed Jobs]
+    CORE --> SERVE[Serving]
+    CORE --> DATA[Storage / Data]
+
+    OPT --> PROV[Provisioning]
+    JOBS --> STATE[State + Recovery]
+    SERVE --> STATE
+    API --> STATE
+
+    PROV --> CLOUDS[Cloud Adapters]
+    CLOUDS --> K8S[Kubernetes]
+    CLOUDS --> AWS[AWS]
+    CLOUDS --> GCP[GCP]
+    CLOUDS --> AZ[Azure]
+    CLOUDS --> SLURM[Slurm]
+    CLOUDS --> OTHER[Other Providers]
+
+    STATE --> METRICS[Metrics]
+    STATE --> LOGS[Logs]
+```
+
+### Repository map
+
+| Path | Responsibility |
+|---|---|
+| `sky/` | Core Python platform and runtime |
+| `sky/client/` | CLI, SDK, authentication, client utilities |
+| `sky/server/` | API server, state, auth, REST/WebSocket infrastructure |
+| `sky/clouds/` | Cloud/provider abstractions |
+| `sky/provision/` | Provider-specific provisioning implementations |
+| `sky/jobs/` | Managed/distributed job lifecycle |
+| `sky/serve/` | Long-running services and autoscaling |
+| `sky/optimizer.py` | Resource optimization and placement logic |
+| `sky/resources.py` | Resource requirements and infrastructure abstraction |
+| `sky/task.py` | Workload/task model |
+| `sky/data/` | Data and storage abstractions |
+| `sky/metrics/` | Operational metrics |
+| `charts/` | Helm/Kubernetes deployment assets |
+| `examples/` | Practical workload and deployment examples |
+| `docs/` | User and developer documentation |
+| `agent/` | Agent-oriented workflows and references |
+| `tests/` | Unit, integration, smoke, and platform tests |
+| `addons/` | Supporting infrastructure components |
+| `llm/` | LLM-oriented workload examples and tooling |
+
+> **Compatibility note:** the repository currently retains the internal Python namespace and executable entry point under `sky` for compatibility with the existing implementation. **CloudPulse** is the public product/project identity. A future namespace migration can be performed separately without coupling it to the branding migration.
+
+---
+
+## 🚀 Quick Start
+
+### Requirements
+
+- Python **3.9+**
+- Linux, macOS, or a supported development environment
+- Git
+- Access credentials for whichever infrastructure provider you intend to use
+- Optional: Kubernetes, Slurm, or cloud CLIs depending on the target environment
+
+### Install from source
+
 ```bash
-# Choose your clouds:
-uv pip install "skypilot[kubernetes,aws,gcp,azure,oci,nebius,lambda,runpod,fluidstack,paperspace,cudo,ibm,scp,seeweb,shadeform,verda]"
+git clone <your-cloudpulse-repository-url>
+cd cloudpulse
+
+python -m venv .venv
+source .venv/bin/activate
+
+python -m pip install --upgrade pip
+pip install -e .
 ```
 
-To use SkyPilot directly with your agent (Claude Code, Codex, etc.), install the [SkyPilot Skill](https://docs.skypilot.co/en/latest/getting-started/skill.html). Tell your agent:
+For development dependencies:
+
+```bash
+pip install -r requirements-dev.txt
 ```
-Fetch and follow https://github.com/skypilot-org/skypilot/blob/HEAD/agent/INSTALL.md to install the skypilot skill
+
+Verify the installation:
+
+```bash
+sky --help
 ```
 
-<p align="center">
-  <img src="docs/source/_static/intro.gif" alt="SkyPilot">
-</p>
+### Define a workload
 
-Current supported infra: Kubernetes, Slurm, AWS, GCP, Azure, OCI, CoreWeave, Nebius, Lambda Cloud, RunPod, Fluidstack,
-Cudo, Digital Ocean, Paperspace, Cloudflare, Samsung, IBM, Vast.ai, VMware vSphere, Seeweb, Prime Intellect, Shadeform, Verda Cloud, VastData, Crusoe.
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/skypilot-org/skypilot/master/docs/source/images/cloud-logos-dark.png">
-    <img alt="SkyPilot" src="https://raw.githubusercontent.com/skypilot-org/skypilot/master/docs/source/images/cloud-logos-light.png" width=85%>
-  </picture>
-</p>
-<!-- source xcf file: https://drive.google.com/drive/folders/1S_acjRsAD3T14qMeEnf6FFrIwHu_Gs_f?usp=drive_link -->
-
-
-## Getting started
-
-[Install SkyPilot](https://docs.skypilot.co/en/latest/getting-started/installation.html) in 1 minute. Then, launch your first cluster in 2 minutes in [Quickstart](https://docs.skypilot.co/en/latest/getting-started/quickstart.html).
-
-SkyPilot is BYOC: Everything is launched within your cloud accounts, VPCs, and clusters.
-
-## Benefits of SkyPilot on Kubernetes
-
-SkyPilot makes Kubernetes AI-native.
-
-It turbocharges your existing Kubernetes clusters by **accelerating AI/ML velocity**:
-
-- AI-friendly interface to launch jobs and deployments
-- Much simplified interactive dev for K8s (SSH / sync code / connect IDE to pods)
-
-...and **optimizing GPU scheduling, utilization, and scaling**:
-
-- Advanced scheduling: Gang scheduling, multi-node jobs, and queueing
-- Multi-cluster support: Bring all your clusters under one control plane
-- Multi-cloud support: One consistent interface to manage many providers
-
-See [SkyPilot vs Vanilla Kubernetes](https://docs.skypilot.co/en/latest/reference/kubernetes/skypilot-and-vanilla-k8s.html) and this [blog post](https://skypilot.ai/blog/ai-on-kubernetes) for more details.
-
-## SkyPilot in 1 minute
-
-A SkyPilot task specifies: resource requirements, data to be synced, setup commands, and the task commands.
-
-Once written in this [**unified interface**](https://docs.skypilot.co/en/latest/reference/yaml-spec.html) (YAML or Python API), the task can be launched on any available infra (Kubernetes, Slurm, cloud, etc.).  This avoids vendor lock-in, and allows easily moving jobs to a different provider.
-
-Paste the following into a file `my_task.yaml`:
+CloudPulse workloads can be expressed declaratively. A minimal example:
 
 ```yaml
 resources:
-  accelerators: A100:8  # 8x NVIDIA A100 GPU
+  accelerators: A100:8
 
-num_nodes: 1  # Number of VMs to launch
+num_nodes: 1
 
-# Working directory (optional) containing the project codebase.
-# Its contents are synced to ~/sky_workdir/ on the cluster.
-workdir: ~/torch_examples
+workdir: ~/my-workload
 
-# Commands to be run before executing the job.
-# Typical use: pip install -r requirements.txt, git clone, etc.
 setup: |
-  cd mnist
   pip install -r requirements.txt
 
-# Commands to run as a job.
-# Typical use: launch the main program.
 run: |
-  cd mnist
-  python main.py --epochs 1
+  python train.py --epochs 10
 ```
 
-Prepare the workdir by cloning:
+Launch:
+
 ```bash
-git clone https://github.com/pytorch/examples.git ~/torch_examples
+sky launch workload.yaml
 ```
 
-Launch with `sky launch` (note: [access to GPU instances](https://docs.skypilot.co/en/latest/cloud-setup/quota.html) is needed for this example):
+Inspect active infrastructure:
+
 ```bash
-sky launch my_task.yaml
+sky status
 ```
 
-SkyPilot then performs the heavy-lifting for you, including:
-1. Find the cheapest & available infra across your clusters or clouds
-2. Provision the GPUs (pods or VMs), with auto-failover if the infra returned capacity errors
-3. Sync your local `workdir` to the provisioned cluster
-4. Auto-install dependencies by running the task's `setup` commands
-5. Run the task's `run` commands, and stream logs
+View logs:
 
-See [Quickstart](https://docs.skypilot.co/en/latest/getting-started/quickstart.html) to get started with SkyPilot.
+```bash
+sky logs <cluster-name>
+```
 
-## Runnable examples
+Stop or tear down resources when finished:
 
-See [**SkyPilot examples**](https://docs.skypilot.co/en/docs-examples/examples/index.html) that cover: development, training, serving, LLM models, AI apps, and common frameworks.
+```bash
+sky stop <cluster-name>
+sky down <cluster-name>
+```
 
-Latest featured examples:
+> The CLI currently uses `sky` as its compatibility entry point. The platform and repository identity are **CloudPulse**.
 
-| Task | Examples |
-|----------|----------|
-| Training | [Verl](https://docs.skypilot.co/en/latest/examples/training/verl.html), [Finetune Llama 4](https://docs.skypilot.co/en/latest/examples/training/llama-4-finetuning.html), [TorchTitan](https://docs.skypilot.co/en/latest/examples/training/torchtitan.html), [PyTorch](https://docs.skypilot.co/en/latest/getting-started/tutorial.html), [DeepSpeed](https://docs.skypilot.co/en/latest/examples/training/deepspeed.html), [NeMo](https://docs.skypilot.co/en/latest/examples/training/nemo.html), [Ray](https://docs.skypilot.co/en/latest/examples/training/ray.html), [Unsloth](https://docs.skypilot.co/en/latest/examples/training/unsloth.html), [Jax/TPU](https://docs.skypilot.co/en/latest/examples/training/tpu.html), [OpenRLHF](https://docs.skypilot.co/en/latest/examples/training/openrlhf.html) |
-| Serving | [vLLM](https://docs.skypilot.co/en/latest/examples/serving/vllm.html), [SGLang](https://docs.skypilot.co/en/latest/examples/serving/sglang.html), [Ollama](https://docs.skypilot.co/en/latest/examples/serving/ollama.html) |
-| Models | [DeepSeek-R1](https://docs.skypilot.co/en/latest/examples/models/deepseek-r1.html), [Llama 4](https://docs.skypilot.co/en/latest/examples/models/llama-4.html), [Llama 3](https://docs.skypilot.co/en/latest/examples/models/llama-3.html), [CodeLlama](https://docs.skypilot.co/en/latest/examples/models/codellama.html), [Qwen](https://docs.skypilot.co/en/latest/examples/models/qwen.html), [Kimi-K2](https://docs.skypilot.co/en/latest/examples/models/kimi-k2.html), [Kimi-K2-Thinking](https://docs.skypilot.co/en/latest/examples/models/kimi-k2-thinking.html), [Mixtral](https://docs.skypilot.co/en/latest/examples/models/mixtral.html) |
-| AI apps | [RAG](https://docs.skypilot.co/en/latest/examples/applications/rag.html), [vector databases](https://docs.skypilot.co/en/latest/examples/applications/vector_database.html) (ChromaDB, CLIP) |
-| Common frameworks | [Airflow](https://docs.skypilot.co/en/latest/examples/frameworks/airflow.html), [Jupyter](https://docs.skypilot.co/en/latest/examples/frameworks/jupyter.html), [marimo](https://docs.skypilot.co/en/latest/examples/frameworks/marimo.html)  |
+---
 
-Source files can be found in [`llm/`](https://github.com/skypilot-org/skypilot/tree/master/llm) and [`examples/`](https://github.com/skypilot-org/skypilot/tree/master/examples).
+## ☁️ Infrastructure model
 
-## Learn more
-To learn more, see [SkyPilot Overview](https://docs.skypilot.co/en/latest/overview.html), [SkyPilot docs](https://docs.skypilot.co/en/latest/), and [SkyPilot blog](https://skypilot.ai/blog).
+CloudPulse follows a **bring-your-own-infrastructure** model.
 
-SkyPilot adopters: [Testimonials and Case Studies](https://skypilot.ai/case-studies)
+Your workloads run inside infrastructure you control:
 
-Follow updates:
-- [Slack](http://slack.skypilot.co)
-- [X](https://twitter.com/skypilot_org)
-- [LinkedIn](https://www.linkedin.com/company/skypilot-oss/)
-- [YouTube](https://www.youtube.com/@skypilot-org)
-- [SkyPilot Blog](https://skypilot.ai/blog)
+```text
+CloudPulse Control Plane
+        │
+        ├── Kubernetes clusters
+        ├── Cloud VMs
+        ├── Slurm clusters
+        ├── GPU providers
+        └── SSH-accessible infrastructure
+```
 
-## Questions and feedback
-We are excited to hear your feedback:
-* For issues and feature requests, please [open a GitHub issue](https://github.com/skypilot-org/skypilot/issues/new).
-* For questions, please use [GitHub Discussions](https://github.com/skypilot-org/skypilot/discussions).
+This keeps provider credentials, networks, storage, and compute within your operational boundary while CloudPulse coordinates the workload lifecycle.
 
-For general discussions, join us on the [SkyPilot Slack](http://slack.skypilot.co).
+---
 
-## Contributing
-We welcome all contributions to the project! See [CONTRIBUTING](CONTRIBUTING.md) for how to get involved.
+## 📦 Deployment
 
-<img referrerpolicy="no-referrer-when-downgrade" src="https://static.scarf.sh/a.png?x-pxid=76c302d0-bd8d-4233-b7df-237d353375cd" />
+### Kubernetes
+
+The repository includes Helm assets under:
+
+```text
+charts/
+```
+
+A typical deployment flow is:
+
+```bash
+helm dependency build ./charts/<cloudpulse-chart>
+helm upgrade --install cloudpulse ./charts/<cloudpulse-chart> \
+  --namespace cloudpulse \
+  --create-namespace
+```
+
+Provider-specific configuration, authentication, database settings, and operational policies should be supplied through the chart values and deployment environment.
+
+### Containers
+
+Container build definitions are provided for different runtime scenarios:
+
+```text
+Dockerfile
+Dockerfile_k8s
+Dockerfile_k8s_gpu
+```
+
+These can be adapted for:
+
+- API server deployments
+- Kubernetes worker environments
+- GPU-enabled workloads
+- CI/CD pipelines
+- Internal platform images
+
+---
+
+## 🔐 Security model
+
+CloudPulse is designed to operate inside infrastructure controlled by the deploying organization.
+
+The repository includes components for:
+
+- Authentication
+- Authorization
+- Administrative policies
+- Service-account authentication
+- Cloud credential handling
+- API access controls
+- Environment isolation
+- Kubernetes deployment security
+
+For production deployments, use dedicated identities, least-privilege cloud permissions, private control-plane networking where appropriate, encrypted secrets, and a managed database/storage configuration.
+
+---
+
+## 📊 Operational model
+
+A production CloudPulse deployment can be thought of as three cooperating planes:
+
+### Control plane
+
+Responsible for:
+
+- API requests
+- Scheduling
+- Resource selection
+- State transitions
+- Authentication
+- Administrative policy
+- Coordination
+
+### Execution plane
+
+Responsible for:
+
+- Provisioning
+- Worker initialization
+- Job execution
+- Service replicas
+- Data movement
+- Log streaming
+
+### Observability plane
+
+Responsible for:
+
+- Metrics
+- Logs
+- Job/service status
+- Diagnostics
+- Recovery signals
+- Operational history
+
+This separation allows the platform to scale from local development to shared infrastructure.
+
+---
+
+## 🧪 Testing
+
+The repository contains multiple test layers:
+
+```text
+tests/
+├── unit_tests/
+├── smoke_tests/
+├── kubernetes/
+└── ...
+```
+
+Run the project's configured test suite with:
+
+```bash
+pytest
+```
+
+For focused development, run an individual test module:
+
+```bash
+pytest tests/unit_tests/<path-to-test>.py
+```
+
+Formatting and static-analysis configuration is included in the repository.
+
+---
+
+## 🛠️ Development
+
+### Recommended workflow
+
+```bash
+# Create environment
+python -m venv .venv
+source .venv/bin/activate
+
+# Install development dependencies
+pip install -r requirements-dev.txt
+
+# Install CloudPulse in editable mode
+pip install -e .
+
+# Run focused tests
+pytest tests/unit_tests/<path-to-test>.py
+
+# Run formatting / repository checks
+./format.sh
+```
+
+### Working on a provider
+
+Provider implementations generally live in:
+
+```text
+sky/clouds/
+sky/provision/
+```
+
+A provider integration typically participates in:
+
+1. Capability discovery
+2. Resource cataloging
+3. Credential validation
+4. Provisioning
+5. Configuration
+6. Lifecycle management
+7. Cleanup
+8. Failure handling
+
+This makes provider support modular rather than embedded throughout the scheduling layer.
+
+---
+
+## 📚 Documentation
+
+The repository includes a full documentation tree under:
+
+```text
+docs/
+```
+
+Useful areas include:
+
+- `docs/source/getting-started/`
+- `docs/source/reference/`
+- `docs/source/cloud-setup/`
+- `docs/source/running-jobs/`
+- `docs/source/serving/`
+- `docs/source/examples/`
+- `docs/source/developers/`
+
+Examples are available under:
+
+```text
+examples/
+```
+
+---
+
+## 🧭 Design principles
+
+CloudPulse is organized around a few core engineering principles:
+
+**Infrastructure independence**  
+Workloads should describe requirements rather than encode a single infrastructure vendor.
+
+**Declarative intent**  
+Resource requirements, setup, execution, and service behavior should be reproducible and automatable.
+
+**Event-driven lifecycle management**  
+Provisioning, execution, recovery, completion, and teardown are treated as observable state transitions.
+
+**Failure-aware orchestration**  
+Distributed systems fail. Recovery, retries, cleanup, and capacity changes are part of the platform rather than application-specific afterthoughts.
+
+**Operational transparency**  
+State, metrics, logs, and diagnostics should be available throughout the workload lifecycle.
+
+**Extensibility**  
+Providers, policies, storage backends, APIs, and workload types should be replaceable or extendable without rewriting the control plane.
+
+---
+
+## 🗺️ Roadmap
+
+The platform architecture provides a foundation for expanding CloudPulse toward a broader distributed infrastructure platform.
+
+Potential areas include:
+
+- Event streaming and durable event buses
+- First-class workload event subscriptions
+- Unified event schemas and audit trails
+- Richer workflow/DAG orchestration
+- Cross-region placement
+- Capacity forecasting
+- Policy-driven scheduling
+- Multi-tenant resource governance
+- Cost and carbon-aware placement
+- Enhanced platform dashboards
+- Native OpenTelemetry integration
+- Public CloudPulse SDKs and APIs
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome.
+
+Before opening a pull request:
+
+1. Read the development guidance in `CONTRIBUTING.md`.
+2. Keep changes scoped and testable.
+3. Add or update tests for behavioral changes.
+4. Update documentation for user-facing changes.
+5. Run relevant formatting and test checks locally.
+6. Avoid provider-specific behavior leaking into generic orchestration layers.
+
+For significant architectural changes, document the design trade-offs before implementation.
+
+---
+
+## 📄 License
+
+This project is distributed under the **Apache License 2.0**. See [`LICENSE`](LICENSE) for the complete license text.
+
+---
+
+## ⭐ CloudPulse
+
+**CloudPulse — Distributed Cloud Infrastructure & Event Processing Platform**
+
+A unified control plane for turning heterogeneous infrastructure into a programmable, observable, and resilient execution platform.
+
+<p align="center">
+  <sub>Build once. Orchestrate anywhere. Observe everything.</sub>
+</p>
+
